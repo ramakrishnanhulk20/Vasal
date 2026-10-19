@@ -77,3 +77,10 @@ If fewer than 6 shows pass, we report "insufficient data" and make no claim abou
 ## Change log
 
 - 19 Oct 2026: first version.
+- 19 Oct 2026, still before any data pull or Qloo key: a definition the first version left open. "Normalised name matches the show's name" means that, after the normaliser above, the two names are equal, or one is the other followed by more words. For example, "armchair expert" matches "armchair expert with dax shepard". When several Qloo podcasts match, the show is excluded rather than one being picked.
+- 19 Oct 2026, still before any data pull or Qloo key: four refinements found while building the pipeline. None of them looks at any outcome data.
+  1. The normaliser also folds typographic quote marks to ASCII, so "Conan O’Brien" equals "Conan O'Brien".
+  2. Podcast matching works in two tiers. An exact normalised match wins. Only when there is none do the "followed by more words" matches count. The show is excluded only when the winning tier holds more than one podcast. This stops "Flagrant" from becoming ambiguous with "Flagrant and Funny with ...".
+  3. Hot Ones and Conan O'Brien Needs A Friend share their YouTube channels with other shows (First We Feast and Team Coco). On those two channels an episode counts only if its normalised title contains the show's normalised name. The rule is set in docs/backtest-shows.json as `titleMustContain`.
+  4. Fame is the guest's Qloo popularity percentile from the same /v2/insights response that gives the fit score, as written above. At most the 2,000 most recent uploads per channel are read. A channel whose 2,000th upload is still inside the window is reported as cut short.
+  SmartLess has no official full-episode channel that a permitted source links, so its channel id is null and it is excluded by the existing rule.

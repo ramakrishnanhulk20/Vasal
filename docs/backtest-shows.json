@@ -1,0 +1,88 @@
+[
+  {
+    "name": "Armchair Expert with Dax Shepard",
+    "youtubeChannelId": "UClKP53RewJWK5s5WtLSg7Dg",
+    "youtubeHandle": "@armchairexpertpod",
+    "evidenceUrl": "https://armchairexpertpod.com/",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Call Her Daddy",
+    "youtubeChannelId": "UCyGi3eCuxko37WB6uUr7LjA",
+    "youtubeHandle": "@callherdaddy",
+    "evidenceUrl": "https://www.callherdaddy.com/",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "The Diary Of A CEO",
+    "youtubeChannelId": "UCGq-a57w-aPwyi3pW7XLiHw",
+    "youtubeHandle": "@TheDiaryOfACEO",
+    "evidenceUrl": "https://thediary.com/",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Club Shay Shay",
+    "youtubeChannelId": "UCQoxJOkwaCgyzQtiuAIDcuw",
+    "youtubeHandle": "@ClubShayShay",
+    "evidenceUrl": "https://podcasts.apple.com/us/podcast/club-shay-shay/id1531023690 (clubshayshay.com is a parked domain. The official feed behind this Apple Podcasts listing links youtube.com/c/clubshayshay in its show notes, and the co-producer's site https://www.playmakerhq.com/ links the same channel.)",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Hot Ones",
+    "youtubeChannelId": "UCPD_bxCRGpmmeQcbe2kpPaA",
+    "youtubeHandle": "@FirstWeFeast",
+    "titleMustContain": "Hot Ones",
+    "evidenceUrl": "https://hotones.com/ (links the Hot Ones playlist PLAzrgbu8gEMIIK3r4Se1dOZWSZzUSadfZ, which First We Feast owns. https://firstwefeast.com/ links this channel directly. The channel also posts other First We Feast shows.)",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Good Hang with Amy Poehler",
+    "youtubeChannelId": "UC1lg-nYUcZ1pjo6EC2Nj5Sw",
+    "youtubeHandle": "@Good-Hang-with-Amy-Poehler",
+    "evidenceUrl": "https://www.theringer.com/podcasts/good-hang-with-amy-poehler",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Conan O'Brien Needs A Friend",
+    "youtubeChannelId": "UCi7GJNg51C3jgmYTUwqoUXA",
+    "youtubeHandle": "@TeamCoco",
+    "titleMustContain": "Conan O'Brien Needs A Friend",
+    "evidenceUrl": "https://teamcoco.com/podcasts/conan-obrien-needs-a-friend (links youtube.com/teamcoco. The channel also posts other Team Coco shows and TV clips.)",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "This Past Weekend w/ Theo Von",
+    "youtubeChannelId": "UC5AQEUAwCh1sGDvkQtkDWUQ",
+    "youtubeHandle": "@TheoVon",
+    "evidenceUrl": "https://www.theovon.com/",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Flagrant",
+    "youtubeChannelId": "UC5PstSsGrRwj2o6asQpC4Rg",
+    "youtubeHandle": "@OfficialFlagrant",
+    "evidenceUrl": "https://podcasts.apple.com/us/podcast/trump-as-jesus-is-wild-melania-revives-epstein-bieber/id1288641267?i=1000761579166 (no official site found: flagrant.com and flagrantpod.com are parked. This Apple Podcasts episode page of the show links its timestamps to youtube.com/watch?v=mZ2WxauJBlM, a video owned by this channel, and the show's feed links youtube.com/watch?v=D5ZBj0Of0S0 the same way.)",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "Impaulsive",
+    "youtubeChannelId": "UCGeBogGDZ9W3dsGx-mWQGJA",
+    "youtubeHandle": "@Impaulsive",
+    "evidenceUrl": "https://podcasts.apple.com/us/podcast/impaulsive-with-logan-paul/id1442164847 (impaulsive.com is a domain for sale. This Apple Podcasts page links youtube.com/impaulsive in its episode notes.)",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "The Joe Rogan Experience",
+    "youtubeChannelId": "UCzQUP1qoWDoEbmsQxvdjxgQ",
+    "youtubeHandle": "@joerogan",
+    "evidenceUrl": "https://www.joerogan.com/",
+    "checkedOn": "2026-10-19"
+  },
+  {
+    "name": "SmartLess",
+    "youtubeChannelId": null,
+    "youtubeHandle": null,
+    "evidenceUrl": "No channel can be pinned under the evidence rule. https://www.smartless.com/ links only Instagram and Twitter, and neither its Apple Podcasts page (https://podcasts.apple.com/us/podcast/smartless/id1521578868) nor its Spotify page (https://open.spotify.com/show/0Yzd0g8NYmn27k2HFNplv7) links a YouTube channel. The official feed links only @SmartLessMedia, which posts other SmartLess Media shows.",
+    "checkedOn": "2026-10-19"
+  }
+]
