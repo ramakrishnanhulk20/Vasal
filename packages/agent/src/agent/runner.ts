@@ -15,6 +15,8 @@ import {
   getBoardGuest,
   getCandidate,
   getRun,
+  markBriefDone,
+  markBriefFailed,
   putBoard,
   putBrief,
   putCandidates,
@@ -38,6 +40,7 @@ export type AgentFeeds = {
 };
 
 const MIN_BOARD = 3;
+const UNEXPECTED = "UNEXPECTED";
 const MAX_FIT_IDS = 25;
 const MAX_EPISODE_TITLES = 40;
 const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
@@ -83,9 +86,10 @@ function knownCode(error: unknown): string | null {
 /**
  * The real agent behind the routes (AgentPort).
  *
- * startRun moves the run to running, resolves the show (resolveShow), stores
- * the candidates in rank order, appends a "candidates" event that carries
- * ids, names and Qloo names but no URL, and moves the run to
+ * startRun moves the run to running, resolves the show (resolveShow, which
+ * reads a pasted feed's title through a handle), stores the candidates in
+ * rank order, appends a "candidates" event that carries ids, names,
+ * publishers and Qloo names but no URL, and moves the run to
  * awaiting_confirm. The feed URL stays in the stored candidate row.
  *
  * continueRun acts only on a candidate the server stored for that run
@@ -100,13 +104,20 @@ function knownCode(error: unknown): string | null {
  * AGENT_BOARD_TOO_SMALL; nothing is padded.
  *
  * writeBrief reads the guest from the stored board (C6.2), writes the brief,
- * stores it, logs any removed links in a step, and appends a "brief" event.
+ * logs any removed links in a step, stores the brief, marks the guest's
+ * brief claim done (markBriefDone), and appends a "brief" event.
  *
  * Any AgentError, QlooError or FeedError in startRun or continueRun ends the
- * run as failed through finishRun with only the error's code (C6.4, C3.6).
- * In writeBrief it appends a failed "brief" event with the code, because the
- * run itself is already done. Every other error is rethrown, so the route
- * marks the run failed with AGENT_ERROR.
+ * run as failed through finishRun with only the error's code (C6.4, C3.6),
+ * and the call resolves. In writeBrief it marks the claim failed with only
+ * that code (markBriefFailed), so the visitor can ask once more, appends a
+ * failed "brief" event with the code, and resolves; the run itself stays
+ * done. Every other error is rethrown: from startRun or continueRun the
+ * route then marks the run failed with AGENT_ERROR. In writeBrief the claim
+ * is first marked failed with UNEXPECTED, so it never stays pending, and the
+ * route then only logs the error. If the database cannot take that write
+ * either, the claim stays pending until the startup sweep
+ * (failStaleBriefClaims) finds it.
  */
 export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: MeteredQloo; feeds: AgentFeeds; now?: () => Date }): AgentPort {
   const { db, model, qloo, feeds } = deps;
@@ -203,7 +214,13 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
     async startRun(runId, input) {
       await setRunStatus(db, runId, "running", undefined, clock());
       await failOnKnownError(runId, async () => {
-        const shows = await resolveShow(input, { searchShows: feeds.searchShows, lookupShow: feeds.lookupShow, qloo });
+        const shows = await resolveShow(input, {
+          searchShows: feeds.searchShows,
+          lookupShow: feeds.lookupShow,
+          safeFetch: feeds.safeFetch,
+          parseFeed: feeds.parseFeed,
+          qloo,
+        });
         const ids = await putCandidates(db, runId, shows);
         const candidates = shows.map((show, index) => ({
           id: ids[index],
@@ -288,11 +305,18 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
           });
         }
         await putBrief(db, runId, guestId, { ...brief, removed }, clock());
+        await markBriefDone(db, runId, guestId);
         await appendEvent(db, runId, "brief", { guestId, ok: true }, clock());
       } catch (error) {
         const code = knownCode(error);
-        if (code !== null) await appendEvent(db, runId, "brief", { guestId, ok: false, code }, clock());
-        throw error;
+        if (code === null) {
+          // The claim was taken before any model call, so leaving it pending
+          // would keep the page waiting forever. The route logs the error.
+          await markBriefFailed(db, runId, guestId, UNEXPECTED);
+          throw error;
+        }
+        await markBriefFailed(db, runId, guestId, code);
+        await appendEvent(db, runId, "brief", { guestId, ok: false, code }, clock());
       }
     },
   };

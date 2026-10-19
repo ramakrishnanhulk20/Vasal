@@ -1,15 +1,18 @@
 // Covers the research loop with a scripted fake model and a fake metered
 // Qloo holding synthetic data: the message shape sent each turn, tool
 // results batched into one user message, error results the loop carries on
-// from, the nudge, every run cap, and step labels written by code. It does
-// not cover the real model's choices, the Anthropic client (agent-model),
-// the tools' own checks (agent-tools) or storing step events (agent-runner).
-import type Anthropic from "@anthropic-ai/sdk";
-import { describe, expect, it } from "vitest";
+// from, the nudge, every run cap, each turn's time limit, and step labels
+// written by code. One test runs the real Anthropic client over a fake SDK
+// that never answers, to show the wall clock cuts a call off. It does not
+// cover the real model's choices, the rest of the Anthropic client
+// (agent-model), the tools' own checks (agent-tools) or storing step events
+// (agent-runner).
+import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
+import { describe, expect, it, vi } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { AgentError } from "../src/agent/errors.js";
 import { runResearch, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
-import type { ModelClient } from "../src/agent/model.js";
+import { createAnthropicModel, type ModelCallOptions, type ModelClient } from "../src/agent/model.js";
 import { RESEARCH_NUDGE, RESEARCH_SYSTEM } from "../src/agent/prompts.js";
 import { TOOL_LIMITS } from "../src/agent/tools.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
@@ -74,16 +77,18 @@ const finish = (id = "finish") =>
 
 function fakeModel(script: (turn: number) => Anthropic.Message) {
   const calls: TurnParams[] = [];
+  const options: Array<ModelCallOptions | undefined> = [];
   const model: ModelClient = {
-    async turn(params) {
+    async turn(params, callOptions) {
       calls.push(structuredClone(params));
+      options.push(callOptions);
       return script(calls.length);
     },
     async structured() {
       throw new Error("structured is not used by the research loop");
     },
   };
-  return { model, calls };
+  return { model, calls, options };
 }
 
 const newContext = (): RunContext =>
@@ -92,7 +97,7 @@ const newContext = (): RunContext =>
 async function run(script: (turn: number) => Anthropic.Message, limits?: Partial<LoopLimits>, nowMs?: () => number) {
   const ctx = newContext();
   const { qloo, ops } = fakeQloo();
-  const { model, calls } = fakeModel(script);
+  const { model, calls, options } = fakeModel(script);
   const steps: StepEvent[] = [];
   const outcome = runResearch(
     ctx,
@@ -103,7 +108,7 @@ async function run(script: (turn: number) => Anthropic.Message, limits?: Partial
     (error: unknown) => ({ picks: null, error }),
   );
   const result = await outcome;
-  return { ...result, ctx, ops, calls, steps };
+  return { ...result, ctx, ops, calls, options, steps };
 }
 
 const codeOf = (error: unknown) => (error instanceof AgentError ? error.code : String(error));
@@ -238,6 +243,77 @@ describe("runResearch caps (C2.1, C2.4)", () => {
   it("refuses a limit that is not a positive whole number", async () => {
     const { error } = await run(() => reply([finish()]), { maxTurns: 0 });
     expect(error).toBeInstanceOf(RangeError);
+  });
+
+  it("gives each turn the wall-clock time left as its timeout, at least 1 second, and the run's signal", async () => {
+    let clock = 0;
+    const { error, options } = await run(
+      (turn) => {
+        if (turn === 1) {
+          clock = 1_500;
+          return reply([toolUse("p", "people_for_show", { reach: "any" })]);
+        }
+        if (turn === 2) {
+          clock = 4_900;
+          return reply([toolUse("t", "recent_episode_titles", {})]);
+        }
+        return reply([finish()]);
+      },
+      { maxWallMs: 5_000 },
+      () => clock,
+    );
+
+    expect(error).toBeNull();
+    expect(options.map((option) => option?.timeoutMs)).toEqual([5_000, 3_500, 1_000]);
+    const [signal] = options.map((option) => option?.signal);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(options.every((option) => option?.signal === signal)).toBe(true);
+    expect(signal?.aborted).toBe(false);
+  });
+
+  it("cuts off a model call still in flight when the wall clock ends, failing with MODEL_TIMEOUT within the limit plus 1 s", async () => {
+    const limitMs = 300;
+    type SdkOptions = NonNullable<Parameters<Anthropic["messages"]["create"]>[1]>;
+    // Like the real SDK: no answer ever comes, and the call rejects once its signal fires.
+    const create = vi.fn(
+      (_params: Anthropic.MessageCreateParamsNonStreaming, options?: SdkOptions) =>
+        new Promise<Anthropic.Message>((_resolve, reject) => {
+          if (options?.signal?.aborted === true) reject(new APIUserAbortError());
+          options?.signal?.addEventListener("abort", () => reject(new APIUserAbortError()), { once: true });
+        }),
+    );
+    const reserveTokens = vi.fn(async (_n: number) => true);
+    const model = createAnthropicModel({
+      apiKey: "sk-ant-test-key",
+      model: "claude-haiku-5-5",
+      effort: "low",
+      reserveTokens,
+      client: { messages: { create } } as unknown as Anthropic,
+    });
+    const steps: StepEvent[] = [];
+    const started = Date.now();
+
+    const error = await runResearch(
+      newContext(),
+      { model, qloo: fakeQloo().qloo, today: TODAY, onStep: async (step) => void steps.push(step) },
+      { maxWallMs: limitMs },
+    ).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    const elapsed = Date.now() - started;
+    expect(codeOf(error)).toBe("MODEL_TIMEOUT");
+    expect(elapsed).toBeGreaterThanOrEqual(limitMs - 50);
+    expect(elapsed).toBeLessThan(limitMs + 1_000);
+    expect(create).toHaveBeenCalledTimes(1);
+    const sent = create.mock.calls[0]![1]!;
+    expect(sent.timeout).toBe(1_000);
+    expect(sent.maxRetries).toBe(1);
+    expect(sent.signal?.aborted).toBe(true);
+    // The reservation was made before the call and stays spent.
+    expect(reserveTokens).toHaveBeenCalledTimes(1);
+    expect(steps).toHaveLength(0);
   });
 });
 

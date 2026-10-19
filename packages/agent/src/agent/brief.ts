@@ -16,6 +16,7 @@ const SUBJECT_CHARS = 120;
 const BODY_CHARS = 1_500;
 const QUESTION_COUNT = 5;
 const MAX_TOKENS = 4_000;
+const DRAFT_TIMEOUT_MS = 45_000;
 const MAX_TAGS = 5;
 const MAX_FACT_CHARS = 100;
 const ANY_PLACEHOLDER = /\{\{([A-Za-z_][A-Za-z0-9_]{0,39})\}\}/g;
@@ -85,7 +86,10 @@ type Checked = { texts: string[]; removed: { links: number; emails: number } };
 async function draftOnce(model: ModelClient, user: string, allowed: readonly string[]): Promise<Checked | null> {
   let draft: Brief;
   try {
-    draft = await model.structured({ system: BRIEF_SYSTEM, user, schema: BriefSchema, maxTokens: MAX_TOKENS });
+    draft = await model.structured(
+      { system: BRIEF_SYSTEM, user, schema: BriefSchema, maxTokens: MAX_TOKENS },
+      { timeoutMs: DRAFT_TIMEOUT_MS },
+    );
   } catch (error) {
     if (error instanceof AgentError && error.code === "AGENT_BAD_PROSE") return null;
     throw error;
@@ -121,14 +125,16 @@ async function draftOnce(model: ModelClient, user: string, allowed: readonly str
  * and tag1 up to the number of shared tags the entry has, so a digit outside
  * a placeholder, or a tag placeholder with no tag behind it, fails (C3.4).
  * Links and emails are removed and counted (C3.5). A draft that fails any
- * field, or fails the schema, is written again once.
+ * field, or fails the schema, is written again once. Each draft is one model
+ * call with a fixed 45 second time limit (C2.4).
  *
  * Placeholders are then filled by code: the fit as a whole percent such as
  * "86% fit", the names as Qloo and the directory gave them. Returns the
  * filled brief and how many links and emails were removed.
  *
  * Throws AgentError AGENT_BAD_PROSE when the second draft also fails, and any
- * other AgentError from the model client (such as MODEL_BUDGET).
+ * other AgentError from the model client (such as MODEL_BUDGET, or
+ * MODEL_TIMEOUT when a draft passes its time limit).
  */
 export async function writeBrief(model: ModelClient, input: { guest: BoardEntry; showName: string }): Promise<WrittenBrief> {
   const tags = input.guest.sharedTags.slice(0, MAX_TAGS).map(cleanFact).filter((tag) => tag !== "");

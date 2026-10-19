@@ -1,6 +1,9 @@
 import { pickPodcastMatch } from "../backtest/eligibility.js";
 import { classifyInput } from "../feeds/classify.js";
+import { FeedError } from "../feeds/errors.js";
+import { FeedHandles } from "../feeds/handles.js";
 import type { ShowCandidate } from "../feeds/lookup.js";
+import type { ParsedFeed } from "../feeds/rss.js";
 import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo } from "../qloo/metered.js";
 import type { QlooEntity } from "../qloo/schemas.js";
@@ -63,27 +66,52 @@ async function qlooPodcastFor(qloo: MeteredQloo, name: string): Promise<{ id: st
   return pick.kind === "match" ? { id: pick.id, name: pick.name } : null;
 }
 
+// The handle is the only way this URL reaches the fetcher, the same path
+// continueRun takes later (C1.5). A body that does not parse as a feed gives
+// only the fixed code; none of its bytes go anywhere (C1.6).
+async function feedTitle(
+  url: URL,
+  deps: { safeFetch: (url: URL) => Promise<{ body: string }>; parseFeed: (xml: string) => ParsedFeed },
+): Promise<string> {
+  const handles = new FeedHandles();
+  const handle = handles.issue(url, "visitor");
+  try {
+    const { body } = await deps.safeFetch(handles.resolve(handle));
+    return deps.parseFeed(body).title;
+  } catch (error) {
+    if (error instanceof FeedError) throw new AgentError("FEED_UNAVAILABLE");
+    throw error;
+  }
+}
+
 /**
  * Turns what the visitor typed into at most 5 show candidates, each tied to
  * exactly one Qloo podcast. classifyInput decides the kind (C8.2): a name is
- * searched in the podcast directory, an Apple Podcasts link is looked up by
- * its id, and any other http or https URL becomes one candidate named after
- * the URL's host, with the URL kept so the server can fetch it later through
- * a FeedHandles handle (C1.5). Each candidate then gets one metered Qloo
- * search (podcasts only, take 5) and pickPodcastMatch; a candidate with no
- * single match is dropped, never guessed (C8.4). Names are cleaned of
- * direction controls and capped at 200 characters.
+ * searched in the podcast directory, and an Apple Podcasts link is looked up
+ * by its id. Any other http or https URL is fetched once through a
+ * FeedHandles handle issued for it (C1.5) and parsed with parseFeed; it
+ * becomes one candidate named after the feed's title, with the URL's
+ * hostname as its publisher and the URL kept so continueRun can fetch it
+ * again through a fresh handle. Episode titles are not kept at this step.
+ * Each candidate then gets one metered Qloo search (podcasts only, take 5)
+ * and pickPodcastMatch; a candidate with no single match is dropped, never
+ * guessed (C8.4). Names are cleaned of direction controls and capped at 200
+ * characters.
  *
- * Throws AgentError SHOW_NOT_FOUND when the directory has nothing and
- * SHOW_NO_QLOO_MATCH when every candidate was dropped, FeedError from
- * classifyInput or the directory lookup, and any QlooError other than
- * QLOO_BAD_INPUT (such as QLOO_BUDGET) from the Qloo search.
+ * Throws AgentError SHOW_NOT_FOUND when the directory has nothing,
+ * FEED_UNAVAILABLE when a pasted feed fails to fetch or parse (any
+ * FeedError), and SHOW_NO_QLOO_MATCH when every candidate was dropped or a
+ * pasted feed has no title; FeedError from classifyInput or the directory
+ * lookup; and any QlooError other than QLOO_BAD_INPUT (such as QLOO_BUDGET)
+ * from the Qloo search.
  */
 export async function resolveShow(
   input: RunInput,
   deps: {
     searchShows: (term: string) => Promise<ShowCandidate[]>;
     lookupShow: (appleId: string) => Promise<ShowCandidate | null>;
+    safeFetch: (url: URL) => Promise<{ body: string }>;
+    parseFeed: (xml: string) => ParsedFeed;
     qloo: MeteredQloo;
   },
 ): Promise<ResolvedShow[]> {
@@ -98,17 +126,21 @@ export async function resolveShow(
       listed = show === null ? [] : [fromDirectory(show)];
       break;
     }
-    case "feed":
+    case "feed": {
+      const name = clean(await feedTitle(classified.url, deps));
+      // An untitled feed has nothing to match, so no Qloo search is spent on it.
+      if (name === "") throw new AgentError("SHOW_NO_QLOO_MATCH");
       listed = [
         {
           appleId: null,
-          name: clean(classified.url.hostname),
-          publisher: "",
+          name,
+          publisher: clean(classified.url.hostname),
           feedHandleSource: "visitor",
           feedUrl: classified.url.href,
         },
       ];
       break;
+    }
   }
 
   const shows = listed.filter((show) => show.name !== "").slice(0, MAX_CANDIDATES);

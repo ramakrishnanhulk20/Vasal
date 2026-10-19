@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AgentPort } from "../src/server/agent-port.js";
+import { createUnavailableAgent, type AgentPort } from "../src/server/agent-port.js";
 import { createApp, type AppDeps } from "../src/server/app.js";
 import type { ServerConfig } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
@@ -16,11 +16,15 @@ import {
   claimBrief,
   claimRunStatus,
   createRun,
+  getBriefClaim,
   getRun,
   listBoard,
   listCandidates,
   listEventsAfter,
+  markBriefDone,
+  markBriefFailed,
   putBoard,
+  putBrief,
   putCandidates,
   setRunStatus,
   type RunInput,
@@ -135,6 +139,7 @@ async function snapshot(): Promise<string> {
     "SELECT visitor_hash, runs FROM visitor_counters ORDER BY visitor_hash",
     "SELECT n FROM inflight",
     "SELECT key, cap, used FROM usage_buckets ORDER BY key",
+    "SELECT run_id, position FROM showcase_runs ORDER BY position",
   ];
   const results = [];
   for (const text of tables) results.push((await db.query(text)).rows);
@@ -143,6 +148,21 @@ async function snapshot(): Promise<string> {
 
 async function settled(expected = 0): Promise<void> {
   await vi.waitFor(async () => expect(await inflight()).toBe(expected));
+}
+
+// Records every statement the app sends, so a test can count meter reads
+// and writes exactly.
+function countingDb(inner: Db) {
+  const texts: string[] = [];
+  const wrap = (target: Db): Db => ({
+    query: <R = Record<string, unknown>>(text: string, params?: unknown[]) => {
+      texts.push(text);
+      return target.query<R>(text, params);
+    },
+    transaction: <T>(fn: (handle: Db) => Promise<T>) => target.transaction((handle) => fn(wrap(handle))),
+    close: () => target.close(),
+  });
+  return { db: wrap(inner), texts };
 }
 
 async function codeOf(promise: Promise<unknown>): Promise<string | undefined> {
@@ -555,6 +575,85 @@ describe("reads never spend (C5.4)", () => {
   });
 });
 
+describe("GET /showcase (C5.4, C6.3)", () => {
+  // Synthetic guests in the shape the agent runner stores (C7.3).
+  const guest = (n: number) => ({
+    personId: `00000000-0000-4000-8000-0000000004${String(n).padStart(2, "0")}`,
+    name: `Synthetic Guest ${n}`,
+    fit: n / 100,
+    fitKnown: true,
+    fitRank: n,
+    reach: "well known",
+    rising: { state: "steady", points: 0 },
+    bringsNew: null,
+    sharedTags: [],
+    angle: "A synthetic angle.",
+    showName: "Synthetic Show",
+  });
+
+  it("lists only promoted runs from storage alone, with the public cache header, no noindex, and no agent, Turnstile or meter call", async () => {
+    const counting = countingDb(db);
+    const { app, agent, verify } = build({ db: counting.db });
+    const first = await runWithBoard([guest(1), guest(2), guest(3), guest(4)]);
+    const second = await runWithBoard([guest(5), guest(6), guest(7)]);
+    const unpromoted = await runWithBoard([guest(8), guest(9), guest(10)]);
+    for (const [runId, position] of [
+      [second.runId, 1],
+      [first.runId, 2],
+    ] as const) {
+      await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, $2, $3::timestamptz)", [
+        runId,
+        position,
+        NOW.toISOString(),
+      ]);
+    }
+    const before = await snapshot();
+
+    const res = await app.request("/showcase", { headers: { origin: APP_ORIGIN } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=60");
+    expect(res.headers.get("x-robots-tag")).toBeNull();
+    const text = await res.text();
+    const body = JSON.parse(text) as { runs: Array<{ runId: string; position: number; guests: Array<{ id: string }> }> };
+    expect(body.runs.map((run) => [run.runId, run.position])).toEqual([
+      [second.runId, 1],
+      [first.runId, 2],
+    ]);
+    expect(body.runs[0]).toEqual({
+      runId: second.runId,
+      position: 1,
+      showName: "Synthetic Show",
+      finishedAt: NOW.toISOString(),
+      guests: [5, 6, 7].map((n, i) => ({
+        id: second.guestIds[i],
+        name: `Synthetic Guest ${n}`,
+        fit: n / 100,
+        fitKnown: true,
+        reach: "well known",
+        rising: "steady",
+        bringsNew: null,
+      })),
+    });
+    expect(body.runs[1]!.guests.map((shown) => shown.id)).toEqual(first.guestIds.slice(0, 3));
+    expect(text).not.toContain(unpromoted.runId);
+    expect(text).not.toContain(first.guestIds[3]);
+
+    const head = await app.request("/showcase", { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(head.headers.get("cache-control")).toBe("public, max-age=60");
+
+    expect(await snapshot()).toBe(before);
+    expect(agent.startRun).not.toHaveBeenCalled();
+    expect(agent.continueRun).not.toHaveBeenCalled();
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled();
+    expect(counting.texts.length).toBeGreaterThan(0);
+    expect(counting.texts.filter((query) => /usage_buckets|app_flags|inflight/.test(query))).toHaveLength(0);
+    expect(counting.texts.filter((query) => !/^\s*SELECT\b/i.test(query))).toHaveLength(0);
+  });
+});
+
 describe("everything else", () => {
   it("gives 404 for every other path and method, with no list of runs (C6.1)", async () => {
     const { app } = build();
@@ -822,5 +921,160 @@ describe("POST /runs/:id/brief", () => {
     expect((await getRun(db, runId))?.status).toBe("done");
     expect(await listBoard(db, runId)).toEqual(boardBefore);
     expect(await listEventsAfter(db, runId, 0)).toEqual([]);
+  });
+
+  it("writes a failed brief once more, then answers 409 BRIEF_FAILED with its code (C5.8)", async () => {
+    // Fails the way the real runner does: the claim is marked with only the code.
+    const writeBrief: AgentPort["writeBrief"] = async (runId, guestId) => {
+      await markBriefFailed(db, runId, guestId, "MODEL_TIMEOUT");
+    };
+    const { app, agent } = build({ agent: { writeBrief } });
+    const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
+    const guestId = guestIds[0]!;
+    const ask = () => postJson(app, `/runs/${runId}/brief`, { guestId });
+
+    const first = await ask();
+    expect(first.status).toBe(202);
+    expect(await first.json()).toEqual({ status: "pending" });
+    await vi.waitFor(async () =>
+      expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" }),
+    );
+
+    const second = await ask();
+    expect(second.status).toBe(202);
+    expect(await second.json()).toEqual({ status: "pending" });
+    expect(agent.writeBrief).toHaveBeenCalledTimes(2);
+    expect(agent.writeBrief).toHaveBeenNthCalledWith(2, runId, guestId);
+    await vi.waitFor(async () =>
+      expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 2, errorCode: "MODEL_TIMEOUT" }),
+    );
+
+    for (let i = 0; i < 2; i += 1) {
+      const refused = await ask();
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toEqual({ error: "BRIEF_FAILED", code: "MODEL_TIMEOUT" });
+    }
+    expect(agent.writeBrief).toHaveBeenCalledTimes(2);
+    expect((await getRun(db, runId))?.status).toBe("done");
+  });
+
+  it("with live runs off, answers a twice-failed brief 409 and a pending one 202, and refuses only new model spend with 503 (C5.7)", async () => {
+    const { app, agent } = build();
+    const { runId, guestIds } = await runWithBoard([{ name: "twice" }, { name: "new" }, { name: "pending" }, { name: "once" }]);
+    const [twice, fresh, pending, once] = guestIds as [string, string, string, string];
+    await claimBrief(db, runId, twice, 5, NOW);
+    await markBriefFailed(db, runId, twice, "MODEL_TIMEOUT");
+    await claimBrief(db, runId, twice, 5, NOW);
+    await markBriefFailed(db, runId, twice, "AGENT_BAD_PROSE");
+    await claimBrief(db, runId, pending, 5, NOW);
+    await claimBrief(db, runId, once, 5, NOW);
+    await markBriefFailed(db, runId, once, "MODEL_TIMEOUT");
+    await setFlag(db, "live_runs", false);
+    const before = await snapshot();
+    const ask = (guestId: string) => postJson(app, `/runs/${runId}/brief`, { guestId });
+
+    const failed = await ask(twice);
+    expect(failed.status).toBe(409);
+    expect(await failed.json()).toEqual({ error: "BRIEF_FAILED", code: "AGENT_BAD_PROSE" });
+    const waiting = await ask(pending);
+    expect(waiting.status).toBe(202);
+    expect(await waiting.json()).toEqual({ status: "pending" });
+    // A brand-new brief and the one retry of a failed brief would both call the model.
+    for (const guestId of [fresh, once]) {
+      const off = await ask(guestId);
+      expect(off.status).toBe(503);
+      expect(await off.json()).toEqual({ error: "LIVE_RUNS_OFF" });
+    }
+
+    expect(await snapshot()).toBe(before);
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await getBriefClaim(db, runId, once)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+    expect(await getBriefClaim(db, runId, fresh)).toBeNull();
+  });
+
+  it("with the unavailable agent, leaves the claim failed with AGENT_NOT_READY instead of pending", async () => {
+    const app = createApp({
+      db,
+      config: CONFIG,
+      verifyTurnstile: async () => true,
+      agent: createUnavailableAgent(db),
+      socketAddress: () => null,
+    });
+    const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
+    const guestId = guestIds[0]!;
+
+    const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ status: "pending" });
+
+    await vi.waitFor(async () =>
+      expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 1, errorCode: "AGENT_NOT_READY" }),
+    );
+    const poll = await app.request(`/runs/${runId}/briefs/${guestId}`);
+    expect(await poll.json()).toEqual({ status: "failed", code: "AGENT_NOT_READY" });
+    expect((await getRun(db, runId))?.status).toBe("done");
+    expect(await listEventsAfter(db, runId, 0)).toEqual([]);
+  });
+});
+
+describe("GET /runs/:id/briefs/:guestId", () => {
+  it("reports none, pending, failed and done from storage alone, with no agent, Turnstile or meter call (C5.4)", async () => {
+    const counting = countingDb(db);
+    const { app, agent, verify } = build({ db: counting.db });
+    const { runId, guestIds } = await runWithBoard([{ name: "none" }, { name: "pending" }, { name: "failed" }, { name: "done" }]);
+    await claimBrief(db, runId, guestIds[1]!, 5, NOW);
+    await claimBrief(db, runId, guestIds[2]!, 5, NOW);
+    await markBriefFailed(db, runId, guestIds[2]!, "MODEL_TIMEOUT");
+    await claimBrief(db, runId, guestIds[3]!, 5, NOW);
+    await putBrief(db, runId, guestIds[3]!, { text: "stored" }, NOW);
+    await markBriefDone(db, runId, guestIds[3]!);
+    const before = await snapshot();
+
+    const expected = [
+      { status: "none" },
+      { status: "pending" },
+      { status: "failed", code: "MODEL_TIMEOUT" },
+      { status: "done", brief: { text: "stored" } },
+    ];
+    for (const [i, body] of expected.entries()) {
+      const res = await app.request(`/runs/${runId}/briefs/${guestIds[i]}`, { headers: { origin: APP_ORIGIN } });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(body);
+      expect(res.headers.get("x-robots-tag")).toBe("noindex");
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
+    const head = await app.request(`/runs/${runId}/briefs/${guestIds[1]}`, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+
+    expect(await snapshot()).toBe(before);
+    expect(agent.startRun).toHaveBeenCalledTimes(0);
+    expect(agent.continueRun).toHaveBeenCalledTimes(0);
+    expect(agent.writeBrief).toHaveBeenCalledTimes(0);
+    expect(verify).toHaveBeenCalledTimes(0);
+    expect(counting.texts.length).toBeGreaterThan(0);
+    expect(counting.texts.filter((text) => text.includes("usage_buckets"))).toHaveLength(0);
+    expect(counting.texts.filter((text) => !/^\s*SELECT\b/i.test(text))).toHaveLength(0);
+  });
+
+  it("gives 404 for an unknown run and for a guest not on that run's board", async () => {
+    const { app } = build();
+    const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
+    const { guestIds: elsewhere } = await runWithBoard([{ name: "elsewhere" }]);
+    const cases: Array<[string, string]> = [
+      [`/runs/${randomUUID()}/briefs/${guestIds[0]}`, "NOT_FOUND"],
+      [`/runs/not-a-uuid/briefs/${guestIds[0]}`, "NOT_FOUND"],
+      [`/runs/${runId}/briefs/${elsewhere[0]}`, "UNKNOWN_GUEST"],
+      [`/runs/${runId}/briefs/${randomUUID()}`, "UNKNOWN_GUEST"],
+      [`/runs/${runId}/briefs/${guestIds[0]!.toUpperCase()}`, "UNKNOWN_GUEST"],
+      [`/runs/${runId}/briefs/Barack%20Obama`, "UNKNOWN_GUEST"],
+    ];
+    for (const [path, error] of cases) {
+      const res = await app.request(path);
+      expect(res.status, path).toBe(404);
+      expect(await res.json()).toEqual({ error });
+      expect(res.headers.get("x-robots-tag")).toBe("noindex");
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
   });
 });

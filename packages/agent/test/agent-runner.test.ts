@@ -1,9 +1,11 @@
 // Covers the agent runner end to end on a migrated PGlite database, with a
 // scripted fake model, a fake directory and feed fetcher, the real feed
 // parser, and a fake metered Qloo holding synthetic data. It also covers
-// finishRun, the run-store step the runner ends every run with. It does not
-// cover the HTTP routes (server-app), the real network, the real model, or
-// races between database connections (PGlite has one).
+// finishRun, the run-store step the runner ends every run with, reads
+// GET /runs/:id once to show a pasted feed's URL stays private, and reads a
+// stored board back through listShowcase so the two schemas agree. It does not
+// cover the other HTTP routes (server-app), the real network, the real
+// model, or races between database connections (PGlite has one).
 import type Anthropic from "@anthropic-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
@@ -16,6 +18,8 @@ import { parseFeed } from "../src/feeds/rss.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
+import { createApp } from "../src/server/app.js";
+import type { ServerConfig } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
 import {
   claimBrief,
@@ -23,10 +27,12 @@ import {
   createRun,
   finishRun,
   getBrief,
+  getBriefClaim,
   getRun,
   listBoard,
   listCandidates,
   listEventsAfter,
+  listShowcase,
   setRunStatus,
   type RunInput,
 } from "../src/server/runs.js";
@@ -219,6 +225,56 @@ describe("startRun (C6.2)", () => {
     expect(ops.every((op) => op.op === "search")).toBe(true);
   });
 
+  it("names a pasted feed after its title, and neither the candidates event nor GET /runs/:id carries its URL (C1.5)", async () => {
+    const pasted = `https://feeds.example/private-feed.xml?token=${MARKER}`;
+    const { runId, input, agent, fetched } = await setup({ input: { show: pasted, exclude: [] } });
+
+    await agent.startRun(runId, input);
+
+    expect((await getRun(db, runId))?.status).toBe("awaiting_confirm");
+    const [stored] = await listCandidates(db, runId);
+    expect(stored!.data).toEqual({
+      appleId: null,
+      name: "Synthetic Show",
+      publisher: "feeds.example",
+      feedHandleSource: "visitor",
+      feedUrl: pasted,
+      qlooId: PODCAST_ID,
+      qlooName: "Synthetic Show",
+    });
+    const shown = { id: stored!.id, appleId: null, name: "Synthetic Show", publisher: "feeds.example", qlooName: "Synthetic Show" };
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.map((event) => event.data)).toEqual([{ candidates: [shown] }]);
+
+    const config: ServerConfig = {
+      production: false,
+      port: 8787,
+      appOrigin: "http://localhost:3000",
+      databaseUrl: null,
+      visitorHashSecret: "v".repeat(32),
+      turnstileSecret: "test-secret",
+      clientIpHeader: null,
+      runsPerVisitorPerDay: 5,
+      maxInflightRuns: 3,
+      anthropicApiKey: null,
+      model: "claude-haiku-5-5",
+      effort: "medium",
+      anthropicTokensPerDay: 2_000_000,
+    };
+    const app = createApp({ db, config, verifyTurnstile: async () => true, agent, socketAddress: () => null });
+    const page = await (await app.request(`/runs/${runId}`)).text();
+    expect((JSON.parse(page) as { candidates: unknown }).candidates).toEqual([shown]);
+    for (const text of [JSON.stringify(events), page]) {
+      for (const fragment of ["http", "private-feed", MARKER, "feedUrl", "feedHandleSource"]) expect(text).not.toContain(fragment);
+    }
+
+    // No episode title was kept at resolve time, so the confirmed run reads the feed again.
+    expect(fetched.map((url) => url.href)).toEqual([pasted]);
+    await agent.continueRun(runId, await confirmFirst(runId));
+    expect((await getRun(db, runId))?.status).toBe("done");
+    expect(fetched.map((url) => url.href)).toEqual([pasted, pasted]);
+  });
+
   it("fails the run with only the code when no show is found", async () => {
     const runId = await createRun(db, { show: "Nothing", exclude: [] }, NOW);
     const { feeds } = fakeFeeds({ shows: [] });
@@ -344,6 +400,25 @@ describe("continueRun (C1.5, C6.4)", () => {
     expect(await listBoard(db, runId)).toEqual([]);
   });
 
+  it("fails the run with MODEL_TIMEOUT and no board when a research turn passes its time limit (C2.4, C6.4)", async () => {
+    const { runId, input, agent } = await setup();
+    await agent.startRun(runId, input);
+    const timingOut: ModelClient = {
+      ...fakeModel().model,
+      turn: async () => {
+        throw new AgentError("MODEL_TIMEOUT");
+      },
+    };
+    const slow = createAgentRunner({ db, model: timingOut, qloo: fakeQloo().qloo, feeds: fakeFeeds().feeds, now: () => NOW });
+
+    await slow.continueRun(runId, await confirmFirst(runId));
+
+    expect(await getRun(db, runId)).toMatchObject({ status: "failed", errorCode: "MODEL_TIMEOUT" });
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.at(-1)).toEqual({ seq: events.length, event: "failed", data: { code: "MODEL_TIMEOUT" } });
+    expect(await listBoard(db, runId)).toEqual([]);
+  });
+
   it("refuses a candidate id this run never stored", async () => {
     const { runId, input, agent, fetched } = await setup();
     await agent.startRun(runId, input);
@@ -353,6 +428,28 @@ describe("continueRun (C1.5, C6.4)", () => {
 
     expect(await getRun(db, runId)).toMatchObject({ status: "failed", errorCode: "SHOW_NOT_FOUND" });
     expect(fetched).toHaveLength(0);
+  });
+
+  it("stores a board the home page reads back whole once it is promoted (C6.5)", async () => {
+    const { runId, input, agent } = await setup();
+    await agent.startRun(runId, input);
+    await agent.continueRun(runId, await confirmFirst(runId));
+    const board = await listBoard(db, runId);
+    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 1, $2::timestamptz)", [
+      runId,
+      NOW.toISOString(),
+    ]);
+
+    const [shown, ...rest] = await listShowcase(db);
+
+    expect(rest).toEqual([]);
+    expect(shown).toMatchObject({ runId, position: 1, showName: "Synthetic Show 1", finishedAt: NOW });
+    expect(shown?.guests.map((guest) => [guest.id, guest.name, guest.fit, guest.fitKnown])).toEqual([
+      [board[0]!.id, "Synthetic Person 2", 0.77, true],
+      [board[1]!.id, "Synthetic Person 3", 0.55, true],
+      [board[2]!.id, "Synthetic Person 1", 0.41, true],
+    ]);
+    expect(shown?.guests[0]).toMatchObject({ rising: "rising", bringsNew: "listeners 25 to 29" });
   });
 });
 
@@ -376,6 +473,59 @@ describe("writeBrief", () => {
       { tool: "brief", ok: true, label: "Removed 1 link and 0 email addresses from the draft" },
       { guestId: first!.id, ok: true },
     ]);
+    expect(await getBriefClaim(db, runId, first!.id)).toEqual({ status: "done", attempts: 1, errorCode: null });
+  });
+
+  it("marks a failed brief's claim failed with only its code, keeps the run done, and writes it on the one retry (C5.8)", async () => {
+    const { runId, input, agent } = await setup();
+    await agent.startRun(runId, input);
+    await agent.continueRun(runId, await confirmFirst(runId));
+    const [first] = await listBoard(db, runId);
+    const timingOut: ModelClient = {
+      ...fakeModel().model,
+      structured: async () => {
+        throw new AgentError("MODEL_TIMEOUT");
+      },
+    };
+    const failing = createAgentRunner({ db, model: timingOut, qloo: fakeQloo().qloo, feeds: fakeFeeds().feeds, now: () => NOW });
+    expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
+
+    await failing.writeBrief(runId, first!.id);
+
+    expect(await getBriefClaim(db, runId, first!.id)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+    expect(await getBrief(db, runId, first!.id)).toBeNull();
+    expect((await getRun(db, runId))?.status).toBe("done");
+    expect((await listEventsAfter(db, runId, 0)).at(-1)?.data).toEqual({ guestId: first!.id, ok: false, code: "MODEL_TIMEOUT" });
+
+    expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
+    await agent.writeBrief(runId, first!.id);
+
+    expect(await getBriefClaim(db, runId, first!.id)).toEqual({ status: "done", attempts: 2, errorCode: null });
+    expect(await getBrief(db, runId, first!.id)).toMatchObject({ pitch_subject: "Synthetic Show 1 would love to have Synthetic Person 2" });
+  });
+
+  it("marks the claim failed with UNEXPECTED on an unexpected error, then rethrows it for the route to log", async () => {
+    const { runId, input, agent } = await setup();
+    await agent.startRun(runId, input);
+    await agent.continueRun(runId, await confirmFirst(runId));
+    const [first] = await listBoard(db, runId);
+    const broken: ModelClient = {
+      ...fakeModel().model,
+      structured: async () => {
+        throw new Error(MARKER);
+      },
+    };
+    const failing = createAgentRunner({ db, model: broken, qloo: fakeQloo().qloo, feeds: fakeFeeds().feeds, now: () => NOW });
+    expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
+    const eventsBefore = await listEventsAfter(db, runId, 0);
+
+    await expect(failing.writeBrief(runId, first!.id)).rejects.toThrow(MARKER);
+
+    expect(await getBriefClaim(db, runId, first!.id)).toEqual({ status: "failed", attempts: 1, errorCode: "UNEXPECTED" });
+    expect(await getBrief(db, runId, first!.id)).toBeNull();
+    expect((await getRun(db, runId))?.status).toBe("done");
+    expect(await listEventsAfter(db, runId, 0)).toEqual(eventsBefore);
+    expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
   });
 });
 

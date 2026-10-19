@@ -1,19 +1,29 @@
 // Covers the run store on PGlite: ids, status rules, events, candidates, the
-// board, briefs and the restart sweep. It does not cover races between
-// separate connections (PGlite has one), the vasal_app grants in roles.sql,
-// the shapes of candidate, guest and brief data (the routes and the agent
-// own those), or the HTTP routes that call these functions.
+// board, briefs, brief claims and their one retry, the restart sweeps for
+// runs and brief claims, and the home-page showcase, including the app
+// role's grants on showcase_runs
+// (roles.sql applied to PGlite). It does not cover races between separate
+// connections (PGlite has one), the other vasal_app grants, the shapes of
+// candidate and brief data (the routes and the agent own those), or the HTTP
+// routes that call these functions.
+import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ServerError } from "../src/server/errors.js";
 import {
   appendEvent,
+  claimBrief,
   createRun,
   failInterruptedRuns,
+  failStaleBriefClaims,
   getBoardGuest,
   getBrief,
+  getBriefClaim,
   getCandidate,
   getRun,
   listEventsAfter,
+  listShowcase,
+  markBriefDone,
+  markBriefFailed,
   putBoard,
   putBrief,
   putCandidates,
@@ -23,6 +33,7 @@ import {
   type RunStatus,
 } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
+import { StoreError } from "../src/store/errors.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
 const NOW = new Date("2026-10-19T12:00:00.000Z");
@@ -434,6 +445,109 @@ describe("briefs (C5.8)", () => {
   });
 });
 
+describe("brief claims (C5.8)", () => {
+  async function claimRow(run: string, guest: string) {
+    const { rows } = await db.query(
+      "SELECT status, attempts, error_code FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+      [run, guest],
+    );
+    return rows[0];
+  }
+
+  it("claims a guest once, pending with attempts 1, and keeps a done claim done", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+
+    expect(await getBriefClaim(db, run, guest!)).toBeNull();
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("claimed");
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 1, error_code: null });
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("exists");
+
+    expect(await markBriefDone(db, run, guest!)).toBe(true);
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("exists");
+    expect(await markBriefDone(db, run, guest!)).toBe(false);
+    expect(await markBriefFailed(db, run, guest!, "MODEL_TIMEOUT")).toBe(false);
+    expect((await getBriefClaim(db, run, guest!))?.status).toBe("done");
+  });
+
+  it("allows one retry of a failed brief, then answers failed for good", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    await claimBrief(db, run, guest!, 5, NOW);
+
+    expect(await markBriefFailed(db, run, guest!, "MODEL_TIMEOUT")).toBe(true);
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("claimed");
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 2, error_code: null });
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("exists");
+
+    expect(await markBriefFailed(db, run, guest!, "AGENT_BAD_PROSE")).toBe(true);
+    for (let i = 0; i < 3; i += 1) expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("failed");
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "failed", attempts: 2, errorCode: "AGENT_BAD_PROSE" });
+    expect(await rowCount("run_brief_claims")).toBe(1);
+  });
+
+  it("gives one winner when a failed brief is re-claimed twice at once", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    await claimBrief(db, run, guest!, 5, NOW);
+    await markBriefFailed(db, run, guest!, "MODEL_UPSTREAM");
+
+    const results = await Promise.all(Array.from({ length: 4 }, () => claimBrief(db, run, guest!, 5, NOW)));
+
+    expect([...results].sort()).toEqual(["claimed", "exists", "exists", "exists"]);
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 2, error_code: null });
+  });
+
+  it("counts a retried claim once against the per-run limit", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [first, second] = await putBoard(db, run, [{ name: "First" }, { name: "Second" }]);
+    await claimBrief(db, run, first!, 1, NOW);
+    await markBriefFailed(db, run, first!, "QLOO_BUDGET");
+
+    expect(await claimBrief(db, run, second!, 1, NOW)).toBe("limit");
+    expect(await claimBrief(db, run, first!, 1, NOW)).toBe("claimed");
+    expect(await claimBrief(db, run, second!, 1, NOW)).toBe("limit");
+  });
+
+  it("refuses free-text codes and bad ids, and moves nothing that is not pending", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest, unclaimed] = await putBoard(db, run, [{ name: "Guest" }, { name: "Unclaimed" }]);
+    await claimBrief(db, run, guest!, 5, NOW);
+
+    for (const code of [`${MARKER} text`, "lower_case", "", "A".repeat(65)]) {
+      expect(await codeOf(markBriefFailed(db, run, guest!, code))).toBe("SRV_BAD_INPUT");
+    }
+    expect(await codeOf(markBriefDone(db, "nope", guest!))).toBe("SRV_BAD_INPUT");
+    expect(await codeOf(markBriefFailed(db, run, "Guest", "MODEL_TIMEOUT"))).toBe("SRV_BAD_INPUT");
+    expect(await markBriefFailed(db, run, unclaimed!, "MODEL_TIMEOUT")).toBe(false);
+    expect(await markBriefDone(db, run, unclaimed!)).toBe(false);
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 1, error_code: null });
+    expect(await rowCount("run_brief_claims")).toBe(1);
+  });
+
+  it("refuses a third attempt or an unknown status in the table, and reads a bad row as missing without spending (C6.5)", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest, odd] = await putBoard(db, run, [{ name: "Guest" }, { name: "Odd" }]);
+    const insert = `INSERT INTO run_brief_claims (run_id, guest_id, status, attempts, error_code, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::timestamptz)`;
+
+    await expect(db.query(insert, [run, guest, "failed", 3, "X", NOW.toISOString()])).rejects.toThrow();
+    await expect(db.query(insert, [run, guest, "retrying", 1, null, NOW.toISOString()])).rejects.toThrow();
+
+    await db.query(insert, [run, odd, "failed", 1, null, NOW.toISOString()]);
+    expect(await getBriefClaim(db, run, odd!)).toBeNull();
+    expect(await claimBrief(db, run, odd!, 5, NOW)).toBe("exists");
+    expect(await claimRow(run, odd!)).toEqual({ status: "failed", attempts: 1, error_code: null });
+
+    const { db: recording, calls } = recordingDb();
+    expect(await getBriefClaim(recording, "nope", guest!)).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+});
+
 describe("failInterruptedRuns (C6.4)", () => {
   it("fails every open run with SERVER_RESTART and a failed event, and leaves ended runs alone", async () => {
     const queued = await runIn("queued");
@@ -473,5 +587,181 @@ describe("failInterruptedRuns (C6.4)", () => {
 
     expect(await getRun(db, id)).toMatchObject({ status: "failed", errorCode: "SERVER_RESTART" });
     expect(await rowCount("run_events")).toBe(500);
+  });
+});
+
+describe("failStaleBriefClaims (C6.4)", () => {
+  const MINUTE = 60_000;
+  const ago = (ms: number) => new Date(NOW.getTime() - ms);
+
+  it("fails only pending claims created before the cutoff, with SERVER_RESTART, and leaves their retry open", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [old, atLimit, recent, doneOld, failedOld] = await putBoard(db, run, [1, 2, 3, 4, 5].map((n) => ({ n })));
+    await claimBrief(db, run, old!, 10, ago(10 * MINUTE));
+    await claimBrief(db, run, atLimit!, 10, ago(5 * MINUTE));
+    await claimBrief(db, run, recent!, 10, ago(MINUTE));
+    await claimBrief(db, run, doneOld!, 10, ago(10 * MINUTE));
+    await markBriefDone(db, run, doneOld!);
+    await claimBrief(db, run, failedOld!, 10, ago(10 * MINUTE));
+    await markBriefFailed(db, run, failedOld!, "MODEL_TIMEOUT");
+
+    expect(await failStaleBriefClaims(db, 5 * MINUTE, NOW)).toBe(1);
+
+    expect(await getBriefClaim(db, run, old!)).toEqual({ status: "failed", attempts: 1, errorCode: "SERVER_RESTART" });
+    expect(await getBriefClaim(db, run, atLimit!)).toEqual({ status: "pending", attempts: 1, errorCode: null });
+    expect(await getBriefClaim(db, run, recent!)).toEqual({ status: "pending", attempts: 1, errorCode: null });
+    expect(await getBriefClaim(db, run, doneOld!)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(await getBriefClaim(db, run, failedOld!)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+    expect(await failStaleBriefClaims(db, 5 * MINUTE, NOW)).toBe(0);
+    expect(await claimBrief(db, run, old!, 10, NOW)).toBe("claimed");
+  });
+
+  it("refuses a bad age or date and changes nothing", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    await claimBrief(db, run, guest!, 5, ago(10 * MINUTE));
+
+    for (const ms of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER]) {
+      expect(await codeOf(failStaleBriefClaims(db, ms, NOW)), String(ms)).toBe("SRV_BAD_INPUT");
+    }
+    expect(await codeOf(failStaleBriefClaims(db, MINUTE, new Date(Number.NaN)))).toBe("SRV_BAD_INPUT");
+    expect((await getBriefClaim(db, run, guest!))?.status).toBe("pending");
+  });
+});
+
+describe("listShowcase (C6.3, C6.5)", () => {
+  // Synthetic guests in the shape the agent runner stores (C7.3).
+  const guest = (n: number, overrides: Record<string, unknown> = {}) => ({
+    personId: `00000000-0000-4000-8000-0000000003${String(n).padStart(2, "0")}`,
+    name: `Synthetic Guest ${n}`,
+    fit: n / 100,
+    fitKnown: n % 3 !== 0,
+    fitRank: n,
+    reach: "bookable",
+    rising: { state: "rising", points: 3.5 },
+    bringsNew: n % 2 === 0 ? { segment: "age", label: "listeners 25 to 29", gap: 0.4 } : null,
+    sharedTags: ["synthetic taste"],
+    angle: "Their fans already love this kind of talk.",
+    showName: "Synthetic Show",
+    ...overrides,
+  });
+  const shownGuest = (id: string, n: number) => ({
+    id,
+    name: `Synthetic Guest ${n}`,
+    fit: n / 100,
+    fitKnown: n % 3 !== 0,
+    reach: "bookable",
+    rising: "rising",
+    bringsNew: n % 2 === 0 ? "listeners 25 to 29" : null,
+  });
+
+  async function endedRun(status: "done" | "failed", guests: unknown[]): Promise<{ runId: string; guestIds: string[] }> {
+    const runId = await createRun(db, INPUT, NOW);
+    await setRunStatus(db, runId, "running", undefined, NOW);
+    const guestIds = await putBoard(db, runId, guests);
+    await setRunStatus(db, runId, status, status === "failed" ? "QLOO_LIMIT" : undefined, LATER);
+    return { runId, guestIds };
+  }
+
+  // Straight into the table as the owner, the way the promote command writes,
+  // so these tests can place runs that promoteRun itself would refuse.
+  async function promote(runId: string, position: number): Promise<void> {
+    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, $2, $3::timestamptz)", [
+      runId,
+      position,
+      LATER.toISOString(),
+    ]);
+  }
+
+  it("lists promoted done runs by position with their top 3 guests, and skips every run it cannot show whole", async () => {
+    const four = await endedRun("done", [guest(1), guest(2), guest(3), guest(4)]);
+    const three = await endedRun("done", [guest(5), guest(6), guest(7)]);
+    const failed = await endedRun("failed", [guest(8), guest(9), guest(10)]);
+    const two = await endedRun("done", [guest(11), guest(12)]);
+    const badGuest = await endedRun("done", [guest(13), guest(14, { name: "" }), guest(15), guest(16)]);
+    const extraField = await endedRun("done", [guest(17), guest(18), guest(19, { url: "https://evil.example" })]);
+    const twoShows = await endedRun("done", [guest(20), guest(21, { showName: "Another Show" }), guest(22)]);
+    const unpromoted = await endedRun("done", [guest(23), guest(24), guest(25)]);
+    const badRun = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO runs (id, status, input, error_code, created_at, finished_at)
+       VALUES ($1::uuid, 'done', '{"show":5,"exclude":[]}'::json, NULL, $2::timestamptz, $2::timestamptz)`,
+      [badRun, NOW.toISOString()],
+    );
+    await putBoard(db, badRun, [guest(26), guest(27), guest(28)]);
+
+    await promote(four.runId, 7);
+    await promote(three.runId, 2);
+    await promote(failed.runId, 1);
+    await promote(two.runId, 3);
+    await promote(badGuest.runId, 4);
+    await promote(extraField.runId, 5);
+    await promote(twoShows.runId, 6);
+    await promote(badRun, 12);
+
+    expect(await listShowcase(db)).toEqual([
+      {
+        runId: three.runId,
+        position: 2,
+        showName: "Synthetic Show",
+        finishedAt: LATER,
+        guests: [shownGuest(three.guestIds[0]!, 5), shownGuest(three.guestIds[1]!, 6), shownGuest(three.guestIds[2]!, 7)],
+      },
+      {
+        runId: four.runId,
+        position: 7,
+        showName: "Synthetic Show",
+        finishedAt: LATER,
+        guests: [shownGuest(four.guestIds[0]!, 1), shownGuest(four.guestIds[1]!, 2), shownGuest(four.guestIds[2]!, 3)],
+      },
+    ]);
+    expect(JSON.stringify(await listShowcase(db))).not.toContain(unpromoted.runId);
+  });
+
+  it("gives an empty list when nothing is promoted", async () => {
+    await endedRun("done", [guest(1), guest(2), guest(3)]);
+
+    expect(await listShowcase(db)).toEqual([]);
+  });
+
+  async function applyRoles(): Promise<void> {
+    const sql = await readFile(new URL("../src/store/roles.sql", import.meta.url), "utf8");
+    const statements = sql
+      .split(/\r?\n/)
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n")
+      .split(";")
+      .map((statement) => statement.trim())
+      .filter((statement) => statement !== "");
+    for (const statement of statements) await db.query(statement);
+  }
+
+  it("lets the app role read the showcase and refuses it every write (C6.3, C6.6)", async () => {
+    const shown = await endedRun("done", [guest(1), guest(2), guest(3)]);
+    const other = await endedRun("done", [guest(4), guest(5), guest(6)]);
+    await promote(shown.runId, 1);
+    await applyRoles();
+    const writes: Array<[string, unknown[]]> = [
+      ["INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 2, now())", [other.runId]],
+      ["UPDATE showcase_runs SET position = 5 WHERE run_id = $1::uuid", [shown.runId]],
+      ["DELETE FROM showcase_runs WHERE run_id = $1::uuid", [shown.runId]],
+      ["TRUNCATE showcase_runs", []],
+    ];
+
+    await db.query("SET ROLE vasal_app");
+    expect((await db.query<{ who: string }>("SELECT current_user AS who")).rows).toEqual([{ who: "vasal_app" }]);
+    for (const [text, params] of writes) {
+      await expect(db.query(text, params), text).rejects.toThrow(StoreError);
+    }
+    expect((await listShowcase(db)).map((run) => [run.runId, run.position])).toEqual([[shown.runId, 1]]);
+    await db.query("RESET ROLE");
+
+    // The same statements work for the owner, so each refusal above was the grant, not the SQL.
+    const owner = await db.query<{ runId: string; position: number }>(
+      'SELECT run_id::text AS "runId", position FROM showcase_runs',
+    );
+    expect(owner.rows).toEqual([{ runId: shown.runId, position: 1 }]);
+    for (const [text, params] of writes) await db.query(text, params);
+    expect(await rowCount("showcase_runs")).toBe(0);
   });
 });

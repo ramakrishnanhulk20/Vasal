@@ -10,8 +10,8 @@
 -- the vasal_app connection string, never the owner's.
 --
 -- What the app role cannot do, by design (C6.6): change the schema, write the
--- kill switch, or delete rows. Pruning expired rows and setting caps or flags
--- are operator jobs run as the owner. Postgres 15 and later give PUBLIC no
+-- kill switch or the showcase, or delete rows. Pruning expired rows, setting
+-- caps or flags and promoting runs are operator jobs run as the owner. Postgres 15 and later give PUBLIC no
 -- CREATE on schema public, so this role cannot add tables either; on an older
 -- server, revoke that first.
 
@@ -40,5 +40,13 @@ GRANT UPDATE (status, error_code, finished_at) ON runs TO vasal_app;
 GRANT SELECT ON inflight TO vasal_app;
 GRANT UPDATE (n) ON inflight TO vasal_app;
 
--- Brief claims are append only too: a claim cannot be undone to spend again.
+-- Brief claims cannot be deleted, so a claim cannot be undone to spend again.
+-- The app may move a claim's status, code and attempts. The table's check
+-- stops attempts at 2; that attempts never go back down is held only by the
+-- app's own UPDATE, which raises it from 1 to 2 and nothing else.
 GRANT SELECT, INSERT ON run_brief_claims TO vasal_app;
+GRANT UPDATE (status, attempts, error_code) ON run_brief_claims TO vasal_app;
+
+-- The home page reads the showcase. Only the operator's promote command, run
+-- as the owner, can put a run on it or take one off (C6.3).
+GRANT SELECT ON showcase_runs TO vasal_app;

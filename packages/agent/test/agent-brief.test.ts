@@ -1,14 +1,15 @@
 // Covers writing a brief with a scripted fake model: the facts the model is
-// given, the one rewrite after failed prose, removal of links and emails,
-// and placeholders filled with code values. It does not cover checkProse's
-// own rules (agent-prose), the real model's writing, or storing the brief
-// (agent-runner). All data is synthetic.
+// given, each draft's fixed time limit, the one rewrite after failed prose,
+// removal of links and emails, and placeholders filled with code values. It
+// does not cover checkProse's own rules (agent-prose), how the client
+// enforces the limit (agent-model), the real model's writing, or storing the
+// brief (agent-runner). All data is synthetic.
 import { describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
 import type { BoardEntry } from "../src/agent/board.js";
 import { writeBrief } from "../src/agent/brief.js";
 import { AgentError } from "../src/agent/errors.js";
-import type { ModelClient } from "../src/agent/model.js";
+import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
 import { BRIEF_SYSTEM } from "../src/agent/prompts.js";
 
 const SHOW_NAME = "Synthetic Show";
@@ -38,12 +39,17 @@ type StructuredParams = Parameters<ModelClient["structured"]>[0];
 // Mirrors the real client's contract: a reply that fails the schema is AGENT_BAD_PROSE.
 function fakeModel(drafts: unknown[]) {
   const calls: StructuredParams[] = [];
+  const options: Array<ModelCallOptions | undefined> = [];
   const model: ModelClient = {
     async turn() {
       throw new Error("turn is not used for briefs");
     },
-    async structured<T>(params: { system: string; user: string; schema: ZodType<T>; maxTokens: number }): Promise<T> {
+    async structured<T>(
+      params: { system: string; user: string; schema: ZodType<T>; maxTokens: number },
+      callOptions?: ModelCallOptions,
+    ): Promise<T> {
       calls.push(params as StructuredParams);
+      options.push(callOptions);
       const next = drafts[calls.length - 1];
       if (next instanceof Error) throw next;
       const parsed = params.schema.safeParse(next);
@@ -51,7 +57,7 @@ function fakeModel(drafts: unknown[]) {
       return parsed.data;
     },
   };
-  return { model, calls };
+  return { model, calls, options };
 }
 
 async function codeOf(promise: Promise<unknown>): Promise<string> {
@@ -96,6 +102,16 @@ describe("writeBrief", () => {
 
     expect(await codeOf(writeBrief(model, { guest: GUEST, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
     expect(calls).toHaveLength(2);
+  });
+
+  it("gives every draft a fixed 45 second time limit and passes MODEL_TIMEOUT straight through (C2.4)", async () => {
+    const retried = fakeModel([{ ...GOOD, questions: ["Q?"] }, GOOD]);
+    await writeBrief(retried.model, { guest: GUEST, showName: SHOW_NAME });
+    expect(retried.options).toEqual([{ timeoutMs: 45_000 }, { timeoutMs: 45_000 }]);
+
+    const slow = fakeModel([new AgentError("MODEL_TIMEOUT")]);
+    expect(await codeOf(writeBrief(slow.model, { guest: GUEST, showName: SHOW_NAME }))).toBe("MODEL_TIMEOUT");
+    expect(slow.calls).toHaveLength(1);
   });
 
   it("keeps the second draft when only the first fails", async () => {

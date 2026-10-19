@@ -1,13 +1,16 @@
-// Covers show resolution with a fake directory and a fake metered Qloo
-// holding synthetic data: how each kind of input is looked up, the one
-// Qloo search per candidate, dropping ambiguous or missing matches, and the
-// two not-found codes. It does not cover the real iTunes or Qloo responses,
-// classifyInput's own rules (feeds-classify) or pickPodcastMatch's tiers
-// (backtest-eligibility).
+// Covers show resolution with a fake directory, a fake feed fetcher with the
+// real feed parser, and a fake metered Qloo holding synthetic data: how each
+// kind of input is looked up, the one Qloo search per candidate, dropping
+// ambiguous or missing matches, and the not-found and feed codes. It does
+// not cover the real iTunes or Qloo responses, the real network or
+// safeFetch's own limits (safe-fetch), classifyInput's own rules
+// (feeds-classify) or pickPodcastMatch's tiers (backtest-eligibility).
 import { describe, expect, it, vi } from "vitest";
 import { AgentError } from "../src/agent/errors.js";
 import { resolveShow } from "../src/agent/resolve.js";
+import { FeedError } from "../src/feeds/errors.js";
 import type { ShowCandidate } from "../src/feeds/lookup.js";
+import { parseFeed } from "../src/feeds/rss.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
@@ -39,11 +42,22 @@ function fakeQloo(respond: (op: QlooOperation) => unknown) {
 const exactMatch = (op: QlooOperation) =>
   op.op === "search" ? [{ entity_id: podcastId(Number(op.query.replace(/\D/g, "") || 0)), name: op.query }] : [];
 
-function deps(directory: { search?: ShowCandidate[]; lookup?: ShowCandidate | null }, respond = exactMatch) {
+const MARKER = "MARKER-f33d";
+const rss = (title: string) =>
+  `<?xml version="1.0"?><rss><channel><title>${title}</title><item><title>Episode one with a guest</title></item></channel></rss>`;
+
+function deps(
+  directory: { search?: ShowCandidate[]; lookup?: ShowCandidate | null; feed?: string | Error },
+  respond = exactMatch,
+) {
   const searchShows = vi.fn(async (_term: string) => directory.search ?? []);
   const lookupShow = vi.fn(async (_id: string) => directory.lookup ?? null);
+  const safeFetch = vi.fn(async (_url: URL) => {
+    if (directory.feed instanceof Error) throw directory.feed;
+    return { body: directory.feed ?? rss("Synthetic Show") };
+  });
   const { qloo, ops } = fakeQloo(respond);
-  return { deps: { searchShows, lookupShow, qloo }, searchShows, lookupShow, ops };
+  return { deps: { searchShows, lookupShow, safeFetch, parseFeed, qloo }, searchShows, lookupShow, safeFetch, ops };
 }
 
 async function codeOf(promise: Promise<unknown>): Promise<string> {
@@ -106,23 +120,78 @@ describe("resolveShow", () => {
     expect(found.map((candidate) => [candidate.appleId, candidate.qlooId])).toEqual([["123456789", podcastId(9)]]);
   });
 
-  it("names a pasted feed after its host and keeps the URL for a later handle", async () => {
-    const setup = deps({}, (op) => (op.op === "search" ? [{ entity_id: podcastId(40), name: op.query }] : []));
+  it("names a pasted feed after its title, matched through pickPodcastMatch, and keeps the URL for a later handle (C1.5)", async () => {
+    const setup = deps({ feed: rss("SmartLess") }, (op) =>
+      op.op === "search"
+        ? [
+            { entity_id: podcastId(41), name: "SmartLess Live and Unscripted" },
+            { entity_id: podcastId(40), name: "SmartLess" },
+          ]
+        : [],
+    );
+    const pasted = `https://feeds.example/private.xml?token=${MARKER}`;
 
-    const found = await resolveShow({ show: "https://feeds.example/private.xml", exclude: [] }, setup.deps);
+    const found = await resolveShow({ show: pasted, exclude: [] }, setup.deps);
 
     expect(setup.searchShows).not.toHaveBeenCalled();
+    expect(setup.lookupShow).not.toHaveBeenCalled();
+    expect(setup.safeFetch).toHaveBeenCalledTimes(1);
+    expect(setup.safeFetch.mock.calls[0]![0].href).toBe(pasted);
+    expect(setup.ops).toEqual([{ op: "search", query: "SmartLess", types: ["urn:entity:podcast"], take: 5 }]);
     expect(found).toEqual([
       {
         appleId: null,
-        name: "feeds.example",
-        publisher: "",
+        name: "SmartLess",
+        publisher: "feeds.example",
         feedHandleSource: "visitor",
-        feedUrl: "https://feeds.example/private.xml",
+        feedUrl: pasted,
         qlooId: podcastId(40),
-        qlooName: "feeds.example",
+        qlooName: "SmartLess",
       },
     ]);
+  });
+
+  it("strips direction controls from a feed title and caps it at 200 characters", async () => {
+    const setup = deps({ feed: rss(`‮${"x".repeat(250)}`) });
+
+    const [found] = await resolveShow({ show: "https://feeds.example/long.xml", exclude: [] }, setup.deps);
+
+    expect(found?.name).toBe("x".repeat(200));
+    expect(setup.ops[0]).toMatchObject({ query: "x".repeat(200) });
+  });
+
+  it("gives FEED_UNAVAILABLE with no Qloo call when the feed fails to fetch or is not a feed (C1.6)", async () => {
+    const blocked = deps({ feed: new FeedError("FEED_BLOCKED_ADDRESS") });
+    expect(await codeOf(resolveShow({ show: "http://169.254.169.254/latest", exclude: [] }, blocked.deps))).toBe("FEED_UNAVAILABLE");
+    expect(blocked.ops).toHaveLength(0);
+
+    const html = deps({ feed: `<html><body>${MARKER}</body></html>` });
+    const error = await resolveShow({ show: "https://feeds.example/page", exclude: [] }, html.deps).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(AgentError);
+    expect((error as AgentError).code).toBe("FEED_UNAVAILABLE");
+    expect(JSON.stringify(error) + String(error) + ((error as Error).stack ?? "")).not.toContain(MARKER);
+    expect(html.ops).toHaveLength(0);
+  });
+
+  it("gives SHOW_NO_QLOO_MATCH for a feed whose title Qloo cannot match to one podcast, and for an untitled feed", async () => {
+    const ambiguous = deps({ feed: rss("SmartLess") }, (op) =>
+      op.op === "search"
+        ? [
+            { entity_id: podcastId(40), name: "SmartLess" },
+            { entity_id: podcastId(42), name: "smartless" },
+          ]
+        : [],
+    );
+    expect(await codeOf(resolveShow({ show: "https://feeds.example/smartless.xml", exclude: [] }, ambiguous.deps))).toBe(
+      "SHOW_NO_QLOO_MATCH",
+    );
+    expect(ambiguous.ops).toHaveLength(1);
+
+    const untitled = deps({ feed: rss("") });
+    expect(await codeOf(resolveShow({ show: "https://feeds.example/untitled.xml", exclude: [] }, untitled.deps))).toBe(
+      "SHOW_NO_QLOO_MATCH",
+    );
+    expect(untitled.ops).toHaveLength(0);
   });
 
   it("gives SHOW_NOT_FOUND with no Qloo call when the directory has nothing", async () => {

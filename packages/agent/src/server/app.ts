@@ -20,11 +20,13 @@ import {
   createRun,
   getBoardGuest,
   getBrief,
+  getBriefClaim,
   getCandidate,
   getRun,
   listBoard,
   listCandidates,
   listEventsAfter,
+  listShowcase,
   setRunStatus,
   type RunInput,
 } from "./runs.js";
@@ -125,12 +127,20 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
 }
 
 /**
- * Builds the public agent server. Routes: GET /health, POST /runs, GET
- * /runs/:id, GET /runs/:id/events, POST /runs/:id/confirm and POST
- * /runs/:id/brief; every other path and method gives 404 NOT_FOUND, and
- * there is no way to list runs (C6.1). Confirm and brief act only on ids the
- * server issued for that run (C6.2), and each guest's brief is claimed once,
- * at most 5 per run (C5.8). The event stream writes only formatSseFrame
+ * Builds the public agent server. Routes: GET /health, GET /showcase, POST
+ * /runs, GET /runs/:id, GET /runs/:id/events, POST /runs/:id/confirm, POST
+ * /runs/:id/brief and GET /runs/:id/briefs/:guestId; every other path and
+ * method gives 404 NOT_FOUND, and there is no way to list visitor runs
+ * (C6.1). GET /showcase lists only the runs the operator promoted (C6.3),
+ * from storage alone, cacheable for 60 seconds and open to indexing.
+ * Confirm and brief act only on ids the server issued for that run (C6.2).
+ * Each guest's brief is claimed once, at most 5 claims per run, and a brief
+ * that failed may be asked for once more; after a second failure the POST
+ * gives 409 { error: "BRIEF_FAILED", code } (C5.8), even with live runs
+ * off, which refuse only a brief that would call the model. GET
+ * /runs/:id/briefs/:guestId reports { status: "done", brief },
+ * { status: "pending" }, { status: "failed", code } or { status: "none" }
+ * from storage alone. The event stream writes only formatSseFrame
  * frames and pings (C3.3), allows 3 open streams per run in this process, and
  * ends at a done or failed event, a finished and drained run, or
  * streamLifetimeMs; pings follow the `now` clock, checked once per poll.
@@ -327,6 +337,12 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/health", async (c) => c.json({ ok: true, liveRuns: await liveRunsEnabled(db) }));
 
+  // Read by the home page, so it only reads storage: no agent, human check,
+  // kill switch or meter is touched (C5.4), and only the operator's promote
+  // command decides what it lists (C6.3). Unlike a visitor's run it is meant
+  // to be public, so it may be cached and indexed.
+  app.get("/showcase", async (c) => c.json({ runs: await listShowcase(db) }, 200, { "Cache-Control": "public, max-age=60" }));
+
   app.post("/runs", sameSiteJson, smallBody, async (c) => {
     const body = await readBody(c, startBody);
     if (body === null) return refuse(c, 400, "BAD_INPUT");
@@ -436,11 +452,22 @@ export function createApp(deps: AppDeps): Hono {
 
     const brief = await getBrief(db, run.id, guestId);
     if (brief !== null) return c.json({ brief }, 200);
-    // A stored brief is still served with live runs off; only new model spend stops (C5.7).
+    // Only new model spend stops when live runs are off (C5.7), so a stored
+    // brief, a brief that failed for good and one already being written are
+    // all answered from storage first. claimBrief below stays the only gate
+    // that lets a model call through.
+    const held = await getBriefClaim(db, run.id, guestId);
+    if (held?.status === "failed" && held.attempts === 2) return c.json({ error: "BRIEF_FAILED", code: held.errorCode }, 409);
+    if (held?.status === "pending" || held?.status === "done") return c.json({ status: "pending" }, 202);
     if (!(await liveRunsEnabled(db))) return refuse(c, 503, "LIVE_RUNS_OFF");
 
     const claim = await claimBrief(db, run.id, guestId, MAX_BRIEFS_PER_RUN, now());
     if (claim === "limit") return refuse(c, 429, "BRIEF_LIMIT");
+    if (claim === "failed") {
+      // A claim that failed twice never changes again, so this reads the code claimBrief saw.
+      const failed = await getBriefClaim(db, run.id, guestId);
+      return c.json({ error: "BRIEF_FAILED", code: failed?.errorCode ?? null }, 409);
+    }
     if (claim === "claimed") {
       // A failed brief leaves the finished run and its board alone.
       void (async () => agent.writeBrief(run.id, guestId))().catch((error: unknown) =>
@@ -448,6 +475,23 @@ export function createApp(deps: AppDeps): Hono {
       );
     }
     return c.json({ status: "pending" }, 202);
+  });
+
+  // Polled by the page while a brief is written, so it only reads storage:
+  // no agent, human check, kill switch or meter is touched (C5.4).
+  app.get("/runs/:id/briefs/:guestId", async (c) => {
+    const run = await getRun(db, c.req.param("id"));
+    if (run === null) return refuse(c, 404, "NOT_FOUND");
+    const guestId = c.req.param("guestId");
+    if ((await getBoardGuest(db, run.id, guestId)) === null) return refuse(c, 404, "UNKNOWN_GUEST");
+
+    const brief = await getBrief(db, run.id, guestId);
+    if (brief !== null) return c.json({ status: "done", brief });
+    // A done claim whose brief cannot be read counts as missing (C6.5).
+    const claim = await getBriefClaim(db, run.id, guestId);
+    if (claim?.status === "pending") return c.json({ status: "pending" });
+    if (claim?.status === "failed") return c.json({ status: "failed", code: claim.errorCode });
+    return c.json({ status: "none" });
   });
 
   app.notFound((c) => refuse(c, 404, "NOT_FOUND"));

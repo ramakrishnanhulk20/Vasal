@@ -1,5 +1,5 @@
 import type { Db } from "../store/db.js";
-import { appendEvent, setRunStatus, type RunInput } from "./runs.js";
+import { appendEvent, markBriefFailed, setRunStatus, type RunInput } from "./runs.js";
 
 /**
  * What the routes ask of the agent. The routes call each method without
@@ -8,8 +8,9 @@ import { appendEvent, setRunStatus, type RunInput } from "./runs.js";
  * startRun is unsettled the run holds one site-wide in-progress slot. If
  * startRun or continueRun rejects, the route marks the run failed with
  * AGENT_ERROR unless the agent already finished it, so an agent that wants a
- * more specific code must set it before rejecting. A writeBrief rejection is
- * only logged.
+ * more specific code must set it before rejecting. writeBrief must leave the
+ * guest's brief claim done or failed, never pending, because the page waits
+ * on it; a writeBrief rejection is only logged.
  */
 export type AgentPort = {
   startRun(runId: string, input: RunInput): Promise<void>;
@@ -24,9 +25,11 @@ const AGENT_NOT_READY = "AGENT_NOT_READY";
  * continueRun make no upstream call: they mark the run failed with
  * AGENT_NOT_READY and append a "failed" event { code: "AGENT_NOT_READY" },
  * which is the honest answer, never a made-up result. writeBrief stores
- * nothing and resolves. startRun and continueRun reject with the run store's
- * ServerError if the run is unknown or already finished, or the database
- * fails.
+ * nothing and marks the guest's pending brief claim failed with
+ * AGENT_NOT_READY, so the page shows that failure instead of waiting.
+ * startRun and continueRun reject with the run store's ServerError if the
+ * run is unknown or already finished, or the database fails; writeBrief
+ * rejects with it for a bad id or a database failure.
  */
 export function createUnavailableAgent(db: Db): AgentPort {
   const refuse = async (runId: string): Promise<void> => {
@@ -36,6 +39,8 @@ export function createUnavailableAgent(db: Db): AgentPort {
   return {
     startRun: (runId) => refuse(runId),
     continueRun: (runId) => refuse(runId),
-    writeBrief: async () => {},
+    writeBrief: async (runId, guestId) => {
+      await markBriefFailed(db, runId, guestId, AGENT_NOT_READY);
+    },
   };
 }

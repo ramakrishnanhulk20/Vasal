@@ -649,17 +649,37 @@ export async function claimRunStatus(
   return rows.length === 1;
 }
 
+export type BriefClaimStatus = "pending" | "failed" | "done";
+export type BriefClaim = { status: BriefClaimStatus; attempts: 1 | 2; errorCode: string | null };
+
+const MAX_BRIEF_ATTEMPTS = 2;
+
+// Only failed claims carry a code, and it is always a fixed upper-case code.
+const briefClaimRow = z
+  .object({
+    status: z.enum(["pending", "failed", "done"]),
+    attempts: z.union([z.literal(1), z.literal(MAX_BRIEF_ATTEMPTS)]),
+    error_code: z.string().regex(ERROR_CODE).nullable(),
+  })
+  .refine((row) => (row.status === "failed") === (row.error_code !== null));
+
 /**
- * Claims the one brief a guest may get on a run, before any model call
- * (C5.8). Inside one transaction that holds the run's row lock it checks the
- * guest is on the run's stored board, then returns "exists" if that guest
- * already holds a claim, "limit" if the run already has `maxPerRun` claims,
- * and otherwise inserts the claim (ON CONFLICT DO NOTHING) and returns
- * "claimed". Because two requests for one run queue on the lock, two at once
- * give one "claimed" and one "exists". Throws ServerError("SRV_BAD_INPUT")
- * for a bad id or date or a maxPerRun outside 1 to 50,
- * ServerError("SRV_NOT_FOUND") for an unknown run or a guest not on its
- * board (C6.2), and ServerError("SRV_UNAVAILABLE") if the database fails.
+ * Claims the brief a guest may get on a run, before any model call (C5.8).
+ * Inside one transaction that holds the run's row lock it checks the guest
+ * is on the run's stored board (C6.2), then reads that guest's claim:
+ * - none: "limit" if the run already has `maxPerRun` claims, otherwise it
+ *   inserts a pending claim with attempts 1 and returns "claimed";
+ * - pending or done: "exists";
+ * - failed after 1 attempt: one UPDATE moves it to pending with attempts 2,
+ *   only WHERE status = 'failed' AND attempts = 1, and returns "claimed";
+ *   the retry reuses the claim, so it does not count against the limit;
+ * - failed after 2 attempts: "failed".
+ * A claim row that fails its schema counts as "exists", so it never leads to
+ * a model call (C6.5). Two requests at once queue on the lock and give one
+ * "claimed". Throws ServerError("SRV_BAD_INPUT") for a bad id or date or a
+ * maxPerRun outside 1 to 50, ServerError("SRV_NOT_FOUND") for an unknown run
+ * or a guest not on its board, and ServerError("SRV_UNAVAILABLE") if the
+ * database fails.
  */
 export async function claimBrief(
   db: Db,
@@ -667,14 +687,14 @@ export async function claimBrief(
   guestId: string,
   maxPerRun: number,
   now: Date = new Date(),
-): Promise<"claimed" | "exists" | "limit"> {
+): Promise<"claimed" | "exists" | "limit" | "failed"> {
   const id = checkId(runId);
   const guest = checkId(guestId);
   if (!Number.isSafeInteger(maxPerRun) || maxPerRun < 1 || maxPerRun > MAX_BOARD_GUESTS) throw badInput();
   checkInstant(now);
 
   return stored(() =>
-    db.transaction(async (tx): Promise<"claimed" | "exists" | "limit"> => {
+    db.transaction(async (tx): Promise<"claimed" | "exists" | "limit" | "failed"> => {
       await lockRun(tx, id);
       const onBoard = await tx.query("SELECT 1 FROM run_board WHERE run_id = $1::uuid AND guest_id = $2::uuid", [
         id,
@@ -682,15 +702,26 @@ export async function claimBrief(
       ]);
       if (onBoard.rows.length !== 1) throw notFound();
       const held = await tx.query(
-        "SELECT 1 FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+        "SELECT status, attempts, error_code FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
         [id, guest],
       );
-      if (held.rows.length === 1) return "exists";
+      if (held.rows.length === 1) {
+        const claim = briefClaimRow.safeParse(held.rows[0]);
+        if (!claim.success || claim.data.status !== "failed") return "exists";
+        if (claim.data.attempts === MAX_BRIEF_ATTEMPTS) return "failed";
+        const retried = await tx.query(
+          `UPDATE run_brief_claims SET status = 'pending', attempts = 2, error_code = NULL
+           WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'failed' AND attempts = 1
+           RETURNING guest_id`,
+          [id, guest],
+        );
+        return retried.rows.length === 1 ? "claimed" : "exists";
+      }
       const claims = await countOf(tx, "SELECT count(*)::int AS n FROM run_brief_claims WHERE run_id = $1::uuid", [id]);
       if (claims >= maxPerRun) return "limit";
       const { rows } = await tx.query(
-        `INSERT INTO run_brief_claims (run_id, guest_id, created_at)
-         VALUES ($1::uuid, $2::uuid, $3::timestamptz)
+        `INSERT INTO run_brief_claims (run_id, guest_id, status, attempts, error_code, created_at)
+         VALUES ($1::uuid, $2::uuid, 'pending', 1, NULL, $3::timestamptz)
          ON CONFLICT (run_id, guest_id) DO NOTHING
          RETURNING guest_id`,
         [id, guest, now.toISOString()],
@@ -698,4 +729,244 @@ export async function claimBrief(
       return rows.length === 1 ? "claimed" : "exists";
     }),
   );
+}
+
+/**
+ * Reads a guest's brief claim on a run: its status, attempts (1 or 2) and,
+ * for a failed claim only, its error code. Returns null without querying for
+ * anything that is not a lower-case UUID, and null when there is no claim or
+ * the row fails its schema (C6.5). Changes nothing. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getBriefClaim(db: Db, runId: string, guestId: string): Promise<BriefClaim | null> {
+  if (!isId(runId) || !isId(guestId)) return null;
+  const { rows } = await stored(() =>
+    db.query(
+      "SELECT status, attempts, error_code FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+      [runId, guestId],
+    ),
+  );
+  const parsed = briefClaimRow.safeParse(rows[0]);
+  if (!parsed.success) return null;
+  return { status: parsed.data.status, attempts: parsed.data.attempts, errorCode: parsed.data.error_code };
+}
+
+/**
+ * Marks a guest's pending brief claim done, after its brief is stored.
+ * Returns true when a pending claim moved and false when there was none to
+ * move (no claim, or already done or failed), in which case nothing changes.
+ * A done claim never changes again. Throws ServerError("SRV_BAD_INPUT") for
+ * a bad id and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function markBriefDone(db: Db, runId: string, guestId: string): Promise<boolean> {
+  const id = checkId(runId);
+  const guest = checkId(guestId);
+  const { rows } = await stored(() =>
+    db.query(
+      `UPDATE run_brief_claims SET status = 'done', error_code = NULL
+       WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'pending'
+       RETURNING guest_id`,
+      [id, guest],
+    ),
+  );
+  return rows.length === 1;
+}
+
+/**
+ * Marks a guest's pending brief claim failed with `code`, which must be an
+ * upper-case code such as MODEL_TIMEOUT, never free text (C3.6). Returns true
+ * when a pending claim moved and false when there was none to move, in which
+ * case nothing changes. The claim's attempts are left as they are, so
+ * claimBrief allows exactly one retry. Throws ServerError("SRV_BAD_INPUT") for
+ * a bad id or code and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function markBriefFailed(db: Db, runId: string, guestId: string, code: string): Promise<boolean> {
+  const id = checkId(runId);
+  const guest = checkId(guestId);
+  if (typeof code !== "string" || !ERROR_CODE.test(code)) throw badInput();
+  const { rows } = await stored(() =>
+    db.query(
+      `UPDATE run_brief_claims SET status = 'failed', error_code = $3
+       WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'pending'
+       RETURNING guest_id`,
+      [id, guest, code],
+    ),
+  );
+  return rows.length === 1;
+}
+
+/**
+ * Startup step: marks every pending brief claim created more than
+ * `olderThanMs` before `now` as failed with SERVER_RESTART, in one
+ * statement, so a brief whose writer died with the last process is never
+ * left pending (C6.4). Attempts are left as they are, so a first attempt
+ * may still be retried once. Claims created at or after the cutoff, and done
+ * or failed claims, are left alone. Returns how many claims were failed.
+ * Throws ServerError("SRV_BAD_INPUT") for an olderThanMs that is not a
+ * non-negative safe integer or a date (or cutoff) that is not valid, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function failStaleBriefClaims(db: Db, olderThanMs: number, now: Date = new Date()): Promise<number> {
+  if (!Number.isSafeInteger(olderThanMs) || olderThanMs < 0) throw badInput();
+  checkInstant(now);
+  const cutoff = checkInstant(new Date(now.getTime() - olderThanMs));
+  return stored(() =>
+    countOf(
+      db,
+      `WITH stopped AS (
+         UPDATE run_brief_claims SET status = 'failed', error_code = $1
+         WHERE status = 'pending' AND created_at < $2::timestamptz
+         RETURNING 1
+       )
+       SELECT count(*)::int AS n FROM stopped`,
+      [SERVER_RESTART, cutoff.toISOString()],
+    ),
+  );
+}
+
+/** The highest place on the home page; the table's check holds the same bound. */
+export const MAX_SHOWCASE_POSITION = 12;
+/** How many guests the home page shows per run, and so the smallest board it accepts. */
+export const SHOWCASE_GUESTS = 3;
+const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
+
+// A board guest exactly as the agent runner stores it, under the limits the
+// runner reads it back with for a brief (BoardRow in agent/runner.ts). A row
+// that could not reach a brief cannot reach the home page either (C6.5).
+const boardGuest = z.strictObject({
+  personId: z.string().regex(QLOO_ID),
+  name: z.string().min(1).max(200),
+  fit: z.number(),
+  fitKnown: z.boolean(),
+  fitRank: z.number().int().min(1),
+  reach: z.enum(["household name", "well known", "bookable"]),
+  rising: z.strictObject({ state: z.enum(["rising", "steady", "falling", "unknown"]), points: z.number().nullable() }),
+  bringsNew: z.strictObject({ segment: z.string().max(100), label: z.string().max(100), gap: z.number() }).nullable(),
+  sharedTags: z.array(z.string().max(200)).max(5),
+  angle: z.string().max(400),
+  showName: z.string().min(1).max(200),
+});
+const storedBoardGuest = storedJson(MAX_ITEM_JSON).pipe(boardGuest);
+
+export type StoredBoardGuest = z.output<typeof boardGuest>;
+export type ShowcaseGuest = {
+  id: string;
+  name: string;
+  fit: number;
+  fitKnown: boolean;
+  reach: string;
+  rising: string;
+  bringsNew: string | null;
+};
+export type ShowcaseRun = { runId: string; position: number; showName: string; finishedAt: Date; guests: ShowcaseGuest[] };
+
+/**
+ * Parses one stored board row's data, read as text, into the guest the agent
+ * runner wrote. Gives null for anything else, including text over 16,384
+ * characters or a field outside the runner's limits (C6.5). Never throws.
+ */
+export function parseBoardGuest(text: unknown): StoredBoardGuest | null {
+  const parsed = storedBoardGuest.safeParse(text);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * What the home page shows for one run: its show name and its first 3 board
+ * guests. `board` is the run's board from rank 1 down (at least its first 3
+ * rows), with null in place of a row that failed its schema. Returns null
+ * unless `status` is done, the board has at least 3 rows, the first 3 all
+ * parsed, and they name the same show. A damaged or unfinished run is never
+ * shown, and a lower guest never moves up to fill a gap (C6.4, C6.5). Pure.
+ */
+export function showcaseView(
+  status: RunStatus,
+  board: ReadonlyArray<{ id: string; guest: StoredBoardGuest } | null>,
+): { showName: string; guests: ShowcaseGuest[] } | null {
+  if (status !== "done") return null;
+  const top: Array<{ id: string; guest: StoredBoardGuest }> = [];
+  for (const item of board.slice(0, SHOWCASE_GUESTS)) {
+    if (item === null) return null;
+    top.push(item);
+  }
+  const [first] = top;
+  if (first === undefined || top.length < SHOWCASE_GUESTS) return null;
+  const { showName } = first.guest;
+  if (top.some((item) => item.guest.showName !== showName)) return null;
+  return {
+    showName,
+    guests: top.map(({ id, guest }) => ({
+      id,
+      name: guest.name,
+      fit: guest.fit,
+      fitKnown: guest.fitKnown,
+      reach: guest.reach,
+      rising: guest.rising.state,
+      bringsNew: guest.bringsNew?.label ?? null,
+    })),
+  };
+}
+
+const showcasePlace = z.object({ position: z.number().int().min(1).max(MAX_SHOWCASE_POSITION) });
+const boardRunId = z.object({ run_id: z.string().refine(isId) });
+const showcaseBoardRow = z.object({ id: z.string().refine(isId), data: storedBoardGuest });
+
+/**
+ * Lists the runs the operator promoted to the home page, by position, each
+ * with its show name, finish time and first 3 board guests in rank order
+ * (C6.3). A promoted run is listed only when its showcase row, its run row
+ * and its first 3 board rows all pass their schemas and showcaseView accepts
+ * it; any other promoted run is skipped (C6.4, C6.5). Two SELECTs read at
+ * most 12 runs and 36 board rows, so it calls nothing upstream, changes
+ * nothing (C5.4), and the app role may run it. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function listShowcase(db: Db): Promise<ShowcaseRun[]> {
+  const promoted = await stored(() =>
+    db.query(
+      `SELECT s.position, r.id::text AS id, r.status, r.input::text AS input, r.error_code, r.created_at, r.finished_at
+       FROM showcase_runs s JOIN runs r ON r.id = s.run_id
+       ORDER BY s.position LIMIT $1`,
+      [MAX_SHOWCASE_POSITION],
+    ),
+  );
+  const runs: Array<{ id: string; position: number; status: RunStatus; finishedAt: Date }> = [];
+  for (const row of promoted.rows) {
+    const place = showcasePlace.safeParse(row);
+    const run = runRow.safeParse(row);
+    if (!place.success || !run.success || run.data.finished_at === null) continue;
+    runs.push({ id: run.data.id, position: place.data.position, status: run.data.status, finishedAt: run.data.finished_at });
+  }
+  if (runs.length === 0) return [];
+
+  const { rows } = await stored(() =>
+    db.query(
+      `SELECT ranked.run_id::text AS run_id, ranked.guest_id::text AS id, ranked.data::text AS data
+       FROM (
+         SELECT run_id, guest_id, data, row_number() OVER (PARTITION BY run_id ORDER BY rank, guest_id) AS place
+         FROM run_board WHERE run_id = ANY ($1::uuid[])
+       ) ranked
+       WHERE ranked.place <= $2
+       ORDER BY ranked.run_id, ranked.place`,
+      [runs.map((run) => run.id), SHOWCASE_GUESTS],
+    ),
+  );
+  // A row that fails stays in its place as null, so showcaseView refuses the
+  // run instead of showing the next guest in its slot.
+  const boards = new Map<string, Array<{ id: string; guest: StoredBoardGuest } | null>>();
+  for (const row of rows) {
+    const owner = boardRunId.safeParse(row);
+    if (!owner.success) continue;
+    const item = showcaseBoardRow.safeParse(row);
+    const board = boards.get(owner.data.run_id) ?? [];
+    board.push(item.success ? { id: item.data.id, guest: item.data.data } : null);
+    boards.set(owner.data.run_id, board);
+  }
+
+  const shown: ShowcaseRun[] = [];
+  for (const run of runs) {
+    const view = showcaseView(run.status, boards.get(run.id) ?? []);
+    if (view === null) continue;
+    shown.push({ runId: run.id, position: run.position, showName: view.showName, finishedAt: run.finishedAt, guests: view.guests });
+  }
+  return shown;
 }

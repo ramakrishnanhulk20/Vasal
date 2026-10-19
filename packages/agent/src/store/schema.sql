@@ -84,10 +84,23 @@ INSERT INTO inflight (slot, n) VALUES ('runs', 0) ON CONFLICT DO NOTHING;
 
 -- One row per brief a run has been asked to write. The claim is taken before
 -- the model is called and holds no brief text, so two requests at once spend
--- once and a run's briefs stay capped (C5.8).
+-- once and a run's briefs stay capped (C5.8). A failed brief may be claimed
+-- once more; the attempts check makes a third model call unstorable.
 CREATE TABLE IF NOT EXISTS run_brief_claims (
   run_id uuid NOT NULL REFERENCES runs (id),
   guest_id uuid NOT NULL,
+  status text NOT NULL CHECK (status IN ('pending', 'failed', 'done')),
+  attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 2),
+  error_code text,
   created_at timestamptz NOT NULL,
   PRIMARY KEY (run_id, guest_id)
+);
+
+-- The finished runs the home page shows, in order. Only the operator writes
+-- here, through the promote command after reading the run's board. The app
+-- role can only read it (C6.3, C6.6). Twelve places cap what the page reads.
+CREATE TABLE IF NOT EXISTS showcase_runs (
+  run_id uuid PRIMARY KEY REFERENCES runs (id),
+  position integer NOT NULL UNIQUE CHECK (position BETWEEN 1 AND 12),
+  promoted_at timestamptz NOT NULL
 );

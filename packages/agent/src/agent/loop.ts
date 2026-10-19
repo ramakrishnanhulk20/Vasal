@@ -19,6 +19,9 @@ export const DEFAULT_LIMITS: Readonly<LoopLimits> = Object.freeze({
   turnMaxTokens: 8_000,
 });
 
+// A turn started just before the wall clock ends still gets a usable
+// timeout; the wall-clock signal is what ends it on time.
+const MIN_TURN_TIMEOUT_MS = 1_000;
 const MAX_LABEL_NAME_CHARS = 100;
 const RELEASE_WORDS: Readonly<Record<string, string>> = { movie: "movies", tv_show: "TV shows", book: "books" };
 
@@ -127,13 +130,16 @@ function checkedLimits(overrides: Partial<LoopLimits>): LoopLimits {
  * input and output tokens of every reply and the wall clock are checked;
  * before each tool the tool-call count; after each tool the tokens and the
  * wall clock. A reply whose usage cannot be read counts as the whole token
- * budget, so it fails closed.
+ * budget, so it fails closed. Each model call gets the wall-clock time left
+ * as its timeoutMs (at least 1 second) and a signal that fires when the
+ * wall clock runs out, so a call still in flight then is cut off.
  *
- * Throws AgentError AGENT_LIMIT for any cap, AGENT_NO_BOARD for a second
+ * Throws AgentError AGENT_LIMIT for any cap, MODEL_TIMEOUT for a model call
+ * cut off by its timeout or the wall clock, AGENT_NO_BOARD for a second
  * reply with no tool call, MODEL_TRUNCATED for a reply cut off at its token
- * limit, any AgentError the model client throws, RangeError for a limit that
- * is not a positive whole number, and whatever runTool or onStep rethrows
- * (such as StoreError).
+ * limit, any other AgentError the model client throws, RangeError for a
+ * limit that is not a positive whole number, and whatever runTool or onStep
+ * rethrows (such as StoreError).
  */
 export async function runResearch(
   ctx: RunContext,
@@ -151,38 +157,48 @@ export async function runResearch(
   let nudged = false;
 
   const overTime = () => clock() - startedAt >= caps.maxWallMs;
+  const timeLeft = () => Math.max(MIN_TURN_TIMEOUT_MS, Math.ceil(caps.maxWallMs - (clock() - startedAt)));
   const tokensOf = (value: unknown) => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : caps.maxRunTokens);
+  const wallClock = new AbortController();
+  const wallTimer = setTimeout(() => wallClock.abort(), caps.maxWallMs);
 
-  for (;;) {
-    if (turns >= caps.maxTurns || toolCalls >= caps.maxToolCalls || tokens >= caps.maxRunTokens || overTime()) throw limitHit();
-    const response = await deps.model.turn({ system: RESEARCH_SYSTEM, messages, tools, maxTokens: caps.turnMaxTokens });
-    turns += 1;
-    tokens += tokensOf(response.usage?.input_tokens) + tokensOf(response.usage?.output_tokens);
-    messages.push({ role: "assistant", content: response.content });
+  try {
+    for (;;) {
+      if (turns >= caps.maxTurns || toolCalls >= caps.maxToolCalls || tokens >= caps.maxRunTokens || overTime()) throw limitHit();
+      const response = await deps.model.turn(
+        { system: RESEARCH_SYSTEM, messages, tools, maxTokens: caps.turnMaxTokens },
+        { signal: wallClock.signal, timeoutMs: timeLeft() },
+      );
+      turns += 1;
+      tokens += tokensOf(response.usage?.input_tokens) + tokensOf(response.usage?.output_tokens);
+      messages.push({ role: "assistant", content: response.content });
 
-    // A tool input cut off at the token limit can still parse, so none of
-    // that reply's tools are run.
-    if (response.stop_reason === "max_tokens") throw new AgentError("MODEL_TRUNCATED");
-    if (response.stop_reason === "model_context_window_exceeded") throw limitHit();
+      // A tool input cut off at the token limit can still parse, so none of
+      // that reply's tools are run.
+      if (response.stop_reason === "max_tokens") throw new AgentError("MODEL_TRUNCATED");
+      if (response.stop_reason === "model_context_window_exceeded") throw limitHit();
 
-    const toolUses = response.content.filter((block): block is Anthropic.ToolUseBlock => block.type === "tool_use");
-    if (toolUses.length === 0) {
-      if (nudged) throw new AgentError("AGENT_NO_BOARD");
-      nudged = true;
-      messages.push({ role: "user", content: RESEARCH_NUDGE });
-      continue;
+      const toolUses = response.content.filter((block): block is Anthropic.ToolUseBlock => block.type === "tool_use");
+      if (toolUses.length === 0) {
+        if (nudged) throw new AgentError("AGENT_NO_BOARD");
+        nudged = true;
+        messages.push({ role: "user", content: RESEARCH_NUDGE });
+        continue;
+      }
+
+      const results: Anthropic.ToolResultBlockParam[] = [];
+      for (const block of toolUses) {
+        if (toolCalls >= caps.maxToolCalls) throw limitHit();
+        toolCalls += 1;
+        const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today);
+        await deps.onStep(stepFor(ctx, block.name, block.input, outcome));
+        if (tokens >= caps.maxRunTokens || overTime()) throw limitHit();
+        if (outcome.finished !== undefined) return outcome.finished;
+        results.push({ type: "tool_result", tool_use_id: block.id, content: outcome.content, is_error: outcome.isError });
+      }
+      messages.push({ role: "user", content: results });
     }
-
-    const results: Anthropic.ToolResultBlockParam[] = [];
-    for (const block of toolUses) {
-      if (toolCalls >= caps.maxToolCalls) throw limitHit();
-      toolCalls += 1;
-      const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today);
-      await deps.onStep(stepFor(ctx, block.name, block.input, outcome));
-      if (tokens >= caps.maxRunTokens || overTime()) throw limitHit();
-      if (outcome.finished !== undefined) return outcome.finished;
-      results.push({ type: "tool_result", tool_use_id: block.id, content: outcome.content, is_error: outcome.isError });
-    }
-    messages.push({ role: "user", content: results });
+  } finally {
+    clearTimeout(wallTimer);
   }
 }

@@ -12,8 +12,10 @@ Under construction, in public. What exists today:
   - a Qloo client built on Qloo's official harness (`qloo mcp`)
   - a feed reader that turns a show name, an Apple Podcasts link or an RSS URL into the show's episode list, without ever fetching a private or internal address
   - a key-day probe that checks Qloo's coverage of 30 real shows
-  - the agent server: it starts a run only for a person on our own site who passes a human check, inside per-visitor, site-wide and budget caps, and it streams each run's progress live; the agent itself plugs in next
-  - a YouTube client for the backtest, which reads a channel's uploads and view counts with the key kept out of every URL
+  - the agent server: it starts a run only for a person on our own site who passes a human check, inside per-visitor, site-wide and budget caps, and it streams each run's progress live
+  - the agent: Claude Haiku researches the show with eight Qloo tools inside hard limits. Code then scores every finalist in one comparable Qloo call (fit, reach, whether they are rising, the listeners they bring, the tastes they share). The model writes only the angles and the booking brief, and code strips any number, link or email it invents
+  - the backtest pipeline, exactly as pre-registered, with the 11 pinned YouTube channels in `docs/backtest-shows.json`
+  - operator commands for budgets, pruning, the kill switch, health and the home-page showcase (`npm run ops -w packages/agent -- --dev selftest` tries them all on a throwaway database)
 - `docs/security/threat-model.md`: the threat model, written before the code. Its section C is the definition of done.
 - `docs/backtest-preregistration.md`: how we will test whether Qloo guest fit predicts real YouTube episode views. Fixed before any data was pulled.
 
@@ -36,7 +38,7 @@ npm run feed:demo -w packages/agent -- "SmartLess"
 
 ## Run the agent server locally
 
-Needs no keys in development. It uses an in-memory database and Cloudflare's published Turnstile test secret. Until the agent is wired in, every run ends with an honest "agent not ready" event.
+Needs no keys in development. It uses an in-memory database and Cloudflare's published Turnstile test secret. Without `QLOO_API_KEY` and `ANTHROPIC_API_KEY` in `.env`, it says which key is missing and every run ends with an honest "agent not ready" event. With both, it runs the real agent.
 
 ```bash
 npm run server:dev -w packages/agent

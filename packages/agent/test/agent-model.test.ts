@@ -1,13 +1,15 @@
 // Covers the Claude client wrapper against a fake SDK client: the request it
-// sends, the token reservation that comes before every call, the mapping of
-// each SDK error class to a fixed code, refusal and truncation stops, and
-// checking structured replies. It does not cover the real SDK's network
-// behaviour, its retry timing, or how well any real model follows the
-// prompts. No real Anthropic call is made.
+// sends and the request options (timeout, signal, one retry), the token
+// reservation that comes before every call, each call's time limit, the
+// mapping of each SDK error class to a fixed code, refusal and truncation
+// stops, and checking structured replies. It does not cover the real SDK's
+// network behaviour, its retry timing, or how well any real model follows
+// the prompts. No real Anthropic call is made.
 import Anthropic, {
   APIConnectionError,
   APIConnectionTimeoutError,
   APIError,
+  APIUserAbortError,
   AuthenticationError,
   BadRequestError,
   InternalServerError,
@@ -43,13 +45,27 @@ function message(over: Record<string, unknown> = {}): Anthropic.Message {
   } as unknown as Anthropic.Message;
 }
 
-function fakeSdk(respond: () => Promise<Anthropic.Message>) {
-  const create = vi.fn<(params: Anthropic.MessageCreateParamsNonStreaming) => Promise<Anthropic.Message>>(respond);
+type SdkOptions = NonNullable<Parameters<Anthropic["messages"]["create"]>[1]>;
+
+function fakeSdk(respond: (options?: SdkOptions) => Promise<Anthropic.Message>) {
+  const create = vi.fn<(params: Anthropic.MessageCreateParamsNonStreaming, options?: SdkOptions) => Promise<Anthropic.Message>>(
+    (_params, options) => respond(options),
+  );
   const client = { messages: { create } } as unknown as Anthropic;
   return { client, create };
 }
 
-function build(respond: () => Promise<Anthropic.Message> = async () => message(), reserved = true) {
+// Like the real SDK: no answer ever comes, and the call rejects with
+// `onAbort()` once the request's signal fires, or at once if it already has.
+const neverAnswers =
+  (onAbort: () => Error = () => new APIUserAbortError()) =>
+  (options?: SdkOptions) =>
+    new Promise<Anthropic.Message>((_resolve, reject) => {
+      if (options?.signal?.aborted === true) reject(new APIUserAbortError());
+      options?.signal?.addEventListener("abort", () => reject(onAbort()), { once: true });
+    });
+
+function build(respond: (options?: SdkOptions) => Promise<Anthropic.Message> = async () => message(), reserved = true) {
   const { client, create } = fakeSdk(respond);
   const reserveTokens = vi.fn<(n: number) => Promise<boolean>>(async () => reserved);
   const model = createAnthropicModel({ apiKey: API_KEY, model: "claude-haiku-5-5", effort: "medium", reserveTokens, client });
@@ -138,6 +154,7 @@ describe("createAnthropicModel turn", () => {
       [new InternalServerError(500, body, MARKER, headers, "api_error"), "MODEL_UPSTREAM"],
       [new InternalServerError(503, body, MARKER, headers, "overloaded_error"), "MODEL_OVERLOADED"],
       [new APIError(418, body, MARKER, headers), "MODEL_UPSTREAM"],
+      [new APIUserAbortError({ message: MARKER }), "MODEL_TIMEOUT"],
       [new APIConnectionTimeoutError({ message: MARKER }), "MODEL_TIMEOUT"],
       [new APIConnectionError({ message: MARKER, cause: new Error(API_KEY) }), "MODEL_UPSTREAM"],
       [new Error(`${MARKER} ${API_KEY}`), "MODEL_UPSTREAM"],
@@ -165,6 +182,78 @@ describe("createAnthropicModel turn", () => {
     const model = createAnthropicModel({ apiKey: API_KEY, model: "claude-haiku-5-5", effort: "low", reserveTokens, client });
     for (const maxTokens of [0, -1, 1.5, 16_001, Number.NaN]) {
       await expect(model.turn({ ...turnInput(), maxTokens })).rejects.toThrow(RangeError);
+    }
+    expect(reserveTokens).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+});
+
+describe("createAnthropicModel time limits (C2.4)", () => {
+  const schema = z.object({ a: z.string() });
+  const structuredInput = () => ({ system: "s", user: "u", schema, maxTokens: 100 });
+
+  it("hands the SDK the caller's timeout, one retry and a signal that follows the caller's", async () => {
+    const { model, create } = build();
+    const caller = new AbortController();
+
+    await model.turn(turnInput(), { signal: caller.signal, timeoutMs: 7_000 });
+
+    const options = create.mock.calls[0]![1]!;
+    expect(options.timeout).toBe(7_000);
+    expect(options.maxRetries).toBe(1);
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+    expect(options.signal?.aborted).toBe(false);
+    caller.abort();
+    expect(options.signal?.aborted).toBe(true);
+  });
+
+  it("gives a call with no timeout 45 seconds, as briefs and the guest extractor use", async () => {
+    const { model, create } = build(async () => message({ content: [{ type: "text", text: '{"a":"b"}', citations: null }] }));
+
+    await model.structured(structuredInput());
+
+    const options = create.mock.calls[0]![1]!;
+    expect(options.timeout).toBe(45_000);
+    expect(options.maxRetries).toBe(1);
+    expect(options.signal?.aborted).toBe(false);
+  });
+
+  it("ends a call that never answers at its own limit, with no caller signal", async () => {
+    const { model, create } = build(neverAnswers());
+    const started = Date.now();
+
+    const error = await agentErrorOf(model.structured(structuredInput(), { timeoutMs: 200 }));
+
+    const elapsed = Date.now() - started;
+    expect(error.code).toBe("MODEL_TIMEOUT");
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(elapsed).toBeLessThan(1_200);
+    expect(create.mock.calls[0]![1]!.signal?.aborted).toBe(true);
+  });
+
+  it("calls it MODEL_TIMEOUT when the signal fires while the body is read, and makes no call once it has fired", async () => {
+    const caller = new AbortController();
+    const reading = build(neverAnswers(() => new DOMException(`${MARKER} aborted`, "AbortError") as unknown as Error));
+    const pending = agentErrorOf(reading.model.turn(turnInput(), { signal: caller.signal, timeoutMs: 60_000 }));
+    await vi.waitFor(() => expect(reading.create).toHaveBeenCalledTimes(1));
+    caller.abort();
+    const error = await pending;
+    expect(error.code).toBe("MODEL_TIMEOUT");
+    expectClean(error);
+
+    const late = build();
+    const fired = AbortSignal.abort();
+    expect((await agentErrorOf(late.model.turn(turnInput(), { signal: fired }))).code).toBe("MODEL_TIMEOUT");
+    expect((await agentErrorOf(late.model.structured(structuredInput(), { signal: fired }))).code).toBe("MODEL_TIMEOUT");
+    expect(late.reserveTokens).not.toHaveBeenCalled();
+    expect(late.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a timeout that is not a whole number of milliseconds from 1 to 2147483647 before any call", async () => {
+    const { model, create, reserveTokens } = build();
+    for (const timeoutMs of [0, -1, 1.5, Number.NaN, 2 ** 31]) {
+      await expect(model.turn(turnInput(), { timeoutMs })).rejects.toThrow(RangeError);
+      await expect(model.structured(structuredInput(), { timeoutMs })).rejects.toThrow(RangeError);
     }
     expect(reserveTokens).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();

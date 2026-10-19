@@ -18,10 +18,14 @@ import { createApp } from "./app.js";
 import { resetInflight } from "./caps.js";
 import { loadServerConfig, type ServerConfig } from "./config.js";
 import { ServerError } from "./errors.js";
-import { failInterruptedRuns } from "./runs.js";
+import { failInterruptedRuns, failStaleBriefClaims } from "./runs.js";
 import { createTurnstileVerifier } from "./turnstile.js";
 
 const DEV_WINDOW_MS = 30 * 24 * 60 * 60 * 1_000;
+// One agent server process owns the database (the same assumption
+// failInterruptedRuns makes), so at start-up no brief can be in progress and
+// every pending claim belongs to a process that is gone.
+const STALE_BRIEF_CLAIM_MS = 0;
 // Room for dozens of local runs. The Qloo key is shared with production, so
 // a runaway local loop still stops well short of the monthly pool.
 const DEV_BUCKETS: ReadonlyArray<[key: string, cap: number]> = [
@@ -96,6 +100,7 @@ async function main(): Promise<void> {
   const db = await openDb(config);
   try {
     await failInterruptedRuns(db);
+    await failStaleBriefClaims(db, STALE_BRIEF_CLAIM_MS);
     await resetInflight(db, 0);
   } catch (error) {
     await db.close().catch(() => {});
