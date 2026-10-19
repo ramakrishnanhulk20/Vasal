@@ -1,0 +1,220 @@
+import { normalizeName } from "../text/normalize.js";
+import type { Demographics, RunContext, SharedTag, TrendRow } from "./context.js";
+
+export type Rising = { state: "rising" | "steady" | "falling" | "unknown"; points: number | null };
+export type BringsNew = { segment: string; label: string; gap: number } | null;
+export type BoardEntry = {
+  personId: string;
+  name: string;
+  fit: number;
+  // False when Qloo gave no affinity for this person. Their fit shows as 0
+  // and they rank below everyone with a real fit.
+  fitKnown: boolean;
+  fitRank: number;
+  reach: "household name" | "well known" | "bookable";
+  rising: Rising;
+  bringsNew: BringsNew;
+  sharedTags: string[];
+  angle: string;
+};
+
+const RECENT_WEEKS = 4;
+const BASELINE_WEEKS = 8;
+// Starting values in percentile points. The live probe may retune them once
+// it has seen how much real trend rows move from week to week.
+const RISING_AT_POINTS = 2;
+const FALLING_AT_POINTS = -2;
+
+const HOUSEHOLD_NAME_AT = 0.95;
+const WELL_KNOWN_AT = 0.8;
+const SHARED_TAGS_SHOWN = 5;
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Fixed labels for the bands Qloo documents. A key Qloo adds later is ignored
+// rather than turned into a label, so no upstream text reaches the screen here.
+const AGE_LABELS: ReadonlyArray<[string, string]> = [
+  ["24_and_younger", "listeners 24 and younger"],
+  ["25_to_29", "listeners 25 to 29"],
+  ["30_to_34", "listeners 30 to 34"],
+  ["35_to_44", "listeners 35 to 44"],
+  ["45_to_54", "listeners 45 to 54"],
+  ["55_and_older", "listeners 55 and older"],
+  ["35_and_younger", "listeners 35 and younger"],
+  ["36_to_55", "listeners 36 to 55"],
+];
+const GENDER_LABELS: ReadonlyArray<[string, string]> = [
+  ["female", "women"],
+  ["male", "men"],
+];
+const SEGMENTS: ReadonlyArray<["age" | "gender", ReadonlyArray<[string, string]>]> = [
+  ["age", AGE_LABELS],
+  ["gender", GENDER_LABELS],
+];
+
+// `|| 0` turns -0 into 0, so a flat trend never prints as "-0".
+const round1 = (value: number) => Math.round(value * 10) / 10 || 0;
+const round2 = (value: number) => Math.round(value * 100) / 100 || 0;
+const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+const byScoreDesc = (a: SharedTag, b: SharedTag) => {
+  if (a.score === b.score) return 0;
+  if (a.score === null) return 1;
+  if (b.score === null) return -1;
+  return b.score - a.score;
+};
+
+/**
+ * Turns weekly trending rows into rising, steady or falling. Takes the newest
+ * 12 weeks that have a date and a percentile (one row per date, newest first
+ * by date whatever order they arrive in), then compares the mean percentile of
+ * the newest 4 with the mean of the 8 before, in percentile points rounded to
+ * one decimal. Values all within 0 to 1 are read as fractions and scaled by
+ * 100. Rising at +2 points or more, falling at -2 or less, else steady.
+ * Returns unknown with null points when fewer than 12 usable weeks remain.
+ */
+export function risingFrom(rows: readonly TrendRow[]): Rising {
+  const byDate = new Map<string, number>();
+  for (const row of rows) {
+    const value = row.population_percentile;
+    if (!ISO_DATE.test(row.date) || !isFiniteNumber(value) || byDate.has(row.date)) continue;
+    byDate.set(row.date, value);
+  }
+  const weeks = [...byDate].sort(([a], [b]) => (a < b ? 1 : a > b ? -1 : 0)).map(([, value]) => value);
+  if (weeks.length < RECENT_WEEKS + BASELINE_WEEKS) return { state: "unknown", points: null };
+
+  const window = weeks.slice(0, RECENT_WEEKS + BASELINE_WEEKS);
+  const scale = window.every((value) => value >= 0 && value <= 1) ? 100 : 1;
+  const points = round1((mean(window.slice(0, RECENT_WEEKS)) - mean(window.slice(RECENT_WEEKS))) * scale);
+
+  if (points >= RISING_AT_POINTS) return { state: "rising", points };
+  if (points <= FALLING_AT_POINTS) return { state: "falling", points };
+  return { state: "steady", points };
+}
+
+/**
+ * Finds the audience a guest would bring that the show does not have yet.
+ * For each documented age band and gender present in both breakdowns, the gap
+ * is person minus show. Returns the largest gap among segments where the
+ * person over-indexes (above 0) and the show does not (0 or below), with a
+ * fixed plain label and the gap rounded to 2 decimals. Age and gender are
+ * separate in Qloo's data, so a label never combines them. Returns null when
+ * no segment qualifies.
+ */
+export function bringsNewFrom(show: Demographics, person: Demographics): BringsNew {
+  let best: BringsNew = null;
+  for (const [kind, labels] of SEGMENTS) {
+    const showSide = show[kind];
+    const personSide = person[kind];
+    for (const [key, label] of labels) {
+      if (!Object.hasOwn(showSide, key) || !Object.hasOwn(personSide, key)) continue;
+      const showValue = showSide[key];
+      const personValue = personSide[key];
+      if (!isFiniteNumber(showValue) || !isFiniteNumber(personValue)) continue;
+      if (personValue <= 0 || showValue > 0) continue;
+      const gap = round2(personValue - showValue);
+      if (best === null || gap > best.gap) best = { segment: `${kind}:${key}`, label, gap };
+    }
+  }
+  return best;
+}
+
+/**
+ * Where an audience is strongest: every documented age band and gender whose
+ * index is above 0, strongest first, as the same fixed labels bringsNewFrom
+ * uses, at most `count` of them.
+ */
+export function strongestSegments(audience: Demographics, count: number): string[] {
+  const found: Array<{ label: string; value: number }> = [];
+  for (const [kind, labels] of SEGMENTS) {
+    const side = audience[kind];
+    for (const [key, label] of labels) {
+      if (!Object.hasOwn(side, key)) continue;
+      const value = side[key];
+      if (isFiniteNumber(value) && value > 0) found.push({ label, value });
+    }
+  }
+  return found
+    .sort((a, b) => b.value - a.value)
+    .slice(0, Math.max(0, count))
+    .map((segment) => segment.label);
+}
+
+/**
+ * How hard a guest is likely to book, from Qloo popularity (0 to 1): 0.95 and
+ * up is a household name, 0.8 and up is well known, anything else, including
+ * a missing value, is bookable.
+ */
+export function reachFrom(popularity: number | null): BoardEntry["reach"] {
+  if (popularity === null || !Number.isFinite(popularity)) return "bookable";
+  if (popularity >= HOUSEHOLD_NAME_AT) return "household name";
+  if (popularity >= WELL_KNOWN_AT) return "well known";
+  return "bookable";
+}
+
+/**
+ * Computes the ranked guest board from the model's picks. Pure.
+ *
+ * A pick is kept only if its personId is one a tool returned in this run, it
+ * is not a repeat of an earlier pick, and the person's name does not match an
+ * exclusion. Names and exclusions both go through normalizeName, so case,
+ * spacing and invisible characters do not matter (C2.7, C8.3). Every number
+ * comes from the context: fit is the Qloo affinity rounded to 2 decimals,
+ * ranked highest first, ties broken by lower popularity and then by pick
+ * order. A person with no affinity gets fit 0, fitKnown false, and ranks
+ * last. Precondition: each angle has already passed checkProse, which
+ * finish_board does before it returns picks.
+ */
+export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: string; angle: string }>): BoardEntry[] {
+  const excluded = new Set(ctx.exclusions.map(normalizeName).filter((name) => name !== ""));
+  const seen = new Set<string>();
+  const kept: Array<{ personId: string; angle: string; name: string; fit: number; fitKnown: boolean; popularity: number | null }> = [];
+
+  for (const pick of picks) {
+    const person = ctx.people.get(pick.personId);
+    if (person === undefined || seen.has(pick.personId)) continue;
+    seen.add(pick.personId);
+    if (excluded.has(normalizeName(person.name))) continue;
+    const { affinity } = person;
+    kept.push({
+      personId: pick.personId,
+      angle: pick.angle,
+      name: person.name,
+      fit: isFiniteNumber(affinity) ? round2(affinity) : 0,
+      fitKnown: isFiniteNumber(affinity),
+      popularity: isFiniteNumber(person.popularity) ? person.popularity : null,
+    });
+  }
+
+  kept.sort((a, b) => {
+    if (a.fitKnown !== b.fitKnown) return a.fitKnown ? -1 : 1;
+    if (a.fit !== b.fit) return b.fit - a.fit;
+    if (a.popularity === b.popularity) return 0;
+    if (a.popularity === null) return 1;
+    if (b.popularity === null) return -1;
+    return a.popularity - b.popularity;
+  });
+
+  return kept.map((entry, index) => {
+    const personDemographics = ctx.personDemographics.get(entry.personId);
+    const sharedTags = [...(ctx.compares.get(entry.personId) ?? [])]
+      .sort(byScoreDesc)
+      .slice(0, SHARED_TAGS_SHOWN)
+      .map((tag) => tag.name);
+    return {
+      personId: entry.personId,
+      name: entry.name,
+      fit: entry.fit,
+      fitKnown: entry.fitKnown,
+      fitRank: index + 1,
+      reach: reachFrom(entry.popularity),
+      rising: risingFrom(ctx.trends.get(entry.personId) ?? []),
+      bringsNew:
+        ctx.showDemographics !== null && personDemographics !== undefined
+          ? bringsNewFrom(ctx.showDemographics, personDemographics)
+          : null,
+      sharedTags,
+      angle: entry.angle,
+    };
+  });
+}

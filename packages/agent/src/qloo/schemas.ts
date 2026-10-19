@@ -111,6 +111,20 @@ export type QlooResponseFor<Op extends QlooOperation["op"]> = {
   tags: QlooTag[];
 }[Op];
 
+/**
+ * Schemas for the normalised lists parseQlooResponse returns, one per
+ * operation. A cached value is checked against the one for its operation when
+ * it is read back, so a row that no longer fits counts as missing (C6.5).
+ */
+export const NORMALISED_SCHEMAS: { [Op in QlooOperation["op"]]: z.ZodType<QlooResponseFor<Op>> } = {
+  search: z.array(EntitySchema),
+  insights: z.array(EntitySchema),
+  demographics: z.array(DemographicSchema),
+  trending: z.array(TrendRowSchema),
+  compare: z.array(CompareTagSchema),
+  tags: z.array(TagSchema),
+};
+
 const RESPONSE_SCHEMAS = {
   search: SearchResponse,
   insights: EntityListResponse,

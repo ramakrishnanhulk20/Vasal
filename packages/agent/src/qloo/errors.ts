@@ -7,7 +7,8 @@ export type QlooErrorCode =
   | "QLOO_UPSTREAM"
   | "QLOO_TIMEOUT"
   | "QLOO_SCHEMA"
-  | "QLOO_BAD_INPUT";
+  | "QLOO_BAD_INPUT"
+  | "QLOO_BUDGET";
 
 // Fixed text per code. Nothing from a request, a response or the key is ever
 // interpolated, so logging or showing an error cannot leak them (C3.6, C4.1).
@@ -21,6 +22,7 @@ const MESSAGES: Record<QlooErrorCode, string> = {
   QLOO_TIMEOUT: "Qloo request timed out.",
   QLOO_SCHEMA: "Qloo response did not match the expected shape.",
   QLOO_BAD_INPUT: "Qloo operation input was rejected.",
+  QLOO_BUDGET: "The Qloo call budget is used up for now.",
 };
 
 /**
