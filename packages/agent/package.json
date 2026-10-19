@@ -1,0 +1,37 @@
+{
+  "name": "@vasal/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run",
+    "probe": "tsx scripts/probe.ts",
+    "probe:dry": "tsx scripts/probe.ts --dry-run",
+    "harness:check": "tsx scripts/harness-check.ts",
+    "feed:demo": "tsx scripts/feed-demo.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.5",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@qloo/qloo-harness": "0.1.26",
+    "fast-xml-parser": "5.11.2",
+    "hono": "4.13.13",
+    "ipaddr.js": "2.5.0",
+    "linkify-it": "6.1.0",
+    "pg": "8.23.1",
+    "undici": "8.12.2",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.10",
+    "@types/node": "26.6.5",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
