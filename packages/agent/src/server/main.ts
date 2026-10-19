@@ -1,11 +1,19 @@
 import { serve } from "@hono/node-server";
 import { getConnInfo } from "@hono/node-server/conninfo";
+import { createAnthropicModel } from "../agent/model.js";
+import { createAgentRunner } from "../agent/runner.js";
+import { loadQlooConfig, type QlooConfig } from "../config.js";
+import { lookupShow, searchShows } from "../feeds/lookup.js";
+import { parseFeed } from "../feeds/rss.js";
+import { safeFetch } from "../net/safe-fetch.js";
+import { createQlooClient } from "../qloo/client.js";
+import { createMeteredQloo } from "../qloo/metered.js";
 import { createPgDb, createPgliteDb, type Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { setFlag } from "../store/flags.js";
-import { setBucket } from "../store/meter.js";
+import { reserve, setBucket } from "../store/meter.js";
 import { migrate } from "../store/migrate.js";
-import { createUnavailableAgent } from "./agent-port.js";
+import { createUnavailableAgent, type AgentPort } from "./agent-port.js";
 import { createApp } from "./app.js";
 import { resetInflight } from "./caps.js";
 import { loadServerConfig, type ServerConfig } from "./config.js";
@@ -21,6 +29,7 @@ const DEV_BUCKETS: ReadonlyArray<[key: string, cap: number]> = [
   ["qloo:month", 2_000],
   ["youtube:day", 5_000],
 ];
+const ANTHROPIC_DAY = "anthropic:day";
 
 function codeOf(error: unknown): string {
   return error instanceof ServerError || error instanceof StoreError ? error.code : "UNEXPECTED";
@@ -35,14 +44,55 @@ async function openDb(config: ServerConfig): Promise<Db> {
   const db = await createPgliteDb();
   await migrate(db);
   const windowEnd = new Date(Date.now() + DEV_WINDOW_MS);
-  for (const [key, cap] of DEV_BUCKETS) await setBucket(db, { key, cap, windowEnd });
+  for (const [key, cap] of [...DEV_BUCKETS, [ANTHROPIC_DAY, config.anthropicTokensPerDay] as const]) {
+    await setBucket(db, { key, cap, windowEnd });
+  }
   await setFlag(db, "live_runs", true);
   console.log("Using an in-memory development database. Everything in it is lost when the server stops.");
   return db;
 }
 
+function qlooSettings(): QlooConfig {
+  try {
+    return loadQlooConfig();
+  } catch (error) {
+    // loadQlooConfig's messages are fixed text naming QLOO_API_KEY or
+    // QLOO_BASE_URL, never a value, so they are safe to show the operator.
+    const failure = new ServerError("SRV_CONFIG");
+    if (error instanceof Error) failure.message = error.message;
+    throw failure;
+  }
+}
+
+// The real agent needs both keys. Without either, runs fail honestly with
+// AGENT_NOT_READY instead of showing anything made up.
+function createAgent(db: Db, config: ServerConfig, qloo: QlooConfig): AgentPort {
+  if (qloo.apiKey === undefined || config.anthropicApiKey === null) {
+    const missing = [
+      ...(qloo.apiKey === undefined ? ["QLOO_API_KEY"] : []),
+      ...(config.anthropicApiKey === null ? ["ANTHROPIC_API_KEY"] : []),
+    ];
+    const verb = missing.length > 1 ? "are" : "is";
+    console.log(`The agent is off because ${missing.join(" and ")} ${verb} not set, so every run fails with AGENT_NOT_READY.`);
+    return createUnavailableAgent(db);
+  }
+  const model = createAnthropicModel({
+    apiKey: config.anthropicApiKey,
+    model: config.model,
+    effort: config.effort,
+    reserveTokens: (amount) => reserve(db, [{ key: ANTHROPIC_DAY, amount }]),
+  });
+  // No retries inside the client, so every Qloo attempt takes its own slot
+  // from the shared meter (C5.1, C5.2).
+  const client = createQlooClient({ apiKey: qloo.apiKey, baseUrl: qloo.baseUrl, maxRetries: 0 });
+  const metered = createMeteredQloo({ client, db, baseUrl: qloo.baseUrl });
+  console.log(`The agent is on and uses ${config.model}.`);
+  return createAgentRunner({ db, model, qloo: metered, feeds: { searchShows, lookupShow, safeFetch, parseFeed } });
+}
+
 async function main(): Promise<void> {
   const config = loadServerConfig();
+  const qloo = qlooSettings();
   const db = await openDb(config);
   try {
     await failInterruptedRuns(db);
@@ -56,7 +106,7 @@ async function main(): Promise<void> {
     db,
     config,
     verifyTurnstile: createTurnstileVerifier({ secret: config.turnstileSecret }),
-    agent: createUnavailableAgent(db),
+    agent: createAgent(db, config, qloo),
     socketAddress: (c) => getConnInfo(c).remote.address ?? null,
   });
 

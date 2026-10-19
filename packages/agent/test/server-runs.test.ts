@@ -380,7 +380,7 @@ describe("candidates and the board (C6.2)", () => {
   it("reads a stored item that is not JSON within its limit as missing (C6.5)", async () => {
     const run = await createRun(db, INPUT, NOW);
     const id = crypto.randomUUID();
-    await db.query("INSERT INTO run_candidates (run_id, candidate_id, data) VALUES ($1::uuid, $2::uuid, $3::text::json)", [
+    await db.query("INSERT INTO run_candidates (run_id, candidate_id, rank, data) VALUES ($1::uuid, $2::uuid, 1, $3::text::json)", [
       run,
       id,
       JSON.stringify({ t: "x".repeat(16_400) }),

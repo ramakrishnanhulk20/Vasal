@@ -281,7 +281,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
    - show text: 300 characters
    - exclusions: 25 names of 100 characters each
    - feed fetch: 5 s to connect, 15 s total, 10 MB decoded, 3 redirects, newest 500 items parsed
-   - model: 12 turns, 25 tool calls, 4,000 output tokens per reply, 150,000 tokens per run
+   - model: 12 turns, 25 tool calls, 8,000 output tokens per reply (raised from a first guess of 4,000, so a turn that plans several tool calls is not cut off; the per-run cap is unchanged), 150,000 tokens per run
    - run wall clock: 120 s
    - streams: 3 per run, 10 minutes each
    - runs in progress across the site: 3

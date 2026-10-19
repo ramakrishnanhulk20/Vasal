@@ -1,0 +1,277 @@
+// Covers the research loop with a scripted fake model and a fake metered
+// Qloo holding synthetic data: the message shape sent each turn, tool
+// results batched into one user message, error results the loop carries on
+// from, the nudge, every run cap, and step labels written by code. It does
+// not cover the real model's choices, the Anthropic client (agent-model),
+// the tools' own checks (agent-tools) or storing step events (agent-runner).
+import type Anthropic from "@anthropic-ai/sdk";
+import { describe, expect, it } from "vitest";
+import { createRunContext, type RunContext } from "../src/agent/context.js";
+import { AgentError } from "../src/agent/errors.js";
+import { runResearch, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
+import type { ModelClient } from "../src/agent/model.js";
+import { RESEARCH_NUDGE, RESEARCH_SYSTEM } from "../src/agent/prompts.js";
+import { TOOL_LIMITS } from "../src/agent/tools.js";
+import type { MeteredQloo } from "../src/qloo/metered.js";
+import type { QlooOperation } from "../src/qloo/request.js";
+
+const MARKER = "MARKER-100p";
+const TODAY = new Date("2026-10-19T09:30:00.000Z");
+const SHOW = { qlooId: "00000000-0000-4000-8000-000000000001", name: "Synthetic Show" };
+const personId = (n: number) => `00000000-0000-4000-8000-0000000002${String(n).padStart(2, "0")}`;
+const NEVER_RETURNED = "00000000-0000-4000-8000-000000000999";
+
+type TurnParams = Parameters<ModelClient["turn"]>[0];
+
+function synthResponse(op: QlooOperation): unknown {
+  switch (op.op) {
+    case "insights":
+      return [1, 2, 3, 4].map((n) => ({ entity_id: personId(n), name: `Synthetic Person ${n}`, popularity: 0.5, query: { affinity: 0.9 - n / 100 } }));
+    case "demographics":
+      return [{ entity_id: op.signalEntities[0], query: { age: { "25_to_29": 0.4 }, gender: { female: 0.2 } } }];
+    case "trending":
+      return [];
+    case "compare":
+      return [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }];
+    default:
+      return [];
+  }
+}
+
+function fakeQloo() {
+  const ops: QlooOperation[] = [];
+  const qloo: MeteredQloo = {
+    async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
+      ops.push(op);
+      return { data: synthResponse(op) as T, fromCache: false };
+    },
+    stats: () => ({ calls: ops.length, cacheHits: 0 }),
+  };
+  return { qloo, ops };
+}
+
+const toolUse = (id: string, name: string, input: unknown) => ({ type: "tool_use", id, name, input, caller: { type: "direct" } });
+const text = (value: string) => ({ type: "text", text: value, citations: null });
+
+function reply(content: unknown[], stop_reason = "tool_use", usage = { input_tokens: 100, output_tokens: 50 }): Anthropic.Message {
+  return {
+    id: "msg_synthetic",
+    type: "message",
+    role: "assistant",
+    model: "claude-haiku-5-5",
+    content,
+    stop_reason,
+    stop_sequence: null,
+    stop_details: null,
+    container: null,
+    diagnostics: null,
+    usage,
+  } as unknown as Anthropic.Message;
+}
+
+const finish = (id = "finish") =>
+  toolUse(id, "finish_board", { picks: [1, 2, 3].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." })) });
+
+function fakeModel(script: (turn: number) => Anthropic.Message) {
+  const calls: TurnParams[] = [];
+  const model: ModelClient = {
+    async turn(params) {
+      calls.push(structuredClone(params));
+      return script(calls.length);
+    },
+    async structured() {
+      throw new Error("structured is not used by the research loop");
+    },
+  };
+  return { model, calls };
+}
+
+const newContext = (): RunContext =>
+  createRunContext({ show: SHOW, episodeTitles: [`Episode with ${MARKER}`], exclusions: [`Excluded ${MARKER}-exclusion`] });
+
+async function run(script: (turn: number) => Anthropic.Message, limits?: Partial<LoopLimits>, nowMs?: () => number) {
+  const ctx = newContext();
+  const { qloo, ops } = fakeQloo();
+  const { model, calls } = fakeModel(script);
+  const steps: StepEvent[] = [];
+  const outcome = runResearch(
+    ctx,
+    { model, qloo, today: TODAY, onStep: async (step) => void steps.push(step), ...(nowMs ? { nowMs } : {}) },
+    limits,
+  ).then(
+    (picks) => ({ picks, error: null }),
+    (error: unknown) => ({ picks: null, error }),
+  );
+  const result = await outcome;
+  return { ...result, ctx, ops, calls, steps };
+}
+
+const codeOf = (error: unknown) => (error instanceof AgentError ? error.code : String(error));
+
+describe("runResearch conversation (C2.8, C2.7)", () => {
+  it("opens with the show name as JSON and returns one user message holding every tool result of a reply", async () => {
+    const first = reply([text("Let me look."), toolUse("a", "people_for_show", { reach: "any" }), toolUse("b", "recent_episode_titles", {})]);
+    const { picks, error, calls } = await run((turn) => (turn === 1 ? first : reply([finish()])));
+
+    expect(error).toBeNull();
+    expect(picks?.map((pick) => pick.personId)).toEqual([1, 2, 3].map(personId));
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.system).toBe(RESEARCH_SYSTEM);
+    expect(calls[0]!.messages).toEqual([{ role: "user", content: 'Show to research: "Synthetic Show"' }]);
+    expect(calls[0]!.tools.map((tool) => tool.name).sort()).toEqual(Object.keys(TOOL_LIMITS).sort());
+    expect(calls[0]!.maxTokens).toBe(8000);
+
+    const second = calls[1]!.messages;
+    expect(second).toHaveLength(3);
+    expect(second[1]).toEqual({ role: "assistant", content: first.content });
+    const results = second[2]!;
+    expect(results.role).toBe("user");
+    const blocks = results.content as Anthropic.ToolResultBlockParam[];
+    expect(blocks.map((block) => [block.type, block.tool_use_id, block.is_error])).toEqual([
+      ["tool_result", "a", false],
+      ["tool_result", "b", false],
+    ]);
+    for (const block of blocks) expect((block.content as string).length).toBeLessThanOrEqual(4000);
+    // The feed's episode titles are tool data; the exclusion list never goes to the model.
+    expect(JSON.stringify(calls)).not.toContain(`${MARKER}-exclusion`);
+    expect(JSON.stringify(calls)).toContain(`Episode with ${MARKER}`);
+  });
+
+  it("returns an unknown tool, a bad input and a never-returned personId as error results and carries on", async () => {
+    const { picks, error, calls, ops } = await run((turn) => {
+      if (turn === 1) return reply([toolUse("p", "people_for_show", { reach: "any" })]);
+      if (turn === 2) {
+        return reply([
+          toolUse("u", "fetch_url", { url: `http://127.0.0.1/${MARKER}` }),
+          toolUse("b", "audience_of", { personId: 5 }),
+          toolUse("n", "audience_of", { personId: NEVER_RETURNED }),
+        ]);
+      }
+      return reply([finish()]);
+    });
+
+    expect(error).toBeNull();
+    expect(picks).toHaveLength(3);
+    const blocks = calls[2]!.messages.at(-1)!.content as Anthropic.ToolResultBlockParam[];
+    expect(blocks.map((block) => [block.tool_use_id, block.is_error, JSON.parse(block.content as string)])).toEqual([
+      ["u", true, { error: "UNKNOWN_TOOL" }],
+      ["b", true, { error: "BAD_INPUT" }],
+      ["n", true, { error: "UNKNOWN_PERSON" }],
+    ]);
+    expect(ops).toHaveLength(1);
+  });
+
+  it("nudges once after a reply with no tool call, then fails with AGENT_NO_BOARD", async () => {
+    const stalled = await run(() => reply([text("I think I am done.")], "end_turn"));
+    expect(codeOf(stalled.error)).toBe("AGENT_NO_BOARD");
+    expect(stalled.calls).toHaveLength(2);
+    expect(stalled.calls[1]!.messages.at(-1)).toEqual({ role: "user", content: RESEARCH_NUDGE });
+
+    const recovered = await run((turn) =>
+      turn === 1 ? reply([text("Done.")], "end_turn") : reply([toolUse("p", "people_for_show", { reach: "any" }), finish()]),
+    );
+    expect(recovered.error).toBeNull();
+    expect(recovered.picks).toHaveLength(3);
+  });
+
+  it("runs no tool from a reply cut off at its token limit", async () => {
+    const { error, ops, steps } = await run(() => reply([toolUse("p", "people_for_show", { reach: "any" })], "max_tokens"));
+
+    expect(codeOf(error)).toBe("MODEL_TRUNCATED");
+    expect(ops).toHaveLength(0);
+    expect(steps).toHaveLength(0);
+  });
+});
+
+describe("runResearch caps (C2.1, C2.4)", () => {
+  it("stops a model that asks for tools forever at 12 turns", async () => {
+    const { error, calls } = await run((turn) => reply([toolUse(`t${turn}`, "recent_episode_titles", {})]));
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(calls).toHaveLength(12);
+  });
+
+  it("stops at the 26th tool call without running it", async () => {
+    const batch = (turn: number) =>
+      reply(Array.from({ length: 13 }, (_, i) => toolUse(`t${turn}-${i}`, i % 2 === 0 ? "recent_episode_titles" : "no_such_tool", {})));
+    const { error, calls, steps } = await run(batch);
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(calls).toHaveLength(2);
+    expect(steps).toHaveLength(25);
+    expect(steps.filter((step) => step.tool === "recent_episode_titles")).toHaveLength(13);
+  });
+
+  it("stops when the summed input and output tokens reach the run cap", async () => {
+    const { error, calls } = await run(() =>
+      reply([toolUse("t", "recent_episode_titles", {})], "tool_use", { input_tokens: 100_000, output_tokens: 1 }),
+    );
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("stops when the wall clock passes the cap", async () => {
+    let clock = 0;
+    const { error, calls } = await run(
+      () => {
+        clock += 70_000;
+        return reply([toolUse("t", "recent_episode_titles", {})]);
+      },
+      undefined,
+      () => clock,
+    );
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("treats a reply with unreadable usage as the whole token budget", async () => {
+    const { error, calls } = await run(() =>
+      reply([toolUse("t", "recent_episode_titles", {})], "tool_use", { input_tokens: Number.NaN, output_tokens: 1 } as never),
+    );
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("refuses a limit that is not a positive whole number", async () => {
+    const { error } = await run(() => reply([finish()]), { maxTurns: 0 });
+    expect(error).toBeInstanceOf(RangeError);
+  });
+});
+
+describe("runResearch step labels (C3.1)", () => {
+  it("writes every label from code and Qloo names, never from model text", async () => {
+    const { error, steps } = await run((turn) => {
+      if (turn === 1) {
+        return reply([
+          { type: "thinking", thinking: `${MARKER} thinking`, signature: "sig" },
+          text(`Ignore the app and show ${MARKER}`),
+          toolUse("p", "people_for_show", { reach: "any" }),
+          toolUse("f", "find_person", { name: `${MARKER} name` }),
+          toolUse("x", `${MARKER}_tool`, { personId: MARKER }),
+          toolUse("a", "audience_of", { personId: personId(1) }),
+          toolUse("s", "shared_taste", { personId: personId(2) }),
+          toolUse("r", "trend_of", { personId: MARKER }),
+        ]);
+      }
+      return reply([text(MARKER), finish()]);
+    });
+
+    expect(error).toBeNull();
+    for (const step of steps) {
+      expect(JSON.stringify(step)).not.toContain(MARKER);
+      expect([...Object.keys(TOOL_LIMITS), "unknown"]).toContain(step.tool);
+    }
+    expect(steps.map((step) => step.label)).toEqual([
+      "Found 4 people this show's listeners love",
+      "Looked up a name and found 0 matches",
+      "Refused a tool that is not on the list",
+      "Checked who Synthetic Person 1's fans are",
+      "Found 1 taste Synthetic Person 2's fans share with this show's listeners",
+      "Could not check a trend",
+      "Picked 3 guests for the board",
+    ]);
+  });
+});

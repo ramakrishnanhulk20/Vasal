@@ -24,6 +24,10 @@ const CONFIG: ServerConfig = {
   clientIpHeader: "x-test-client-ip",
   runsPerVisitorPerDay: 5,
   maxInflightRuns: 3,
+  anthropicApiKey: null,
+  model: "claude-haiku-5-5",
+  effort: "medium",
+  anthropicTokensPerDay: 2_000_000,
 };
 
 let db: Db;

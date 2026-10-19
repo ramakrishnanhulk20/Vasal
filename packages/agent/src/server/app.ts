@@ -109,6 +109,21 @@ function withIds(items: Array<{ id: string; data: unknown }>): Array<Record<stri
   return items.flatMap((item) => (isPlainObject(item.data) ? [{ ...item.data, id: item.id }] : []));
 }
 
+// A stored candidate also holds its feed URL, which the server keeps to itself
+// and fetches only through a handle (C1.5). The page gets the same fields the
+// candidates event carries, chosen by name so a new stored field stays private.
+const PUBLIC_CANDIDATE_FIELDS = ["appleId", "name", "publisher", "qlooName"] as const;
+
+function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Record<string, unknown>> {
+  return items.flatMap((item) => {
+    if (!isPlainObject(item.data)) return [];
+    const data = item.data as Record<string, unknown>;
+    const picked: Record<string, unknown> = { id: item.id };
+    for (const field of PUBLIC_CANDIDATE_FIELDS) if (field in data) picked[field] = data[field];
+    return [picked];
+  });
+}
+
 /**
  * Builds the public agent server. Routes: GET /health, POST /runs, GET
  * /runs/:id, GET /runs/:id/events, POST /runs/:id/confirm and POST
@@ -359,7 +374,7 @@ export function createApp(deps: AppDeps): Hono {
       createdAt: run.createdAt,
       finishedAt: run.finishedAt,
       errorCode: run.errorCode,
-      candidates: withIds(candidates),
+      candidates: publicCandidates(candidates),
       // Only a finished run shows its board, so a run that stopped early is
       // never shown with partial results (C6.4).
       board: run.status === "done" ? withIds(board) : [],

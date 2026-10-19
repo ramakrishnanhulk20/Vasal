@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS run_events (
 CREATE TABLE IF NOT EXISTS run_candidates (
   run_id uuid NOT NULL REFERENCES runs (id),
   candidate_id uuid NOT NULL,
+  rank integer NOT NULL,
   data json NOT NULL,
   PRIMARY KEY (run_id, candidate_id)
 );

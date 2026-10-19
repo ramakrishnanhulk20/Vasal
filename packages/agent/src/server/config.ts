@@ -14,6 +14,21 @@ export type ServerConfig = {
   clientIpHeader: string | null;
   runsPerVisitorPerDay: number;
   maxInflightRuns: number;
+  anthropicApiKey: string | null;
+  model: string;
+  effort: "low" | "medium" | "high";
+  anthropicTokensPerDay: number;
+};
+
+type ModelVariable = "ANTHROPIC_API_KEY" | "VASAL_MODEL" | "VASAL_EFFORT" | "ANTHROPIC_TOKENS_PER_DAY";
+
+// errors.ts holds the messages for the other variables. Like those, each of
+// these names its variable and never contains the value.
+const MODEL_MESSAGES: Record<ModelVariable, string> = {
+  ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY has spaces or characters a key cannot contain. Copy the key into .env again.",
+  VASAL_MODEL: "VASAL_MODEL must be a Claude model id such as claude-haiku-5-5.",
+  VASAL_EFFORT: "VASAL_EFFORT must be low, medium or high.",
+  ANTHROPIC_TOKENS_PER_DAY: "ANTHROPIC_TOKENS_PER_DAY must be a whole number from 1 to 100000000.",
 };
 
 // Cloudflare's published Turnstile test secrets, from
@@ -33,6 +48,9 @@ const DEV_APP_ORIGIN = "http://localhost:3000";
 const DEFAULT_RUNS_PER_VISITOR_PER_DAY = 5;
 const DEFAULT_MAX_INFLIGHT_RUNS = 3;
 const MIN_SECRET_LENGTH = 32;
+const DEFAULT_MODEL = "claude-haiku-5-5";
+const DEFAULT_EFFORT = "medium";
+const DEFAULT_ANTHROPIC_TOKENS_PER_DAY = 2_000_000;
 
 // One value for the life of the process, so every config load in it counts
 // visitors under the same key.
@@ -76,9 +94,25 @@ const headerNameSchema = z
   .regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/)
   .transform((name) => name.toLowerCase());
 
+// Printable ASCII only, like the Qloo key: a header value with a space or a
+// line break would make the request fail before anything is sent.
+const apiKeySchema = z.string().max(500).regex(/^[\x21-\x7E]+$/);
+const modelSchema = z.string().regex(/^claude-[a-z0-9-]{3,60}$/);
+const effortSchema = z.enum(["low", "medium", "high"]);
+
 function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) throw new ServerError("SRV_CONFIG", variable);
+  return result.data;
+}
+
+function modelSetting<T>(variable: ModelVariable, schema: z.ZodType<T>, value: unknown): T {
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    const error = new ServerError("SRV_CONFIG");
+    error.message = MODEL_MESSAGES[variable];
+    throw error;
+  }
   return result.data;
 }
 
@@ -91,8 +125,12 @@ function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: 
  * CLIENT_IP_HEADER. In development these fall back to http://localhost:3000,
  * PGlite in memory (databaseUrl null), a random per-process secret with a
  * console warning, Cloudflare's always-pass test secret, and the socket
- * address. Throws ServerError("SRV_CONFIG") at the first bad or missing
- * variable; the message names the variable and never contains its value.
+ * address. The model settings are the same in both: ANTHROPIC_API_KEY is
+ * optional (null when unset), VASAL_MODEL defaults to claude-haiku-5-5 and
+ * must look like a Claude model id, VASAL_EFFORT is low, medium or high
+ * (default medium), and ANTHROPIC_TOKENS_PER_DAY defaults to 2,000,000.
+ * Throws ServerError("SRV_CONFIG") at the first bad or missing variable; the
+ * message names the variable and never contains its value.
  */
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (env === process.env && existsSync(REPO_ROOT_ENV_FILE)) {
@@ -159,6 +197,17 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const maxInflightRuns =
     inflightText === undefined ? DEFAULT_MAX_INFLIGHT_RUNS : parsed("MAX_INFLIGHT_RUNS", wholeNumber(1, 20), inflightText);
 
+  const modelText = (variable: ModelVariable): string | undefined => modelSetting(variable, optionalText, env[variable]);
+  const keyText = modelText("ANTHROPIC_API_KEY");
+  const anthropicApiKey = keyText === undefined ? null : modelSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
+  const model = modelSetting("VASAL_MODEL", modelSchema, modelText("VASAL_MODEL") ?? DEFAULT_MODEL);
+  const effort = modelSetting("VASAL_EFFORT", effortSchema, modelText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
+  const tokensText = modelText("ANTHROPIC_TOKENS_PER_DAY");
+  const anthropicTokensPerDay =
+    tokensText === undefined
+      ? DEFAULT_ANTHROPIC_TOKENS_PER_DAY
+      : modelSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
+
   return {
     production,
     port,
@@ -169,5 +218,9 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     clientIpHeader,
     runsPerVisitorPerDay,
     maxInflightRuns,
+    anthropicApiKey,
+    model,
+    effort,
+    anthropicTokensPerDay,
   };
 }

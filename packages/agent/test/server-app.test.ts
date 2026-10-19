@@ -47,6 +47,10 @@ const CONFIG: ServerConfig = {
   clientIpHeader: IP_HEADER,
   runsPerVisitorPerDay: 5,
   maxInflightRuns: 3,
+  anthropicApiKey: null,
+  model: "claude-haiku-5-5",
+  effort: "medium",
+  anthropicTokensPerDay: 2_000_000,
 };
 
 let db: Db;
@@ -465,7 +469,17 @@ describe("GET /runs/:id", () => {
   it("returns the run with server ids on every item and shows a board only once the run is done", async () => {
     const { app } = build();
     const runId = await createRun(db, { show: "SmartLess", exclude: ["Jason"] }, NOW);
-    const candidateIds = await putCandidates(db, runId, [{ title: "SmartLess", id: "forged" }]);
+    const candidateIds = await putCandidates(db, runId, [
+      {
+        name: "SmartLess",
+        publisher: "SmartLess Media",
+        appleId: "1521578868",
+        qlooName: "SmartLess",
+        feedUrl: "https://feeds.example/smartless",
+        feedHandleSource: "directory",
+        id: "forged",
+      },
+    ]);
     await setRunStatus(db, runId, "running", undefined, NOW);
     const guestIds = await putBoard(db, runId, [{ name: "first" }, { name: "second" }]);
 
@@ -477,9 +491,14 @@ describe("GET /runs/:id", () => {
       createdAt: NOW.toISOString(),
       finishedAt: null,
       errorCode: null,
-      candidates: [{ title: "SmartLess", id: candidateIds[0] }],
+      // The stored feed URL and source never reach the page (C1.5); the
+      // server-issued id replaces any id the stored data carried.
+      candidates: [
+        { id: candidateIds[0], appleId: "1521578868", name: "SmartLess", publisher: "SmartLess Media", qlooName: "SmartLess" },
+      ],
       board: [],
     });
+    expect(JSON.stringify(await (await app.request(`/runs/${runId}`)).json())).not.toContain("feeds.example");
 
     await setRunStatus(db, runId, "done", undefined, NOW);
     const done = (await (await app.request(`/runs/${runId}`)).json()) as { board: unknown[]; finishedAt: string };

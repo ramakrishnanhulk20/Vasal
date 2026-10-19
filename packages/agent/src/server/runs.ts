@@ -285,6 +285,58 @@ export async function appendEvent(
 }
 
 /**
+ * Ends an open run (queued, awaiting_confirm or running) as done or failed
+ * and appends its final event, both in one transaction that holds the run's
+ * lock, so a run is never seen finished without its last event or the other
+ * way round (C6.4). `event.name` must equal `status`, and its data must
+ * serialise to at most 16,384 JSON characters. `errorCode` is allowed only
+ * with failed and must be an upper-case code, never free text. finished_at
+ * is set to `now`. Like the restart sweep, a run whose 500 event slots are
+ * already used still ends, without an extra event. Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id, status, event, code or date,
+ * ServerError("SRV_LIMIT") for event data that is too large,
+ * ServerError("SRV_NOT_FOUND") when no open run has that id (nothing
+ * changes), and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function finishRun(
+  db: Db,
+  runId: string,
+  status: "done" | "failed",
+  event: { name: "done" | "failed"; data: unknown },
+  errorCode?: string,
+  now: Date = new Date(),
+): Promise<void> {
+  const id = checkId(runId);
+  if (status !== "done" && status !== "failed") throw badInput();
+  if (typeof event !== "object" || event === null || event.name !== status) throw badInput();
+  if (errorCode !== undefined && (status !== "failed" || typeof errorCode !== "string" || !ERROR_CODE.test(errorCode))) {
+    throw badInput();
+  }
+  checkInstant(now);
+  const text = jsonText(event.data, MAX_EVENT_JSON);
+
+  await stored(() =>
+    db.transaction(async (tx) => {
+      await lockRun(tx, id);
+      const { rows } = await tx.query(
+        `UPDATE runs SET status = $2, error_code = $3, finished_at = $4::timestamptz
+         WHERE id = $1::uuid AND status IN ('queued', 'awaiting_confirm', 'running')
+         RETURNING id`,
+        [id, status, errorCode ?? null, now.toISOString()],
+      );
+      if (rows.length !== 1) throw notFound();
+      const last = await countOf(tx, "SELECT coalesce(max(seq), 0) AS n FROM run_events WHERE run_id = $1::uuid", [id]);
+      if (last >= MAX_EVENTS_PER_RUN) return;
+      await tx.query(
+        `INSERT INTO run_events (run_id, seq, event, data, created_at)
+         VALUES ($1::uuid, $2, $3, $4::text::json, $5::timestamptz)`,
+        [id, last + 1, event.name, text, now.toISOString()],
+      );
+    }),
+  );
+}
+
+/**
  * Lists a run's events with seq greater than `afterSeq`, oldest first, at
  * most `limit` of them (default 100, 1 to 500). A stored row that fails the
  * event schema is skipped as missing (C6.5). Throws
@@ -338,9 +390,9 @@ async function putItems(
       : "SELECT count(*)::int AS n FROM run_board WHERE run_id = $1::uuid";
   const insert =
     table === "run_candidates"
-      ? `INSERT INTO run_candidates (run_id, candidate_id, data)
-         SELECT $1::uuid, item.id::uuid, item.data::json
-         FROM unnest($2::text[], $3::text[]) AS item(id, data)`
+      ? `INSERT INTO run_candidates (run_id, candidate_id, rank, data)
+         SELECT $1::uuid, item.id::uuid, item.rank, item.data::json
+         FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS item(id, data, rank)`
       : `INSERT INTO run_board (run_id, guest_id, rank, data)
          SELECT $1::uuid, item.id::uuid, item.rank, item.data::json
          FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS item(id, data, rank)`;
@@ -356,8 +408,9 @@ async function putItems(
 }
 
 /**
- * Stores the show candidates offered for a run and returns one fresh
- * crypto.randomUUID per candidate, in order. The confirm step may later act
+ * Stores the show candidates offered for a run, ranked 1 to n in the order
+ * given, and returns one fresh crypto.randomUUID per candidate, in that
+ * order. The confirm step may later act
  * only on one of these ids (C6.2). A run gets one candidate list of at most
  * 10, each serialising to at most 16,384 JSON characters. Throws
  * ServerError("SRV_BAD_INPUT") for a bad id or data JSON cannot hold,
@@ -529,10 +582,9 @@ async function listItems(
 }
 
 /**
- * Lists the show candidates stored for a run as [{ id, data }], at most 10.
- * putCandidates stores no position, so they come back ordered by candidate
- * id: stable across reads, but not the order they were offered in. A row
- * that fails its schema is skipped as missing (C6.5). Anything that is not a
+ * Lists the show candidates stored for a run as [{ id, data }] from rank 1
+ * down, which is the order putCandidates was given, at most 10. A row that
+ * fails its schema is skipped as missing (C6.5). Anything that is not a
  * lower-case UUID, or an unknown run, gives an empty list without error.
  * Throws ServerError("SRV_UNAVAILABLE") if the database fails.
  */
@@ -540,7 +592,7 @@ export async function listCandidates(db: Db, runId: string): Promise<Array<{ id:
   return listItems(
     db,
     `SELECT candidate_id::text AS id, data::text AS data FROM run_candidates
-     WHERE run_id = $1::uuid ORDER BY candidate_id LIMIT $2`,
+     WHERE run_id = $1::uuid ORDER BY rank LIMIT $2`,
     runId,
     MAX_CANDIDATES,
   );

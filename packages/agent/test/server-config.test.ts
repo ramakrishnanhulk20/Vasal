@@ -112,6 +112,10 @@ describe("loadServerConfig in production", () => {
       clientIpHeader: "fly-client-ip",
       runsPerVisitorPerDay: 7,
       maxInflightRuns: 4,
+      anthropicApiKey: null,
+      model: "claude-haiku-5-5",
+      effort: "medium",
+      anthropicTokensPerDay: 2_000_000,
     });
     expect(warn).not.toHaveBeenCalled();
   });
@@ -160,6 +164,12 @@ describe("loadServerConfig with bad values", () => {
       ["RUNS_PER_VISITOR_PER_DAY", `five${MARKER}`],
       ["MAX_INFLIGHT_RUNS", "0"],
       ["MAX_INFLIGHT_RUNS", "21"],
+      ["ANTHROPIC_API_KEY", `sk-ant ${MARKER}`],
+      ["VASAL_MODEL", `gpt-${MARKER}`],
+      ["VASAL_MODEL", "claude-HAIKU"],
+      ["VASAL_EFFORT", `max${MARKER}`],
+      ["ANTHROPIC_TOKENS_PER_DAY", "0"],
+      ["ANTHROPIC_TOKENS_PER_DAY", `2e6${MARKER}`],
     ];
     for (const [variable, value] of cases) {
       expectRefusal({ ...PRODUCTION, [variable]: value }, variable);

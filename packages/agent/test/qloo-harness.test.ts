@@ -171,5 +171,7 @@ describe("startHarness", () => {
     } finally {
       await harness.close();
     }
-  });
+    // Starting the real child process can take far longer than a unit test
+    // when the full suite runs in parallel, so this one waits up to a minute.
+  }, 60_000);
 });
