@@ -14,7 +14,9 @@
     "harness:check": "tsx scripts/harness-check.ts",
     "feed:demo": "tsx scripts/feed-demo.ts",
     "youtube:demo": "tsx scripts/youtube-demo.ts",
-    "server:dev": "tsx src/server/main.ts"
+    "server:dev": "tsx src/server/main.ts",
+    "ops": "tsx scripts/ops.ts",
+    "backtest": "tsx scripts/backtest.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.135.0",

@@ -255,6 +255,91 @@ describe("waitForQlooSlot", () => {
   });
 });
 
+describe("offline Qloo share (dayKey)", () => {
+  const OFFLINE = { dayKey: "qloo:day:offline" };
+
+  async function openOfflineShare(cap: number): Promise<void> {
+    await setBucket(db, { key: "qloo:day:offline", cap, windowEnd: FAR_FUTURE });
+  }
+
+  it("reserves from qloo:day:offline and the shared month, and leaves qloo:day alone (C5.1)", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openOfflineShare(50);
+
+    expect(await reserveQlooCall(db, NOW, OFFLINE)).toBe(true);
+    expect(await reserveQlooCall(db, NOW)).toBe(true);
+
+    expect(await usedOf("qloo:day:offline")).toBe(1);
+    expect(await usedOf("qloo:day")).toBe(1);
+    expect(await usedOf("qloo:month")).toBe(2);
+  });
+
+  it("is not blocked by a full qloo:day, but a full month blocks both shares", async () => {
+    await openQlooBuckets(1, 3);
+    await openOfflineShare(50);
+    expect(await reserveQlooCall(db, NOW)).toBe(true);
+
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 1_000))).toBe(false);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 1_000), OFFLINE)).toBe(true);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 2_000), OFFLINE)).toBe(true);
+
+    expect(await usedOf("qloo:month")).toBe(3);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 3_000), OFFLINE)).toBe(false);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 3_000))).toBe(false);
+    expect(await usedOf("qloo:day:offline")).toBe(2);
+    expect(await usedOf("qloo:day")).toBe(1);
+  });
+
+  it("refuses when the offline share was never set, even with qloo:day open", async () => {
+    await openQlooBuckets(100, 1_000);
+
+    expect(await reserveQlooCall(db, NOW, OFFLINE)).toBe(false);
+    expect(await usedOf("qloo:month")).toBe(0);
+  });
+
+  it("shares one per-second limit with the online share (C5.2)", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openOfflineShare(50);
+
+    const results = [
+      await reserveQlooCall(db, NOW),
+      await reserveQlooCall(db, NOW, OFFLINE),
+      await reserveQlooCall(db, NOW),
+      await reserveQlooCall(db, NOW, OFFLINE),
+      await reserveQlooCall(db, NOW, OFFLINE),
+      await reserveQlooCall(db, NOW),
+    ];
+
+    expect(results).toEqual([true, true, true, true, false, false]);
+    expect(await usedOf("qloo:month")).toBe(4);
+  });
+
+  it("waitForQlooSlot draws on the share it is given and gives up at once when that share is full", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openOfflineShare(1);
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+    };
+
+    expect(await waitForQlooSlot(db, { ...OFFLINE, now: () => NOW, sleep })).toBe(true);
+    expect(await waitForQlooSlot(db, { ...OFFLINE, now: () => new Date(NOW.getTime() + 1_000), sleep })).toBe(false);
+    expect(sleeps).toEqual([]);
+    expect(await usedOf("qloo:day:offline")).toBe(1);
+    expect(await usedOf("qloo:day")).toBe(0);
+  });
+
+  it("refuses a dayKey outside the qloo:day family before touching any bucket", async () => {
+    await openQlooBuckets(100, 1_000);
+
+    for (const dayKey of ["qloo:month", "qloo:second:1", "qloo:dayoffline", "", "qloo:day:".padEnd(201, "x")]) {
+      expect(await codeOf(reserveQlooCall(db, NOW, { dayKey }))).toBe("STORE_BAD_INPUT");
+      expect(await codeOf(waitForQlooSlot(db, { dayKey }))).toBe("STORE_BAD_INPUT");
+    }
+    expect(await usedOf("qloo:month")).toBe(0);
+  });
+});
+
 describe("pruneSecondBuckets", () => {
   it("deletes only per-second buckets whose window has ended", async () => {
     await openQlooBuckets(100, 1_000);

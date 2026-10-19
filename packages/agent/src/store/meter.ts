@@ -164,7 +164,16 @@ function secondKeyOf(now: Date): string {
   return `${QLOO_SECOND_PREFIX}${Math.floor(now.getTime() / 1_000)}`;
 }
 
-async function tryQlooCall(db: Db, now: Date): Promise<Outcome> {
+// Only qloo:day or a share under it. Any other key could name the month or a
+// per-second bucket, and the reservation map would then skip the day share.
+function checkDayKey(dayKey: unknown): string {
+  if (dayKey === undefined) return QLOO_DAY;
+  const key = checkKey(dayKey);
+  if (key !== QLOO_DAY && !key.startsWith(`${QLOO_DAY}:`)) throw badInput();
+  return key;
+}
+
+async function tryQlooCall(db: Db, now: Date, dayKey: string): Promise<Outcome> {
   checkInstant(now);
   const second = secondKeyOf(now);
   return db.transaction(async (tx) => {
@@ -181,7 +190,7 @@ async function tryQlooCall(db: Db, now: Date): Promise<Outcome> {
       tx,
       new Map([
         [QLOO_MONTH, 1],
-        [QLOO_DAY, 1],
+        [dayKey, 1],
         [second, 1],
       ]),
       now,
@@ -190,34 +199,45 @@ async function tryQlooCall(db: Db, now: Date): Promise<Outcome> {
 }
 
 /**
- * Reserves one Qloo call from qloo:month, qloo:day and the bucket for the
- * current epoch second, all or nothing. The per-second bucket is created on
- * demand with cap 4 inside the same transaction, so every process sharing the
- * database shares one per-second limit (C5.1, C5.2). Returns false if any of
- * the three is full, missing or expired. Throws StoreError("STORE_BAD_INPUT")
- * for an invalid `now` and StoreError("STORE_UNAVAILABLE") if the database
- * fails.
+ * Reserves one Qloo call from qloo:month, the day bucket and the bucket for
+ * the current epoch second, all or nothing. The day bucket is qloo:day unless
+ * `opts.dayKey` names a share under it, such as "qloo:day:offline" for the
+ * offline scripts: that share has its own daily cap but still counts against
+ * the one month bucket and the one per-second limit (C5.1). The per-second
+ * bucket is created on demand with cap 4 inside the same transaction, so
+ * every process sharing the database shares one per-second limit (C5.1,
+ * C5.2). Returns false if any of the three is full, missing or expired.
+ * Throws StoreError("STORE_BAD_INPUT") for an invalid `now` or a dayKey that
+ * is not "qloo:day" or "qloo:day:" followed by more, and
+ * StoreError("STORE_UNAVAILABLE") if the database fails.
  */
-export async function reserveQlooCall(db: Db, now: Date = new Date()): Promise<boolean> {
-  return (await tryQlooCall(db, now)).ok;
+export async function reserveQlooCall(
+  db: Db,
+  now: Date = new Date(),
+  opts: { dayKey?: string } = {},
+): Promise<boolean> {
+  const dayKey = checkDayKey(opts.dayKey);
+  return (await tryQlooCall(db, now, dayKey)).ok;
 }
 
 /**
  * Keeps trying reserveQlooCall while only the per-second bucket is full,
  * sleeping until the next second each time. Returns true once a call is
  * reserved. Returns false at once if the day or month bucket refuses, and
- * false when waiting longer would pass maxWaitMs (default 3000). Time is
- * measured as the larger of clock time and time slept, so the loop ends even
- * if an injected clock never moves. Throws StoreError("STORE_BAD_INPUT") for a
- * maxWaitMs outside 0 to 60000 and StoreError("STORE_UNAVAILABLE") if the
- * database fails.
+ * false when waiting longer would pass maxWaitMs (default 3000). `dayKey`
+ * picks the day bucket exactly as in reserveQlooCall. Time is measured as the
+ * larger of clock time and time slept, so the loop ends even if an injected
+ * clock never moves. Throws StoreError("STORE_BAD_INPUT") for a maxWaitMs
+ * outside 0 to 60000 or a bad dayKey, and StoreError("STORE_UNAVAILABLE") if
+ * the database fails.
  */
 export async function waitForQlooSlot(
   db: Db,
-  opts: { maxWaitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => Date } = {},
+  opts: { maxWaitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; dayKey?: string } = {},
 ): Promise<boolean> {
   const maxWaitMs = opts.maxWaitMs ?? 3_000;
   if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0 || maxWaitMs > MAX_WAIT_LIMIT_MS) throw badInput();
+  const dayKey = checkDayKey(opts.dayKey);
   const sleep = opts.sleep ?? ((ms: number) => delay(ms));
   const clock = opts.now ?? (() => new Date());
 
@@ -225,7 +245,7 @@ export async function waitForQlooSlot(
   let slept = 0;
   for (;;) {
     const now = checkInstant(clock());
-    const outcome = await tryQlooCall(db, now);
+    const outcome = await tryQlooCall(db, now, dayKey);
     if (outcome.ok) return true;
     if (!outcome.refused.every((key) => key.startsWith(QLOO_SECOND_PREFIX))) return false;
 
