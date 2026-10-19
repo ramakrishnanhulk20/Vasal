@@ -12,6 +12,8 @@ Under construction, in public. What exists today:
   - a Qloo client built on Qloo's official harness (`qloo mcp`)
   - a feed reader that turns a show name, an Apple Podcasts link or an RSS URL into the show's episode list, without ever fetching a private or internal address
   - a key-day probe that checks Qloo's coverage of 30 real shows
+  - the agent server: it starts a run only for a person on our own site who passes a human check, inside per-visitor, site-wide and budget caps, and it streams each run's progress live; the agent itself plugs in next
+  - a YouTube client for the backtest, which reads a channel's uploads and view counts with the key kept out of every URL
 - `docs/security/threat-model.md`: the threat model, written before the code. Its section C is the definition of done.
 - `docs/backtest-preregistration.md`: how we will test whether Qloo guest fit predicts real YouTube episode views. Fixed before any data was pulled.
 
@@ -30,6 +32,14 @@ Needs no API key. It calls Apple's public podcast directory and the show's own f
 
 ```bash
 npm run feed:demo -w packages/agent -- "SmartLess"
+```
+
+## Run the agent server locally
+
+Needs no keys in development. It uses an in-memory database and Cloudflare's published Turnstile test secret. Until the agent is wired in, every run ends with an honest "agent not ready" event.
+
+```bash
+npm run server:dev -w packages/agent
 ```
 
 ## Licence
