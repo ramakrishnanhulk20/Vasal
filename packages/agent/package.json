@@ -12,7 +12,9 @@
     "probe": "tsx scripts/probe.ts",
     "probe:dry": "tsx scripts/probe.ts --dry-run",
     "harness:check": "tsx scripts/harness-check.ts",
-    "feed:demo": "tsx scripts/feed-demo.ts"
+    "feed:demo": "tsx scripts/feed-demo.ts",
+    "youtube:demo": "tsx scripts/youtube-demo.ts",
+    "server:dev": "tsx src/server/main.ts"
   },
   "dependencies": {
     "@hono/node-server": "2.1.5",

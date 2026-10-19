@@ -54,7 +54,7 @@ A5. Injecting content into the browser, in F5 and F6. Feed text, Qloo names, You
 
 Applies.
 
-A6. Leaking secrets, in F4, F5, F6 and F8. The YouTube key travels as a `key` query parameter, so any logged or stored request URL contains it. HTTP client errors often carry the full request, headers included, which means the Qloo `X-Api-Key`. Step events stream tool inputs. The MCP child process is third-party code and gets an environment. Next.js puts any `NEXT_PUBLIC_` variable into the browser bundle. The repo is public. Applies strongly.
+A6. Leaking secrets, in F4, F5, F6 and F8. The reviewed design sent the YouTube key as a `key` query parameter, so any logged or stored request URL would contain it. The build sends it in the `X-goog-api-key` header instead, which Google accepts (checked on 19 Oct 2026), so no URL carries it. HTTP client errors often carry the full request, headers included, which means the Qloo `X-Api-Key`. Step events stream tool inputs. The MCP child process is third-party code and gets an environment. Next.js puts any `NEXT_PUBLIC_` variable into the browser bundle. The repo is public. Applies strongly.
 
 A7. Cache poisoning and mismatched cache keys, in F6. The cache can go wrong in several ways: a key built differently from the request actually sent (parameter order, a different encoder, a parameter left out of the key), the MCP path and the HTTPS path colliding, or an error response cached as data. Then one visitor's request fills an entry another visitor's run reads. Applies.
 
@@ -191,7 +191,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C4.1 No secret value appears in any byte sent to a browser, stored in the database, written to logs, sent to the model, or committed to git.
   - Show it: after a full test run, search the HTML, the server-component payload, a capture of the stream, every row the run wrote, and the captured logs for each secret's literal value and for `key=`. Zero hits. The git history is searched in the finishing sweep.
 - C4.2 Secrets stay on the server. None uses the `NEXT_PUBLIC_` prefix, and every module that reads one imports `server-only`, so importing it into a client component breaks the build.
-- C4.3 Request logs and step logs record the operation and its checked parameters, never the URL or headers as sent. The YouTube key rides in the URL and the Qloo key in a header.
+- C4.3 Request logs and step logs record the operation and its checked parameters, never the URL or headers as sent. Both the YouTube key (`X-goog-api-key`) and the Qloo key (`X-Api-Key`) ride in headers. Every client that sends one refuses redirects, because fetch would forward the header to the redirect target.
 - C4.4 The Qloo MCP child process gets an environment holding only the Qloo key and what it needs to start, never a copy of the server's environment. It is spawned with a fixed argument list and no shell, from the version pinned in the lockfile, and never downloaded at run time.
   - Show it: a unit test checks that the spawn call's environment has exactly the expected keys and that `shell` is false.
 - C4.5 A leaked key's damage is capped at the provider. The YouTube key is restricted to the YouTube Data API, and the Anthropic key sits in a workspace with a spend limit.

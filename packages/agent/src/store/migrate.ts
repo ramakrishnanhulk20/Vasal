@@ -19,8 +19,9 @@ function statementsOf(sql: string): string[] {
 }
 
 /**
- * Applies schema.sql in one transaction. Safe to run repeatedly: every
- * statement is CREATE ... IF NOT EXISTS. Needs a role that can create tables,
+ * Applies schema.sql in one transaction. Safe to run repeatedly: tables use
+ * CREATE ... IF NOT EXISTS and seed rows use ON CONFLICT DO NOTHING. Needs a
+ * role that can create tables,
  * so in production the operator runs it as the database owner, not as
  * vasal_app. Throws StoreError("STORE_UNAVAILABLE") if the file cannot be read
  * or any statement fails, in which case nothing is applied.

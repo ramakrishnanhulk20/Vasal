@@ -31,3 +31,14 @@ GRANT UPDATE (body, fetched_at, expires_at) ON qloo_cache TO vasal_app;
 GRANT UPDATE (runs) ON visitor_counters TO vasal_app;
 
 GRANT SELECT ON app_flags TO vasal_app;
+
+-- Runs are append only for the app: it can read and add rows, and on runs it
+-- can move only the status fields. There is no DELETE grant on any run table.
+GRANT SELECT, INSERT ON runs, run_events, run_candidates, run_board, run_briefs TO vasal_app;
+GRANT UPDATE (status, error_code, finished_at) ON runs TO vasal_app;
+
+GRANT SELECT ON inflight TO vasal_app;
+GRANT UPDATE (n) ON inflight TO vasal_app;
+
+-- Brief claims are append only too: a claim cannot be undone to spend again.
+GRANT SELECT, INSERT ON run_brief_claims TO vasal_app;

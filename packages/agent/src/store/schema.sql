@@ -28,3 +28,65 @@ CREATE TABLE IF NOT EXISTS visitor_counters (
   runs integer NOT NULL DEFAULT 0,
   PRIMARY KEY (visitor_hash, window_start)
 );
+
+-- Run tables. None holds a visitor address or its hash: the only link between
+-- a visitor and a run is the unguessable run id they were handed (C6.8, C6.1).
+CREATE TABLE IF NOT EXISTS runs (
+  id uuid PRIMARY KEY,
+  status text NOT NULL CHECK (status IN ('queued', 'awaiting_confirm', 'running', 'done', 'failed')),
+  input json NOT NULL,
+  error_code text,
+  created_at timestamptz NOT NULL,
+  finished_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+  run_id uuid NOT NULL REFERENCES runs (id),
+  seq integer NOT NULL CHECK (seq >= 1),
+  event text NOT NULL,
+  data json NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_candidates (
+  run_id uuid NOT NULL REFERENCES runs (id),
+  candidate_id uuid NOT NULL,
+  data json NOT NULL,
+  PRIMARY KEY (run_id, candidate_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_board (
+  run_id uuid NOT NULL REFERENCES runs (id),
+  guest_id uuid NOT NULL,
+  rank integer NOT NULL,
+  data json NOT NULL,
+  PRIMARY KEY (run_id, guest_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_briefs (
+  run_id uuid NOT NULL REFERENCES runs (id),
+  guest_id uuid NOT NULL,
+  data json NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (run_id, guest_id)
+);
+
+-- One row per global counter. The app role can only move n, never add rows,
+-- so the row is created here.
+CREATE TABLE IF NOT EXISTS inflight (
+  slot text PRIMARY KEY,
+  n integer NOT NULL CHECK (n >= 0)
+);
+
+INSERT INTO inflight (slot, n) VALUES ('runs', 0) ON CONFLICT DO NOTHING;
+
+-- One row per brief a run has been asked to write. The claim is taken before
+-- the model is called and holds no brief text, so two requests at once spend
+-- once and a run's briefs stay capped (C5.8).
+CREATE TABLE IF NOT EXISTS run_brief_claims (
+  run_id uuid NOT NULL REFERENCES runs (id),
+  guest_id uuid NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (run_id, guest_id)
+);

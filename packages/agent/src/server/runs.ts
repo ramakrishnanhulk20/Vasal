@@ -1,0 +1,649 @@
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import type { Db } from "../store/db.js";
+import { ServerError } from "./errors.js";
+import { RUN_EVENTS, type RunEventName } from "./sse.js";
+
+export { RUN_EVENTS, type RunEventName } from "./sse.js";
+
+export type RunStatus = "queued" | "awaiting_confirm" | "running" | "done" | "failed";
+export type RunInput = { show: string; exclude: string[] };
+export type RunRecord = {
+  id: string;
+  status: RunStatus;
+  input: RunInput;
+  errorCode: string | null;
+  createdAt: Date;
+  finishedAt: Date | null;
+};
+
+const RUN_STATUSES = ["queued", "awaiting_confirm", "running", "done", "failed"] as const satisfies readonly RunStatus[];
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set<RunStatus>(["done", "failed"]);
+const TERMINAL_EVENTS: ReadonlySet<string> = new Set<RunEventName>(["done", "failed"]);
+
+const MAX_SHOW_LENGTH = 300;
+const MAX_EXCLUSIONS = 25;
+const MAX_EXCLUSION_LENGTH = 100;
+// Every input character could be escaped to six JSON characters, plus quotes
+// and commas, so the stored text always fits under this.
+const MAX_INPUT_JSON = 32_768;
+const MAX_EVENT_JSON = 16_384;
+const MAX_EVENTS_PER_RUN = 500;
+const MAX_ITEM_JSON = 16_384;
+// A brief is model prose of up to about 4,000 tokens plus computed fields.
+const MAX_BRIEF_JSON = 65_536;
+const MAX_CANDIDATES = 10;
+const MAX_BOARD_GUESTS = 50;
+const DEFAULT_EVENT_PAGE = 100;
+const MAX_EVENT_PAGE = 500;
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const SERVER_RESTART = "SERVER_RESTART";
+
+const badInput = (): ServerError => new ServerError("SRV_BAD_INPUT");
+const overLimit = (): ServerError => new ServerError("SRV_LIMIT");
+const notFound = (): ServerError => new ServerError("SRV_NOT_FOUND");
+
+const uuid = z.uuid();
+
+// Postgres prints a uuid in lower case. Accepting only that form makes every
+// id an exact string match on what the server issued, never a looser cast
+// of some other spelling (C6.2).
+function isId(value: unknown): value is string {
+  return typeof value === "string" && value === value.toLowerCase() && uuid.safeParse(value).success;
+}
+
+function checkId(value: unknown): string {
+  if (!isId(value)) throw badInput();
+  return value;
+}
+
+function checkInstant(value: unknown): Date {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw badInput();
+  return value;
+}
+
+// Over a size cap is SRV_LIMIT; something JSON cannot hold is SRV_BAD_INPUT.
+function jsonText(value: unknown, maxLength: number): string {
+  let text: string | undefined;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    throw badInput();
+  }
+  if (typeof text !== "string") throw badInput();
+  if (text.length > maxLength) throw overLimit();
+  return text;
+}
+
+// Each json column is read back as text and must pass the same limit it was
+// written under, then parse, before anything uses it (C6.5).
+function storedJson(maxLength: number) {
+  return z
+    .string()
+    .max(maxLength)
+    .transform((text, ctx): unknown => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        ctx.addIssue({ code: "custom", message: "stored text is not JSON" });
+        return z.NEVER;
+      }
+    });
+}
+
+const instant = z
+  .union([z.date(), z.string()])
+  .transform((value) => new Date(value))
+  .pipe(z.date());
+
+const runInputSchema = z.strictObject({
+  show: z.string().min(1).max(MAX_SHOW_LENGTH),
+  exclude: z.array(z.string().min(1).max(MAX_EXCLUSION_LENGTH)).max(MAX_EXCLUSIONS),
+});
+
+const runRow = z
+  .object({
+    id: z.string().refine(isId),
+    status: z.enum(RUN_STATUSES),
+    input: storedJson(MAX_INPUT_JSON).pipe(runInputSchema),
+    error_code: z.string().regex(ERROR_CODE).nullable(),
+    created_at: instant,
+    finished_at: instant.nullable(),
+  })
+  // A row in a state the code never writes reads as missing.
+  .refine((row) => TERMINAL_STATUSES.has(row.status) === (row.finished_at !== null))
+  .refine((row) => row.error_code === null || row.status === "failed");
+
+const eventRow = z.object({
+  seq: z.number().int().min(1).max(MAX_EVENTS_PER_RUN),
+  event: z.enum(RUN_EVENTS),
+  data: storedJson(MAX_EVENT_JSON),
+});
+
+const count = z
+  .union([z.number(), z.string().regex(/^\d+$/)])
+  .transform(Number)
+  .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
+
+// Driver errors become one fixed code. ServerErrors thrown on purpose inside
+// a transaction pass through unchanged.
+async function stored<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof ServerError) throw error;
+    throw new ServerError("SRV_UNAVAILABLE");
+  }
+}
+
+async function countOf(tx: Db, text: string, params: unknown[]): Promise<number> {
+  const { rows } = await tx.query(text, params);
+  const parsed = count.safeParse(rows[0]?.["n"]);
+  if (!parsed.success) throw new ServerError("SRV_UNAVAILABLE");
+  return parsed.data;
+}
+
+// Every writer that numbers or caps rows for a run takes this lock first, so
+// on hosted Postgres two writers to one run queue instead of both reading the
+// same count. NO KEY UPDATE still lets other tables' foreign keys reference
+// the row meanwhile.
+async function lockRun(tx: Db, runId: string): Promise<void> {
+  const { rows } = await tx.query("SELECT id FROM runs WHERE id = $1::uuid FOR NO KEY UPDATE", [runId]);
+  if (rows.length !== 1) throw notFound();
+}
+
+async function readData(db: Db, text: string, params: string[], maxLength: number): Promise<unknown | null> {
+  const { rows } = await stored(() => db.query(text, params));
+  const parsed = z.object({ data: storedJson(maxLength) }).safeParse(rows[0]);
+  return parsed.success ? parsed.data.data : null;
+}
+
+/**
+ * Creates a queued run and returns its id, a fresh crypto.randomUUID (122
+ * random bits, never sequential, C6.1). `input` must be exactly
+ * { show, exclude } with a show of 1 to 300 characters (String length, so
+ * the caller normalises first) and at most 25 exclusions of 1 to 100
+ * characters each. Throws ServerError("SRV_BAD_INPUT") for any other input
+ * or an invalid date, and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function createRun(db: Db, input: RunInput, now: Date = new Date()): Promise<string> {
+  const parsed = runInputSchema.safeParse(input);
+  if (!parsed.success) throw badInput();
+  checkInstant(now);
+  const id = randomUUID();
+  await stored(() =>
+    db.query(
+      `INSERT INTO runs (id, status, input, error_code, created_at, finished_at)
+       VALUES ($1::uuid, 'queued', $2::text::json, NULL, $3::timestamptz, NULL)`,
+      [id, JSON.stringify(parsed.data), now.toISOString()],
+    ),
+  );
+  return id;
+}
+
+/**
+ * Reads one run. Returns null, without querying, for anything that is not a
+ * lower-case UUID, and null when the run is missing or its row fails the run
+ * schema (C6.5). Throws ServerError("SRV_UNAVAILABLE") if the database fails,
+ * so an outage is never mistaken for a missing run.
+ */
+export async function getRun(db: Db, id: string): Promise<RunRecord | null> {
+  if (!isId(id)) return null;
+  const { rows } = await stored(() =>
+    db.query(
+      `SELECT id::text AS id, status, input::text AS input, error_code, created_at, finished_at
+       FROM runs WHERE id = $1::uuid`,
+      [id],
+    ),
+  );
+  const parsed = runRow.safeParse(rows[0]);
+  if (!parsed.success) return null;
+  const row = parsed.data;
+  return {
+    id: row.id,
+    status: row.status,
+    input: row.input,
+    errorCode: row.error_code,
+    createdAt: row.created_at,
+    finishedAt: row.finished_at,
+  };
+}
+
+/**
+ * Moves an open run (queued, awaiting_confirm or running) to `status`.
+ * Moving to done or failed sets finished_at to `now`, and after that the run
+ * never changes again. `errorCode` is allowed only with failed and must be an
+ * upper-case code such as QLOO_LIMIT, never free text. Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id, status, code or date,
+ * ServerError("SRV_NOT_FOUND") when no open run has that id (missing, or
+ * already done or failed; nothing changes), and ServerError("SRV_UNAVAILABLE")
+ * if the database fails.
+ */
+export async function setRunStatus(
+  db: Db,
+  id: string,
+  status: RunStatus,
+  errorCode?: string,
+  now: Date = new Date(),
+): Promise<void> {
+  const runId = checkId(id);
+  if (typeof status !== "string" || !(RUN_STATUSES as readonly string[]).includes(status)) throw badInput();
+  if (errorCode !== undefined && (status !== "failed" || typeof errorCode !== "string" || !ERROR_CODE.test(errorCode))) {
+    throw badInput();
+  }
+  checkInstant(now);
+
+  const { rows } = await stored(() =>
+    db.query(
+      `UPDATE runs SET status = $2, error_code = $3, finished_at = $4::timestamptz
+       WHERE id = $1::uuid AND status IN ('queued', 'awaiting_confirm', 'running')
+       RETURNING id`,
+      [runId, status, errorCode ?? null, TERMINAL_STATUSES.has(status) ? now.toISOString() : null],
+    ),
+  );
+  if (rows.length !== 1) throw notFound();
+}
+
+/**
+ * Appends one event to a run and returns its seq, which is the previous
+ * highest seq plus 1, worked out inside one transaction that holds the run's
+ * lock. `data` must serialise to at most 16,384 JSON characters. A run holds
+ * at most 500 events, and the 500th slot is kept for a done or failed event so
+ * a run that reaches the cap can still be ended (C6.7, C6.4). Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id, event name, date or data JSON
+ * cannot hold, ServerError("SRV_LIMIT") when the data is too large or the run
+ * is full, ServerError("SRV_NOT_FOUND") for an unknown run, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function appendEvent(
+  db: Db,
+  runId: string,
+  event: RunEventName,
+  data: unknown,
+  now: Date = new Date(),
+): Promise<number> {
+  const id = checkId(runId);
+  if (typeof event !== "string" || !(RUN_EVENTS as readonly string[]).includes(event)) throw badInput();
+  checkInstant(now);
+  const text = jsonText(data, MAX_EVENT_JSON);
+  const slotsNeeded = TERMINAL_EVENTS.has(event) ? 1 : 2;
+
+  return stored(() =>
+    db.transaction(async (tx) => {
+      await lockRun(tx, id);
+      const last = await countOf(tx, "SELECT coalesce(max(seq), 0) AS n FROM run_events WHERE run_id = $1::uuid", [id]);
+      if (last + slotsNeeded > MAX_EVENTS_PER_RUN) throw overLimit();
+      const seq = last + 1;
+      await tx.query(
+        `INSERT INTO run_events (run_id, seq, event, data, created_at)
+         VALUES ($1::uuid, $2, $3, $4::text::json, $5::timestamptz)`,
+        [id, seq, event, text, now.toISOString()],
+      );
+      return seq;
+    }),
+  );
+}
+
+/**
+ * Lists a run's events with seq greater than `afterSeq`, oldest first, at
+ * most `limit` of them (default 100, 1 to 500). A stored row that fails the
+ * event schema is skipped as missing (C6.5). Throws
+ * ServerError("SRV_BAD_INPUT") for a bad run id, an afterSeq that is not a
+ * non-negative safe integer, or a limit outside 1 to 500, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails. An unknown run gives
+ * an empty list.
+ */
+export async function listEventsAfter(
+  db: Db,
+  runId: string,
+  afterSeq: number,
+  limit: number = DEFAULT_EVENT_PAGE,
+): Promise<Array<{ seq: number; event: RunEventName; data: unknown }>> {
+  const id = checkId(runId);
+  if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) throw badInput();
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_PAGE) throw badInput();
+
+  const { rows } = await stored(() =>
+    db.query(
+      `SELECT seq, event, data::text AS data FROM run_events
+       WHERE run_id = $1::uuid AND seq > $2 ORDER BY seq LIMIT $3`,
+      [id, afterSeq, limit],
+    ),
+  );
+  const events: Array<{ seq: number; event: RunEventName; data: unknown }> = [];
+  for (const row of rows) {
+    const parsed = eventRow.safeParse(row);
+    if (parsed.success) events.push(parsed.data);
+  }
+  return events;
+}
+
+async function putItems(
+  db: Db,
+  runId: string,
+  items: unknown[],
+  max: number,
+  table: "run_candidates" | "run_board",
+): Promise<string[]> {
+  const id = checkId(runId);
+  if (!Array.isArray(items)) throw badInput();
+  if (items.length > max) throw overLimit();
+  const texts = items.map((item) => jsonText(item, MAX_ITEM_JSON));
+  const ids = texts.map(() => randomUUID());
+
+  // The table name comes only from the fixed union above, never from a value.
+  const existing =
+    table === "run_candidates"
+      ? "SELECT count(*)::int AS n FROM run_candidates WHERE run_id = $1::uuid"
+      : "SELECT count(*)::int AS n FROM run_board WHERE run_id = $1::uuid";
+  const insert =
+    table === "run_candidates"
+      ? `INSERT INTO run_candidates (run_id, candidate_id, data)
+         SELECT $1::uuid, item.id::uuid, item.data::json
+         FROM unnest($2::text[], $3::text[]) AS item(id, data)`
+      : `INSERT INTO run_board (run_id, guest_id, rank, data)
+         SELECT $1::uuid, item.id::uuid, item.rank, item.data::json
+         FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS item(id, data, rank)`;
+
+  await stored(() =>
+    db.transaction(async (tx) => {
+      await lockRun(tx, id);
+      if ((await countOf(tx, existing, [id])) > 0) throw overLimit();
+      if (ids.length > 0) await tx.query(insert, [id, ids, texts]);
+    }),
+  );
+  return ids;
+}
+
+/**
+ * Stores the show candidates offered for a run and returns one fresh
+ * crypto.randomUUID per candidate, in order. The confirm step may later act
+ * only on one of these ids (C6.2). A run gets one candidate list of at most
+ * 10, each serialising to at most 16,384 JSON characters. Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id or data JSON cannot hold,
+ * ServerError("SRV_LIMIT") for too many or too large candidates or a run that
+ * already has a list, ServerError("SRV_NOT_FOUND") for an unknown run, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function putCandidates(db: Db, runId: string, candidates: unknown[]): Promise<string[]> {
+  return putItems(db, runId, candidates, MAX_CANDIDATES, "run_candidates");
+}
+
+/**
+ * Returns a candidate only when both the run id and the candidate id match
+ * exactly what putCandidates issued for that run (C6.2). A candidate id from
+ * another run, an id never issued, anything that is not a lower-case UUID, or
+ * a stored row that fails its schema gives null. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getCandidate(db: Db, runId: string, candidateId: string): Promise<unknown | null> {
+  if (!isId(runId) || !isId(candidateId)) return null;
+  return readData(
+    db,
+    "SELECT data::text AS data FROM run_candidates WHERE run_id = $1::uuid AND candidate_id = $2::uuid",
+    [runId, candidateId],
+    MAX_ITEM_JSON,
+  );
+}
+
+/**
+ * Stores a run's ranked board, ranks 1 to n in the order given, and returns
+ * one fresh guest id per guest in that order. A run gets one board of at most
+ * 50 guests, each serialising to at most 16,384 JSON characters. Throws as
+ * putCandidates does.
+ */
+export async function putBoard(db: Db, runId: string, guests: unknown[]): Promise<string[]> {
+  return putItems(db, runId, guests, MAX_BOARD_GUESTS, "run_board");
+}
+
+/**
+ * Returns a board guest only when both ids match what putBoard issued for
+ * that run (C6.2), and null otherwise, as getCandidate does.
+ */
+export async function getBoardGuest(db: Db, runId: string, guestId: string): Promise<unknown | null> {
+  if (!isId(runId) || !isId(guestId)) return null;
+  return readData(
+    db,
+    "SELECT data::text AS data FROM run_board WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+    [runId, guestId],
+    MAX_ITEM_JSON,
+  );
+}
+
+/**
+ * Returns the stored brief for a guest on a run, or null when there is none,
+ * either id is not a lower-case UUID, or the row fails its schema. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getBrief(db: Db, runId: string, guestId: string): Promise<unknown | null> {
+  if (!isId(runId) || !isId(guestId)) return null;
+  return readData(
+    db,
+    "SELECT data::text AS data FROM run_briefs WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+    [runId, guestId],
+    MAX_BRIEF_JSON,
+  );
+}
+
+/**
+ * Stores the one brief for a guest on a run (C5.8). Returns true when it was
+ * stored and false when that guest already has a brief, which is kept
+ * unchanged; the insert is a single statement, so two writers cannot both
+ * win. The guest must be on the run's stored board (C6.2). `brief` must
+ * serialise to at most 65,536 JSON characters. Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id, date or data JSON cannot hold,
+ * ServerError("SRV_LIMIT") for a brief that is too large,
+ * ServerError("SRV_NOT_FOUND") when the guest is not on that run's board, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function putBrief(
+  db: Db,
+  runId: string,
+  guestId: string,
+  brief: unknown,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const id = checkId(runId);
+  const guest = checkId(guestId);
+  checkInstant(now);
+  const text = jsonText(brief, MAX_BRIEF_JSON);
+
+  return stored(async () => {
+    const onBoard = await db.query("SELECT 1 FROM run_board WHERE run_id = $1::uuid AND guest_id = $2::uuid", [
+      id,
+      guest,
+    ]);
+    if (onBoard.rows.length !== 1) throw notFound();
+    const { rows } = await db.query(
+      `INSERT INTO run_briefs (run_id, guest_id, data, created_at)
+       VALUES ($1::uuid, $2::uuid, $3::text::json, $4::timestamptz)
+       ON CONFLICT (run_id, guest_id) DO NOTHING
+       RETURNING guest_id`,
+      [id, guest, text, now.toISOString()],
+    );
+    return rows.length === 1;
+  });
+}
+
+/**
+ * Startup step: marks every queued, awaiting_confirm or running run as failed
+ * with error code SERVER_RESTART and finished_at `now`, and appends a failed
+ * event to each, all in one statement, so no run is left looking alive after
+ * the process that ran it died (C6.4). A run whose 500 event slots are all
+ * used already ended with a terminal event and gets no extra one. Done and
+ * failed runs are left alone. Returns how many runs were failed. Assumes one
+ * agent server process per database: a second live process would have its
+ * runs failed too. Throws ServerError("SRV_BAD_INPUT") for an invalid date
+ * and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function failInterruptedRuns(db: Db, now: Date = new Date()): Promise<number> {
+  checkInstant(now);
+  // A data-modifying WITH clause always runs to completion, and the INSERT
+  // takes its run ids straight from the UPDATE, so the two cannot disagree.
+  return stored(() =>
+    db.transaction((tx) =>
+      countOf(
+        tx,
+        `WITH stopped AS (
+           UPDATE runs SET status = 'failed', error_code = $1, finished_at = $2::timestamptz
+           WHERE status IN ('queued', 'awaiting_confirm', 'running')
+           RETURNING id
+         ),
+         numbered AS (
+           SELECT stopped.id,
+                  coalesce((SELECT max(e.seq) FROM run_events e WHERE e.run_id = stopped.id), 0) AS last
+           FROM stopped
+         ),
+         noted AS (
+           INSERT INTO run_events (run_id, seq, event, data, created_at)
+           SELECT numbered.id, numbered.last + 1, 'failed', $3::text::json, $2::timestamptz
+           FROM numbered WHERE numbered.last < $4
+           RETURNING run_id
+         )
+         SELECT count(*)::int AS n FROM stopped`,
+        [SERVER_RESTART, now.toISOString(), JSON.stringify({ code: SERVER_RESTART }), MAX_EVENTS_PER_RUN],
+      ),
+    ),
+  );
+}
+
+const itemRow = z.object({
+  id: z.string().refine(isId),
+  data: storedJson(MAX_ITEM_JSON),
+});
+
+async function listItems(
+  db: Db,
+  text: string,
+  runId: string,
+  max: number,
+): Promise<Array<{ id: string; data: unknown }>> {
+  if (!isId(runId)) return [];
+  const { rows } = await stored(() => db.query(text, [runId, max]));
+  const items: Array<{ id: string; data: unknown }> = [];
+  for (const row of rows) {
+    const parsed = itemRow.safeParse(row);
+    if (parsed.success) items.push(parsed.data);
+  }
+  return items;
+}
+
+/**
+ * Lists the show candidates stored for a run as [{ id, data }], at most 10.
+ * putCandidates stores no position, so they come back ordered by candidate
+ * id: stable across reads, but not the order they were offered in. A row
+ * that fails its schema is skipped as missing (C6.5). Anything that is not a
+ * lower-case UUID, or an unknown run, gives an empty list without error.
+ * Throws ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function listCandidates(db: Db, runId: string): Promise<Array<{ id: string; data: unknown }>> {
+  return listItems(
+    db,
+    `SELECT candidate_id::text AS id, data::text AS data FROM run_candidates
+     WHERE run_id = $1::uuid ORDER BY candidate_id LIMIT $2`,
+    runId,
+    MAX_CANDIDATES,
+  );
+}
+
+/**
+ * Lists a run's board as [{ id, data }] from rank 1 down, at most 50. Skips
+ * rows that fail their schema and returns an empty list for a bad or
+ * unknown run id, as listCandidates does. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function listBoard(db: Db, runId: string): Promise<Array<{ id: string; data: unknown }>> {
+  return listItems(
+    db,
+    `SELECT guest_id::text AS id, data::text AS data FROM run_board
+     WHERE run_id = $1::uuid ORDER BY rank LIMIT $2`,
+    runId,
+    MAX_BOARD_GUESTS,
+  );
+}
+
+/**
+ * Moves a run from `from` to `to` only if it is in `from` right now, in one
+ * UPDATE ... WHERE status = from, so of two simultaneous callers exactly one
+ * wins (C6.2: a second confirm cannot start a second continuation). Returns
+ * true when this call moved the run and false when it was not in `from` or
+ * does not exist. Moving to done or failed sets finished_at to `now`. Throws
+ * ServerError("SRV_BAD_INPUT") for a bad id or date, a status outside the
+ * five, a `from` that is done or failed (finished runs never change), or
+ * `from` equal to `to`, and ServerError("SRV_UNAVAILABLE") if the database
+ * fails.
+ */
+export async function claimRunStatus(
+  db: Db,
+  runId: string,
+  from: RunStatus,
+  to: RunStatus,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const id = checkId(runId);
+  const statuses = RUN_STATUSES as readonly string[];
+  if (typeof from !== "string" || !statuses.includes(from) || TERMINAL_STATUSES.has(from)) throw badInput();
+  if (typeof to !== "string" || !statuses.includes(to) || to === from) throw badInput();
+  checkInstant(now);
+
+  const { rows } = await stored(() =>
+    db.query(
+      `UPDATE runs SET status = $3, finished_at = $4::timestamptz
+       WHERE id = $1::uuid AND status = $2
+       RETURNING id`,
+      [id, from, to, TERMINAL_STATUSES.has(to) ? now.toISOString() : null],
+    ),
+  );
+  return rows.length === 1;
+}
+
+/**
+ * Claims the one brief a guest may get on a run, before any model call
+ * (C5.8). Inside one transaction that holds the run's row lock it checks the
+ * guest is on the run's stored board, then returns "exists" if that guest
+ * already holds a claim, "limit" if the run already has `maxPerRun` claims,
+ * and otherwise inserts the claim (ON CONFLICT DO NOTHING) and returns
+ * "claimed". Because two requests for one run queue on the lock, two at once
+ * give one "claimed" and one "exists". Throws ServerError("SRV_BAD_INPUT")
+ * for a bad id or date or a maxPerRun outside 1 to 50,
+ * ServerError("SRV_NOT_FOUND") for an unknown run or a guest not on its
+ * board (C6.2), and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function claimBrief(
+  db: Db,
+  runId: string,
+  guestId: string,
+  maxPerRun: number,
+  now: Date = new Date(),
+): Promise<"claimed" | "exists" | "limit"> {
+  const id = checkId(runId);
+  const guest = checkId(guestId);
+  if (!Number.isSafeInteger(maxPerRun) || maxPerRun < 1 || maxPerRun > MAX_BOARD_GUESTS) throw badInput();
+  checkInstant(now);
+
+  return stored(() =>
+    db.transaction(async (tx): Promise<"claimed" | "exists" | "limit"> => {
+      await lockRun(tx, id);
+      const onBoard = await tx.query("SELECT 1 FROM run_board WHERE run_id = $1::uuid AND guest_id = $2::uuid", [
+        id,
+        guest,
+      ]);
+      if (onBoard.rows.length !== 1) throw notFound();
+      const held = await tx.query(
+        "SELECT 1 FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+        [id, guest],
+      );
+      if (held.rows.length === 1) return "exists";
+      const claims = await countOf(tx, "SELECT count(*)::int AS n FROM run_brief_claims WHERE run_id = $1::uuid", [id]);
+      if (claims >= maxPerRun) return "limit";
+      const { rows } = await tx.query(
+        `INSERT INTO run_brief_claims (run_id, guest_id, created_at)
+         VALUES ($1::uuid, $2::uuid, $3::timestamptz)
+         ON CONFLICT (run_id, guest_id) DO NOTHING
+         RETURNING guest_id`,
+        [id, guest, now.toISOString()],
+      );
+      return rows.length === 1 ? "claimed" : "exists";
+    }),
+  );
+}

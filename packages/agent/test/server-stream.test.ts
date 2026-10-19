@@ -1,0 +1,198 @@
+// Covers GET /runs/:id/events through app.request() on a migrated PGlite
+// database: replay after Last-Event-ID, the ways a stream ends, pings, the
+// per-run stream cap and frame safety. It does not cover a real socket or a
+// browser's EventSource (the live smoke uses curl), proxies that buffer, or
+// streams spread over several server processes, whose counts are separate.
+import { randomUUID } from "node:crypto";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentPort } from "../src/server/agent-port.js";
+import { createApp, type AppDeps } from "../src/server/app.js";
+import type { ServerConfig } from "../src/server/config.js";
+import { appendEvent, createRun, setRunStatus } from "../src/server/runs.js";
+import { SSE_PING } from "../src/server/sse.js";
+import type { Db } from "../src/store/db.js";
+import { migratedPglite } from "./helpers/pglite.js";
+
+const NOW = new Date("2026-10-19T12:00:00.000Z");
+const CONFIG: ServerConfig = {
+  production: false,
+  port: 8787,
+  appOrigin: "http://localhost:3000",
+  databaseUrl: null,
+  visitorHashSecret: "v".repeat(32),
+  turnstileSecret: "test-secret",
+  clientIpHeader: "x-test-client-ip",
+  runsPerVisitorPerDay: 5,
+  maxInflightRuns: 3,
+};
+
+let db: Db;
+let opened: Response[] = [];
+
+beforeEach(async () => {
+  db = await migratedPglite();
+  opened = [];
+});
+
+// PGlite 0.5.10 can spin forever inside its WASM Postgres when a query
+// reaches it while close() runs, so every stream is ended first. PGlite runs
+// queries one at a time in order, so once the barrier query returns, a stream
+// that was mid-query has resumed, seen it is closed, and stopped.
+afterEach(async () => {
+  for (const res of opened) await res.body?.cancel().catch(() => {});
+  await db.query("SELECT 1");
+  await db.close();
+});
+
+function build(extra: Partial<Pick<AppDeps, "now" | "streamPollMs" | "streamLifetimeMs">> = {}) {
+  const agent: AgentPort = {
+    startRun: vi.fn(async () => {}),
+    continueRun: vi.fn(async () => {}),
+    writeBrief: vi.fn(async () => {}),
+  };
+  return createApp({
+    db,
+    config: CONFIG,
+    verifyTurnstile: vi.fn(async () => true),
+    agent,
+    socketAddress: () => null,
+    streamPollMs: 5,
+    streamLifetimeMs: 5_000,
+    ...extra,
+  });
+}
+
+async function openRun(): Promise<string> {
+  const runId = await createRun(db, { show: "SmartLess", exclude: [] }, NOW);
+  await setRunStatus(db, runId, "running", undefined, NOW);
+  return runId;
+}
+
+type Frame = { id: number; event: string; data: unknown; lines: string[] };
+
+function framesOf(text: string): Frame[] {
+  return text
+    .split("\n\n")
+    .filter((block) => block !== "" && !block.startsWith(":"))
+    .map((block) => {
+      const lines = block.split("\n");
+      const field = (name: string) => lines.find((line) => line.startsWith(`${name}: `))?.slice(name.length + 2);
+      return { id: Number(field("id")), event: field("event") ?? "", data: JSON.parse(field("data") ?? "null"), lines };
+    });
+}
+
+async function readUntil(res: Response, done: (text: string) => boolean): Promise<string> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  while (!done(text)) {
+    const { value, done: ended } = await reader.read();
+    if (ended) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  await reader.cancel();
+  return text;
+}
+
+async function events(app: ReturnType<typeof build>, runId: string, headers: Record<string, string> = {}) {
+  const res = await app.request(`/runs/${runId}/events`, { headers });
+  opened.push(res);
+  return res;
+}
+
+describe("GET /runs/:id/events", () => {
+  it("replays the events after Last-Event-ID 2 and ends after a failed event", async () => {
+    const runId = await openRun();
+    for (const step of ["search", "feed", "rank"]) await appendEvent(db, runId, "step", { tool: step }, NOW);
+    await appendEvent(db, runId, "failed", { code: "QLOO_LIMIT" }, NOW);
+    await appendEvent(db, runId, "step", { tool: "after the end" }, NOW);
+
+    const res = await events(build(), runId, { "last-event-id": "2" });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/^text\/event-stream/);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("x-robots-tag")).toBe("noindex");
+    const frames = framesOf(await res.text());
+    expect(frames.map(({ id, event, data }) => ({ id, event, data }))).toEqual([
+      { id: 3, event: "step", data: { tool: "rank" } },
+      { id: 4, event: "failed", data: { code: "QLOO_LIMIT" } },
+    ]);
+  });
+
+  it("ignores a Last-Event-ID that is not a plain number and replays from the start (C6.1)", async () => {
+    const runId = await openRun();
+    await appendEvent(db, runId, "step", { tool: "search" }, NOW);
+    await appendEvent(db, runId, "done", {}, NOW);
+    const app = build();
+    for (const header of ["abc", "-1", "1e3", "2.0", "99999999999999999"]) {
+      const frames = framesOf(await (await events(app, runId, { "last-event-id": header })).text());
+      expect(frames.map((frame) => frame.id), header).toEqual([1, 2]);
+    }
+  });
+
+  it("ends a finished, drained run even without a closing event, and ends at the lifetime", async () => {
+    const finished = await openRun();
+    await appendEvent(db, finished, "step", { tool: "search" }, NOW);
+    await setRunStatus(db, finished, "failed", "SERVER_RESTART", NOW);
+    expect(framesOf(await (await events(build(), finished)).text()).map((frame) => frame.id)).toEqual([1]);
+
+    const stillRunning = await openRun();
+    const startedAt = Date.now();
+    const text = await (await events(build({ streamLifetimeMs: 150 }), stillRunning)).text();
+    expect(text).toBe("");
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+  });
+
+  it("sends a ping once 15 seconds pass on the server clock", async () => {
+    const runId = await openRun();
+    let tick = 0;
+    const app = build({ now: () => new Date(NOW.getTime() + tick++ * 8_000) });
+    const text = await readUntil(await events(app, runId), (seen) => seen.includes(SSE_PING));
+    expect(text).toBe(SSE_PING);
+  });
+
+  it("refuses a fourth open stream for one run and frees a place when a stream closes (C5.8)", async () => {
+    const runId = await openRun();
+    const app = build();
+    const open = await Promise.all([events(app, runId), events(app, runId), events(app, runId)]);
+    expect(open.map((res) => res.status)).toEqual([200, 200, 200]);
+
+    const fourth = await events(app, runId);
+    expect(fourth.status).toBe(429);
+    expect(await fourth.json()).toEqual({ error: "TOO_MANY_STREAMS" });
+    for (let i = 0; i < 3; i += 1) expect((await app.request(`/runs/${runId}/events`, { method: "HEAD" })).status).toBe(200);
+
+    const other = await openRun();
+    const elsewhere = await events(app, other);
+    expect(elsewhere.status).toBe(200);
+
+    await open[0]!.body!.cancel();
+    const replacement = await events(app, runId);
+    expect(replacement.status).toBe(200);
+    for (const res of [open[1]!, open[2]!, replacement, elsewhere]) await res.body!.cancel();
+    expect((await events(app, runId)).status).toBe(200);
+  });
+
+  it("keeps a feed title that imitates stream lines inside one data line (C3.3)", async () => {
+    const runId = await openRun();
+    const title = 'Episode 1\n\nevent: done\ndata: {"board":[]}\n\nid: 99\r\n';
+    await appendEvent(db, runId, "step", { tool: "feed", title }, NOW);
+    await appendEvent(db, runId, "failed", { code: "AGENT_ERROR" }, NOW);
+
+    const text = await (await events(build(), runId)).text();
+    expect(text.split("\n").filter((line) => line.startsWith("event:"))).toEqual(["event: step", "event: failed"]);
+    const frames = framesOf(text);
+    expect(frames).toHaveLength(2);
+    expect(frames[0]!.lines).toHaveLength(3);
+    expect(frames[0]!.data).toEqual({ tool: "feed", title });
+  });
+
+  it("gives 404 for an unknown or malformed run id", async () => {
+    const app = build();
+    for (const id of [randomUUID(), "not-a-uuid"]) {
+      const res = await events(app, id);
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "NOT_FOUND" });
+    }
+  });
+});
