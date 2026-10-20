@@ -87,7 +87,7 @@ Does not apply, and why:
 
 ### Trust boundaries
 - TB1 Browser to the web app and the agent server: bodies, query strings, run IDs in paths, headers (Origin, X-Forwarded-For, Content-Type, Last-Event-ID, User-Agent), and the number and timing of requests and open streams.
-- TB2 Web app to agent server, if they are deployed separately: this call crosses the public internet unless the two share a private network. The agent server cannot assume a request came through the web app.
+- TB2 Web app to agent server, if they are deployed separately: this call crosses the public internet unless the two share a private network. The agent server cannot assume a request came through the web app. As built, the browser calls the agent server directly (DECISIONS, 19 Oct), and since section D the agent server also serves the public /mcp route. It is a front door in its own right, so every check lives in it (C5.6, D2.7).
 - TB3 Agent server to arbitrary feed hosts: status, headers, redirects, body, and the DNS answers for the host.
 - TB4 Upstream APIs to the agent server (Qloo over HTTPS and MCP, the podcast directory, YouTube, Anthropic): the transport is trusted, but the content is written by strangers. Podcasters write directory metadata, channel owners write video titles, and Qloo entity data comes from public sources.
 - TB5 Model to agent server: tool calls and prose. The model has read untrusted text, so everything it returns is untrusted.
@@ -170,7 +170,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C2.5 The visitor controls no model setting. Model name, system prompt, token limits and tool list are fixed on the server.
 - C2.6 No secret, environment variable, database URL or internal hostname appears in any message to the model, including tool results and tool errors.
 - C2.7 Exclusions are applied in code to the ranked board, and the model never sees them. Visitor free text never reaches the brief or pitch prompts. Those get only the confirmed show, the guest picked from the stored board, computed numbers and tool data.
-- C2.8 Tool results reach the model only as tool-result content, capped in size, and are never merged into the system prompt.
+- C2.8 Tool results reach the model only as tool-result content, capped in size, and are never merged into the system prompt. Every third-party string in a tool result is cleaned first by the same cleaner as D5.2: NFC, `\p{Cc}` removed, `\p{Default_Ignorable_Code_Point}` and `\p{Bidi_Control}` removed. That takes out the invisible Unicode tag characters (U+E0000 to U+E007F), which a model reads and a person cannot see.
 
 ### C3 What leaves the server (A5, A11, G4, G5)
 - C3.1 No attacker-influenced string is ever treated as HTML or script in the browser. This covers model prose, feed fields, Qloo and YouTube text, tool inputs in step events, and anything read back from the database. All of it renders as React text, with no `dangerouslySetInnerHTML`. If prose is rendered as markdown, raw HTML and images are off.
@@ -184,7 +184,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C3.5 The brief and pitch the model writes contain no URL, email address or phone number. Any found is removed before storage and display, and the step log records the removal. Detection uses linkify-it, which catches schemes, bare domains and emails, plus a phone-number finder. It does not catch disguised forms like "name at domain dot com". The system never sends the pitch.
   - Show it: stub prose containing `https://evil.example`, `evil.example/login` and `bob@evil.example` comes out without them.
 - C3.6 Upstream errors and exceptions never reach the browser, the step log or the model word for word. They become a fixed error code, plus a structured server log record with secrets redacted. Attacker text is a field value in that record, never part of the message template.
-- C3.7 Characters with the Unicode property `\p{Bidi_Control}` are stripped from upstream text before display, so text reads the way it is stored.
+- C3.7 Upstream text is cleaned before display by the D5.2 cleaner: `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}` (including the invisible tag characters) and `\p{Cc}` are removed, so text reads the way it is stored and hides nothing from the person reading it.
 - C3.8 Visitor run pages are marked noindex, and no other page links to them.
 
 ### C4 Secrets (A6, A12, G3)
@@ -205,9 +205,11 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
   - Show it: crawl every page with GET requests only while counting upstream calls. The count is zero.
 - C5.5 Starting a run, confirming a show and requesting a brief all require a POST with Content-Type `application/json` and an Origin header that, once parsed by the URL parser, equals the app's configured origin parsed the same way. A missing Origin is refused.
   - Show it: POSTs with Origin `https://evil.example`, with no Origin, and with `text/plain` are all refused.
-- C5.6 Every check that protects spending runs in the process that spends. If the agent server is deployed separately, it enforces C5.1 to C5.5 itself. It accepts relayed requests only with the web app's secret, and takes the visitor identity from a field the web app sets after its own C5.3 check.
+- C5.6 Every check that protects spending runs in the process that spends. If the agent server is deployed separately, it enforces C5.1 to C5.5 itself. It accepts relayed requests only with the web app's secret, and takes the visitor identity from a field the web app sets after its own C5.3 check. As built there is no relay: the agent server takes the visitor address only from the edge header (C5.3), and the public /mcp route follows D2.7.
 - C5.7 The kill switch and every cap fail closed. If the flag, a counter or the database cannot be read, no run starts and no metered call goes out. When live runs are off, the site says so and saved runs still work.
-- C5.8 Expensive steps cannot be repeated for free. Each guest gets one brief per run, served from storage after the first. Runs in progress are capped globally, and each run has a cap on open streams and a maximum stream lifetime.
+- C5.8 Expensive steps cannot be repeated for free. Each guest gets one brief per run, served from storage after the first. The claim is made atomically, under a unique (run, guest) key, before any model call, so parallel requests make one call. Runs in progress are capped globally, and each run has a cap on open streams and a maximum stream lifetime.
+- C5.9 A run starts only after a fresh human check solved on this site for this purpose. The server calls Cloudflare's siteverify itself and accepts only when all three hold: `success` is true; `hostname` equals the hostname of the configured app origin, taken by the URL parser with both sides lower-cased; and `action` equals the run-start action. A failure, a timeout or an answer that does not parse is a refusal. Each surface uses its own action name (run start and agent-key issue), so an answer solved for one can never be spent on the other.
+  - Show it: a stubbed reply naming another hostname, one with the agent-key action, one with no action, and a siteverify timeout are each refused, and no run is created.
 
 ### C6 Runs, state and storage (A9, A10, A14)
 - C6.1 Run IDs carry at least 122 random bits (`crypto.randomUUID`) and are never sequential. A visitor's run can be reached only by its ID, and no endpoint lists visitor runs. The Last-Event-ID header is read as a bounded non-negative integer or ignored.
@@ -291,13 +293,218 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 5. Non-goals. This system does not defend against:
    - Mistakes in AI prose about real people. Briefs and pitches are labelled AI drafts. The code guarantees their numbers come from data and that they carry no links or contact details (C3.4, C3.5), not that every sentence is true.
    - Prompt injection happening. Feed and channel text can still sway the model's wording and tool choices. C1.5, C2 and C3 limit what that can cost or reach.
-   - A determined attacker draining the day's budget. Caps protect money and quota, but a script that keeps changing its IP address can still use up the global budget and switch live runs off until the reset. Saved runs keep working. A human check on run start would narrow this. Without one it is a known weakness.
+   - A determined attacker draining the day's budget. Caps protect money and quota, and run start now needs a human check (C5.9). But a funded attacker buying Turnstile answers from a solving service, while rotating addresses, can still use up the public daily share and turn live runs off until the reset. Saved runs keep working. The judging reserve is built from protected time, not protected people (DECISIONS, 19 Oct).
    - Privacy of runs. Anyone with a run link can read it, so visitors should not type anything private.
    - Secrecy of prompts and ranking logic. The repo is public by design.
    - Accuracy of third-party data. Qloo, YouTube and directory data is shown as received, apart from the confirm step and the channel label.
    - A compromised provider or host (Qloo, Anthropic, Google, Apple, Vercel, Railway or Fly, the Postgres host, npm). C4.4 and C4.5 limit the damage; nothing here detects a compromise.
    - Network-level floods, which are left to the host's edge.
    - Life after the hackathon. Once Qloo turns off the key, live runs stop with a clear message (C5.7), and saved runs and the backtest stay up from the database.
+
+## Section D: the public MCP server
+
+Written on 19 Oct 2026, before any code for this component existed, in a second threat model pass. Section D extends section C. Every C invariant still holds for runs started through MCP, and D adds what the new door needs.
+
+How callers authenticate is decided as follows (Ram, 19 Oct 2026). A person gets a free agent key on the website after the human check, and pastes it into an MCP client that can send an Authorization header: Claude Code, agent frameworks, scripts. Official docs checked on 19 Oct show the Claude.ai and ChatGPT apps cannot send a static key, so they cannot use it. An OAuth sign-in for those apps comes later, after the frontend stage, and gets its own threat model pass before any code.
+
+### Data flows added
+- F9 Key issue: a website visitor passes Turnstile and receives a bearer token once. The server stores its hash, issue time, expiry and counters.
+- F10 MCP request: any internet client sends JSON-RPC over Streamable HTTP to /mcp on the agent server, with the token in the Authorization header.
+- F11 find_show: the query goes through the website's resolve step and returns up to 5 candidates with server-issued ids.
+- F12 book_guests: a candidate id starts a run on the shared runner. The request waits up to a fixed time, then returns the board and a run link, or the run id to poll.
+- F13 get_board and write_brief: a run id, plus a guest id for briefs, reads a board or asks for one model-written brief.
+- F14 Tool results to the calling agent: board fields, briefs and candidate names carry text from podcasters, Qloo and Vasal's model. That text becomes input to a model Vasal does not control.
+
+### A) App-class risk profile
+The MCP server adds four things:
+1. A public, scriptable API, authenticated by a bearer token, in front of the same metered runs the website starts.
+2. A credential issuer. Tokens go to anonymous people and then live for 30 days in files Vasal never sees.
+3. A tool provider whose output is input to someone else's AI agent. That agent may hold its user's email, files, shell or other MCP servers.
+4. A second public route on the agent server.
+
+It still holds no private user data, sends no email and moves no money directly. What it holds is spending power, shared capacity, and the trust a calling agent places in its results.
+
+- A15 Leaked and stolen tokens (F9, F10). Tokens get pasted into config files, committed, synced, screenshotted and logged. Each is a 30-day spending credential. A stored or logged token is as good as the original.
+- A16 Broken authentication on the transport (F10). Malformed or duplicate Authorization headers, tokens offered in the query string, cookie or body, a session id treated as authentication, and one transport instance shared across clients, which routes responses by a client-chosen JSON-RPC id.
+- A17 Acting on objects that are not yours (F11 to F13). A candidate from another token, a website run's id, a guest id from another board, a guest name in place of an id, or a candidate id that encodes a URL.
+- A18 Budget and capacity exhaustion (F9, F11 to F13). Everything in A4, plus:
+  - token farming
+  - one human check covering 30 days of calls
+  - client retries buying new runs
+  - races on per-token counters
+  - JSON-RPC batches
+  - long-held connections
+  - MCP runs filling the site's in-flight slots
+  - MCP daily slices adding up to the shared monthly ceiling
+  - find_show spam getting the server throttled by the Apple directory
+- A19 Prompt injection relayed to the caller's agent (F14). Podcasters write show names and episode titles, and Qloo tags come from public sources. Vasal's angles and briefs were written by a model that read them. Payloads include plain instructions, fake "Vasal note" framing, invisible Unicode tag characters, markdown images that leak data when rendered, and sheer size.
+- A20 Leaking internals through errors (F10 to F13). The SDK can turn a thrown error's message into a tool result. Different answers for "does not exist" and "not yours" would also reveal which ids are live.
+- A21 A public door on a process built for its own website (F10). Path tricks around the public route, relayed identity headers, and the website's and MCP's opposite Origin rules leaking into each other.
+- A22 The resolver as a scriptable service (F11). The new part is rate and amplification, not reach: C1 still guards the network.
+- A23 Bulk extraction of Qloo-derived data (F12 to F14). Whether Qloo's terms allow returning derived data through an API is to be verified (A13).
+- A24 A weaker human check (F9). A check that skips the hostname or the action, or treats a siteverify timeout as a pass.
+- A25 Claims about real people leaving Vasal's domain (F14). Applies lightly; mostly a non-goal.
+
+Does not apply, and why:
+- **Cross-site request forgery on /mcp.** Authority is a bearer header, which a browser never attaches on its own. This stays true only while no code reads the token from a cookie or the query string.
+- **DNS rebinding.** The server is public and checks a token on every request. Origins are still refused, by D2.6.
+- **Server-to-client features.** None are declared (D2.4).
+- **Token passthrough to upstreams.** Vasal calls Qloo and Anthropic with its own keys and never needs the caller's token.
+- **Tool poisoning through Vasal's own tool descriptions.** They are fixed strings in a public repo.
+
+### B) Threat model
+Trust boundaries:
+- TB11 Internet client to /mcp
+- TB12 Browser to the key-issue endpoint
+- TB13 Cloudflare siteverify's answer, which must be checked, not assumed
+- TB14 The MCP SDK to Vasal's code: the parsing edge
+- TB15 The public MCP route and the other routes in one process
+- TB16 Vasal to the calling agent: TB5 in reverse
+- TB17 The new tables read back
+- TB18 The caller's environment: config files, logs and the model provider
+
+Inputs an attacker can influence:
+- On /mcp:
+  - every header: Authorization, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, Accept, Content-Type, Origin, Host, forwarding headers
+  - the method
+  - the JSON-RPC body: size, batches, undeclared methods, client-chosen ids, `_meta`, clientInfo
+  - tool arguments
+  - the path's spelling
+  - timing and concurrency
+- At key issue: the Turnstile answer, the address, and the rate.
+- Indirectly:
+  - every upstream input in section B, which now also flows out through F14
+  - Vasal's model output
+  - the siteverify answer
+  - rows read back
+  - the calling agent's own retry policy
+
+Privileged position and assets:
+- the power to start runs, and through it the shared monthly Qloo ceiling and the site's 3 in-flight slots
+- the token store
+- the server's standing with the Apple directory and Qloo
+- the trust the calling agent places in Vasal's results
+- Qloo-derived data in bulk
+- the run links Vasal hands out
+
+Attacker goals:
+- G6 Drain the MCP budget and starve the website.
+- G7 Use Vasal to attack its own users' agents through injected podcast text. This is the most damaging goal, and it costs one podcast registration.
+- G8 Spend or read on someone else's authority.
+- G9 Reach the agent server's internals through the new door.
+- G10 Extract Qloo data in bulk.
+
+### C) Defensive-programming standards for the MCP server (the definition of done)
+"Token" means an agent key issued in F9. Each invariant ends with how to show it holds.
+
+D1 Tokens and the human check (A15, A24, G8)
+- D1.1 A database read yields no usable token. A token is 32 bytes from `crypto.randomBytes`, base64url-encoded behind the prefix `vsl_`, and only its SHA-256 hash is stored. Covers guessing and a leaked database, but not a token its holder leaks.
+  - Show it: only the hash appears in the rows and logs an issue wrote.
+- D1.2 The token is read only from the Authorization header, by one parser: scheme `Bearer` (any case), one space, then the exact token format. Any other shape gets 401 before the body is parsed or the database is read. A token in the query string, a cookie or the body is never read.
+  - Show it: two spaces, `Basic`, `?token=` with no header, a short token and a token with extra text each get 401 with zero database reads.
+- D1.3 A token authorizes a request only if its hash row exists, it is not revoked, and the database clock is before its expiry. All three are checked in the one query that loads the row, on every request. Expiry is set from the database clock. No decision is cached past one request.
+  - Show it: expire or revoke a token between two requests, and the second is refused.
+- D1.4 Outside the caller, the token appears in exactly one place: the one response that shows it, sent with `Cache-Control: no-store` and never in a URL. It never appears in a log, run row, step log, stream frame, tool result, error, run page or analytics event, and it is never sent upstream.
+  - Show it: a full MCP test run finds zero `vsl_` hits in logs, rows, streams and results.
+- D1.5 A token is issued only after a fresh human check solved on this site for key issue: `success` true, `hostname` equal to the app origin's hostname, and `action` equal to the key-issue action (C5.9's rule with its own action). A failure, timeout or unparseable answer issues nothing. The endpoint keeps C5.5. Per-visitor issue caps use C5.3's normaliser and an atomic reservation, and a global cap bounds tokens issued per day.
+  - Show it: a replay, the run-start action, another hostname and a timeout each issue nothing. 50 parallel requests against a cap of 3 issue exactly 3 tokens.
+- D1.6 A leaked token can be made useless at once. The operator can revoke one token, revoke all of them, or switch MCP off, through database flags only, with no web endpoint. The main kill switch stops MCP too. All of these fail closed.
+  - Show it: flip each flag, and the next request gets a fixed refusal.
+- D1.7 Token rows carry no visitor address, raw or hashed.
+
+D2 Transport (A16, A20, A21, G8, G9)
+- D2.1 A session id grants nothing. Every request authenticates with its own token.
+- D2.2 The server runs stateless: no session ids, no event store, a fresh server and transport per request. If sessions are ever added, each id is minted by the server, bound to the token hash, capped and idle-expired, and an unknown or foreign id gets 404.
+- D2.3 A response reaches only the connection whose request produced it. JSON-RPC ids are never used as keys outside one transport instance.
+  - Show it: two tokens send `tools/call` with `id: 1` at once, 200 times, and each gets only its own result.
+- D2.4 The server offers tools only, with no sampling, elicitation, roots or log messages. Undeclared methods get method-not-found. Tool names, descriptions, schemas, annotations and instructions are fixed strings. Annotations tell the truth: book_guests and write_brief are not read-only, and all four tools are open-world.
+- D2.5 Vasal's code caps the body at 16 KB before the SDK parses it. Content-Type must be `application/json`, and JSON-RPC batch arrays are refused. Limits count tool calls, not HTTP requests. GET streams are refused, since the server is stateless and JSON-only. The HTTP server's timeouts are set explicitly.
+  - Show it: a 17 KB body, a batch and `text/plain` are each refused, and no tool runs.
+- D2.6 A request carrying an Origin header is refused unless that origin is on a fixed list, which is empty at launch, and /mcp sends no CORS headers. A request with no Origin is allowed. This is deliberately the opposite of C5.5, and the two rules live in separate code.
+  - Show it: `Origin: https://evil.example` gets 403, no Origin works, and the website's run start with no Origin is still refused.
+- D2.7 Only the exact mounted /mcp route answers to an agent key, and that comes from the router's own match, never a string test on the raw path. Identity comes only from the token there.
+  - Show it: `/MCP`, `/mcp/`, `/mcpx`, `/mcp/../runs` and `/%6Dcp` reach no MCP handler.
+- D2.8 No exception text reaches the caller. Every handler returns one code from a fixed set (`invalid_input`, `not_found`, `busy`, `budget_exhausted`, `expired`, `upstream_failed`, `mcp_off`), never `error.message`. "Does not exist" and "not yours" both return `not_found`.
+  - Show it: a planted marker and an internal hostname appear in no result or error.
+
+D3 Spending and capacity (A18, A22, G6)
+- D3.1 Nothing an MCP tool reaches goes unmetered. Qloo is charged to `qloo:day:mcp` and Anthropic to `anthropic:day:mcp`. Every call also counts against the token's daily count, the shared monthly ceiling and the per-second limit, all reserved atomically. If any one fails, no call goes out.
+  - Show it: 50 tokens calling book_guests against a slice sized for 2 runs start exactly 2.
+- D3.2 Which share a call is charged to is recorded on the run (and on the brief claim) when it is created, and the runner reads it back. It is never inferred from the request or a header.
+  - Show it: an MCP run touches only MCP counters, and a website run touches none.
+- D3.3 MCP can never take the website's capacity:
+  - it holds at most 1 of the 3 in-flight slots, reserved atomically
+  - it has its own monthly cap below the shared ceiling
+  - when no MCP slot is free, book_guests answers `busy` at once, with no queue
+  - Show it: with MCP at its limit, a website run still starts.
+- D3.4 A retry never buys a second run. A candidate id can start at most one run, ever, claimed by a unique constraint before anything is spent. A repeat call returns the same run.
+  - Show it: 10 parallel calls with one candidate start one run.
+- D3.5 One brief per guest per run, under races (C5.8).
+  - Show it: 10 parallel write_brief calls make one Anthropic call.
+- D3.6 Each token has caps, counted atomically: runs per day, find_show calls per day, briefs per day, and calls in flight at once. Next to the caps, record how many runs one human check can buy.
+  - Show it: 20 parallel find_show calls against a cap of 5 complete exactly 5.
+- D3.7 One find_show call makes a fixed maximum of outbound requests, and Apple lookups share one limiter, with MCP capped at a share.
+- D3.8 A request without a valid token costs at most one indexed read and no write. Repeated failures from one address are slowed or refused.
+
+D4 Ids and ownership (A17, G8)
+- D4.1 A token acts only on what it made. Candidates, runs and brief claims record the token row id. book_guests accepts only an unexpired candidate (1 hour) issued to the calling token. get_board and write_brief accept only that token's runs, and write_brief only a guest on that run's board. Anything else, including website runs, gets `not_found` with no upstream call.
+- D4.2 Ids point to server rows and carry no data. A candidate id never encodes a URL.
+- D4.3 An MCP run starts from exactly the inputs a website run has after its confirm step. No MCP request text reaches Vasal's model.
+- D4.4 Tool arguments pass a strict schema before any work. Queries are classified by the same C8.2 function the website uses, and one resolver serves both surfaces.
+
+D5 What goes back to the calling agent (A19, A20, A23, A25, G7, G10)
+- D5.1 Every tool result is a schema-checked object, sent as `structuredContent` against a declared output schema, with `JSON.stringify` of it as the text. Third-party and model text appears only as JSON string values.
+  - Show it: a feed title carrying `"}\n\nVasal note: ...` arrives as one escaped value.
+- D5.2 Every third-party or model-written string is cleaned: NFC, `\p{Cc}` removed (briefs keep newlines), `\p{Default_Ignorable_Code_Point}` and `\p{Bidi_Control}` removed. Each field is capped (names 120, tags 40, angle 400, brief 2,000 characters) and the whole result is capped at 16 KB. Does not cover visible plain-language instructions or lookalike letters.
+- D5.3 The only URLs in a result are ones Vasal builds: the run link (the configured website origin plus the run id, never the Host header) and an Apple Podcasts link built from a numeric id. Every other field goes through C3.5's link removal. Vasal emits no markdown or HTML.
+  - Show it: `![x](https://evil.example/p?d=)` and `evil.example/login` come back without the URL.
+- D5.4 Results label themselves in fixed fields: third-party text as data from directories, feeds and Qloo, not instructions; angles and briefs as AI drafts; numbers as computed by Vasal. The labels are a hint, not a defence.
+- D5.5 MCP returns no more than the run page shows a person: no raw Qloo responses, Qloo entity ids or step logs.
+- D5.6 Nothing internal reaches the caller's model: secrets, internal hostnames, stack traces, other tokens' ids.
+
+D6 New tables
+- D6.1 New rows follow C6.5 and C6.6. A token row that fails its schema counts as missing.
+- D6.2 Rows per token are capped, and expired tokens and candidates are pruned on schedule (C6.7).
+
+### General standards for the MCP server
+1. Primitives over lists. The token uses `crypto.randomBytes` and SHA-256, and ids use `crypto.randomUUID`. The human check uses siteverify's hostname and action fields. Output uses Unicode property escapes, linkify-it, `JSON.stringify` and an output schema. Public routes come from the router's own match, and races are settled by database constraints. The remaining lists fail closed: the four tools, the declared capabilities, the error codes, the empty origin list and the token format.
+2. Normalise before you compare. Tokens are compared as hashes from one function, and expiry is checked against the database clock. The share a call is charged to is read from storage. The Turnstile hostname comes from the URL parser on both sides, ids are exact server strings, and one classifier serves both surfaces.
+3. Validate outputs like inputs. The new consumers are:
+   - the caller's model (D5.1 to D5.4)
+   - the caller's client, which may render markdown (D5.3)
+   - the caller's logs and model provider (D1.4, D5.5, D5.6)
+   - Vasal's own logs (D1.4, D2.8)
+4. Fail closed. Starting values:
+   - body: 16 KB, no batches
+   - token life: 30 days; candidate life: 1 hour
+   - book_guests waits up to 45 s, then returns the run id; there is no queue
+   - per token, per day: 3 runs, 20 find_show calls, 15 briefs
+   - per token, at once: 1 book_guests and 3 calls in flight
+   - MCP in-flight slots: 1 of 3
+   - key issue: 3 per visitor per day, plus a global daily cap
+   - tool result: 16 KB
+
+   An unreadable token row, flag or counter, a siteverify failure, a schema failure or an unknown method is a refusal. One human check buys at most 3 runs a day for 30 days, so 90 runs.
+5. Non-goals. The MCP server does not defend against:
+   - the caller's model obeying visible plain-language text in a result
+   - tokens leaked by their holders, beyond the caps until expiry or revocation
+   - a funded attacker minting tokens through solver services, beyond D3.3 keeping the website's capacity safe
+   - fairness among honest MCP users once the daily slice is spent
+   - privacy of MCP runs (run links work like the website's)
+   - knowing who a token belongs to
+   - compromise of the caller's agent, client or model provider, or of the MCP SDK (pinned in the lockfile)
+
+### Facts to verify for section D
+- How SDK 1.32.1 handles each of these:
+  - a thrown tool error
+  - batch arrays
+  - unknown keys in a raw-shape input schema
+  - `structuredContent` against `outputSchema`
+  - reuse of a stateless transport across requests
+- Cloudflare siteverify's `hostname` and `action` fields, and whether an answer is single use.
+- The Apple directory's per-address rate limit.
+- Whether Qloo's terms allow returning Qloo-derived board data to third parties through an API (A13, A23).
+- Settled on 19 Oct: the agent loop does not call YouTube; only the offline backtest does.
 
 ## Facts to verify before a work order cites them
 

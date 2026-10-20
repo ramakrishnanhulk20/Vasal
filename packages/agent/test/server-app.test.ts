@@ -1,7 +1,8 @@
 // Covers the agent server's HTTP routes through app.request() on a migrated
-// PGlite database, with a stub human check, a spy agent and a stub socket
-// address, plus the run-store functions those routes added. It does not cover
-// the real Turnstile call or a real socket (the live smoke does), races
+// PGlite database, with a stub human check (and once the real verifier on a
+// fake siteverify), a spy agent and a stub socket address, plus the run-store
+// functions those routes added. It does not cover the real Turnstile call or
+// a real socket (the live smoke does), races
 // between separate database connections (PGlite has one), the vasal_app
 // grants, the event stream (server-stream.test.ts), or the real agent loop.
 import { randomUUID } from "node:crypto";
@@ -29,6 +30,7 @@ import {
   setRunStatus,
   type RunInput,
 } from "../src/server/runs.js";
+import { createTurnstileVerifier, TURNSTILE_ACTIONS } from "../src/server/turnstile.js";
 import type { Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
 import { setBucket } from "../src/store/meter.js";
@@ -273,7 +275,7 @@ describe("POST /runs", () => {
     const { runId } = (await res.json()) as { runId: string };
     expect(runId).toMatch(UUID);
 
-    expect(verify).toHaveBeenCalledExactlyOnceWith("tok-1", VISITOR);
+    expect(verify).toHaveBeenCalledExactlyOnceWith("tok-1", VISITOR, TURNSTILE_ACTIONS.runStart);
     expect(agent.startRun).toHaveBeenCalledExactlyOnceWith(runId, { show: "Café Society", exclude: ["Kevin"] });
     expect((await getRun(db, runId))?.input).toEqual({ show: "Café Society", exclude: ["Kevin"] });
     expect(await visitorRuns()).toBe(1);
@@ -378,6 +380,44 @@ describe("POST /runs", () => {
     expect(await snapshot()).toBe(before);
   });
 
+  it("starts a run only for an answer solved on this site for run start, and creates no run otherwise (C5.9)", async () => {
+    const answering = (reply: () => Promise<Response>) =>
+      createTurnstileVerifier({
+        secret: "0x4AAAAAAA-real-looking-secret",
+        expectedHostname: new URL(APP_ORIGIN).hostname,
+        fetchImpl: (async () => reply()) as typeof fetch,
+        timeoutMs: 50,
+      });
+    const answer = (body: unknown) => async () => new Response(JSON.stringify(body), { status: 200 });
+    const before = await snapshot();
+
+    const refused: Array<[string, () => Promise<Response>]> = [
+      ["another hostname", answer({ success: true, hostname: "evil.example", action: TURNSTILE_ACTIONS.runStart })],
+      ["the agent-key action", answer({ success: true, hostname: "localhost", action: TURNSTILE_ACTIONS.agentKey })],
+      ["no action", answer({ success: true, hostname: "localhost" })],
+      ["a siteverify timeout", () => new Promise<Response>(() => {})],
+    ];
+    for (const [label, reply] of refused) {
+      const { app, agent } = build({ verify: answering(reply) });
+      const res = await start(app);
+      expect(res.status, label).toBe(403);
+      expect(await res.json()).toEqual({ error: "HUMAN_CHECK_FAILED" });
+      expect(agent.startRun).not.toHaveBeenCalled();
+    }
+    expect(await snapshot()).toBe(before);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int AS n FROM runs")).rows).toEqual([{ n: 0 }]);
+
+    const { app, agent } = build({
+      verify: answering(answer({ success: true, hostname: "LocalHost", action: TURNSTILE_ACTIONS.runStart })),
+    });
+    const res = await start(app);
+    expect(res.status).toBe(202);
+    const { runId } = (await res.json()) as { runId: string };
+    expect((await getRun(db, runId))?.status).toBe("queued");
+    expect(agent.startRun).toHaveBeenCalledOnce();
+    await settled(0);
+  });
+
   it("counts only the one address the edge header gives, or the socket when no header is configured (C5.3)", async () => {
     const before = await snapshot();
     const header = build();
@@ -395,7 +435,7 @@ describe("POST /runs", () => {
     const socket = build({ config: { clientIpHeader: null }, socket: "198.51.100.4" });
     const res = await start(socket.app, undefined, { [IP_HEADER]: "192.0.2.99" });
     expect(res.status).toBe(202);
-    expect(socket.verify).toHaveBeenCalledExactlyOnceWith("tok", "198.51.100.4");
+    expect(socket.verify).toHaveBeenCalledExactlyOnceWith("tok", "198.51.100.4", TURNSTILE_ACTIONS.runStart);
     await settled(0);
   });
 
@@ -820,7 +860,7 @@ describe("POST /runs/:id/confirm", () => {
     expect((await getRun(db, second.runId))?.status).toBe("awaiting_confirm");
 
     finish();
-    await vi.waitFor(async () => expect((await db.query("SELECT n FROM inflight")).rows).toEqual([{ n: 0 }]));
+    await vi.waitFor(async () => expect((await db.query("SELECT n FROM inflight WHERE slot = 'runs'")).rows).toEqual([{ n: 0 }]));
     expect((await confirm(second)).status).toBe(202);
     expect(agent.continueRun).toHaveBeenCalledTimes(2);
   });

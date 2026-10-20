@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { routePath } from "hono/route";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
+import { createMcpRoute } from "../mcp/server.js";
 import { visitorKey } from "../net/visitor-key.js";
 import type { Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
@@ -13,6 +14,7 @@ import { acquireInflightSlot, countVisitorRun, releaseInflightSlot } from "./cap
 import type { ServerConfig } from "./config.js";
 import { ServerError } from "./errors.js";
 import { clientAddressFrom, isAllowedPost } from "./guards.js";
+import { createAgentKeysRoute } from "./keys-route.js";
 import {
   appendEvent,
   claimBrief,
@@ -31,11 +33,12 @@ import {
   type RunInput,
 } from "./runs.js";
 import { formatSseFrame, parseLastEventId, SSE_PING } from "./sse.js";
+import { TURNSTILE_ACTIONS } from "./turnstile.js";
 
 export type AppDeps = {
   db: Db;
   config: ServerConfig;
-  verifyTurnstile: (token: string, remoteIp: string | null) => Promise<boolean>;
+  verifyTurnstile: (token: string, remoteIp: string | null, expectedAction: string) => Promise<boolean>;
   agent: AgentPort;
   socketAddress: (c: Context) => string | null; // main.ts passes getConnInfo; tests pass a stub
   now?: () => Date;
@@ -129,7 +132,8 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
 /**
  * Builds the public agent server. Routes: GET /health, GET /showcase, POST
  * /runs, GET /runs/:id, GET /runs/:id/events, POST /runs/:id/confirm, POST
- * /runs/:id/brief and GET /runs/:id/briefs/:guestId; every other path and
+ * /runs/:id/brief, GET /runs/:id/briefs/:guestId, POST /agent-keys
+ * (keys-route.ts) and POST /mcp (mcp/server.ts); every other path and
  * method gives 404 NOT_FOUND, and there is no way to list visitor runs
  * (C6.1). GET /showcase lists only the runs the operator promoted (C6.3),
  * from storage alone, cacheable for 60 seconds and open to indexing.
@@ -146,7 +150,9 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * streamLifetimeMs; pings follow the `now` clock, checked once per poll.
  * Every POST that can spend must pass the Origin and Content-Type check, the
  * 8 KiB body cap and a strict body schema before anything else runs (C5.5,
- * C8.1), and a GET or HEAD never spends (C5.4). Refusals are JSON
+ * C8.1), and a GET or HEAD never spends (C5.4). POST /runs also needs a
+ * human check solved on this site for the run-start action (C5.9), checked
+ * before the visitor is counted. Refusals are JSON
  * { error: CODE } and change nothing. An unexpected failure gives 500
  * { error: "INTERNAL" } and one log line holding only the route pattern and
  * a fixed code (C3.6). Throws ServerError("SRV_BAD_INPUT") while building if
@@ -173,7 +179,7 @@ export function createApp(deps: AppDeps): Hono {
 
   const isHuman = async (token: string, address: string): Promise<boolean> => {
     try {
-      return (await deps.verifyTurnstile(token, address)) === true;
+      return (await deps.verifyTurnstile(token, address, TURNSTILE_ACTIONS.runStart)) === true;
     } catch {
       return false;
     }
@@ -324,6 +330,10 @@ export function createApp(deps: AppDeps): Hono {
       c.res.headers.set("Cache-Control", "no-store");
     }
   });
+
+  // Mounted before cors() so /mcp never sends a CORS header: the MCP door
+  // refuses every Origin, the opposite of the website's rule (D2.6).
+  app.route("/mcp", createMcpRoute({ db, agent, config, now }));
 
   app.use(
     "*",
@@ -493,6 +503,8 @@ export function createApp(deps: AppDeps): Hono {
     if (claim?.status === "failed") return c.json({ status: "failed", code: claim.errorCode });
     return c.json({ status: "none" });
   });
+
+  app.route("/", createAgentKeysRoute(deps));
 
   app.notFound((c) => refuse(c, 404, "NOT_FOUND"));
 

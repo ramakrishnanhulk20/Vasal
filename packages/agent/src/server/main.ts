@@ -1,26 +1,31 @@
 import { serve } from "@hono/node-server";
 import { getConnInfo } from "@hono/node-server/conninfo";
-import { createAnthropicModel } from "../agent/model.js";
-import { createAgentRunner } from "../agent/runner.js";
+import { fileURLToPath } from "node:url";
+import { createAnthropicModel, type ModelClient } from "../agent/model.js";
+import { createAgentRunner, reserveSurfaceTokens, waitForSurfaceQlooSlot } from "../agent/runner.js";
 import { loadQlooConfig, type QlooConfig } from "../config.js";
 import { lookupShow, searchShows } from "../feeds/lookup.js";
 import { parseFeed } from "../feeds/rss.js";
+import { MCP_ENABLED_FLAG } from "../mcp/tokens.js";
+import { resetTokenInflight } from "../mcp/usage.js";
 import { safeFetch } from "../net/safe-fetch.js";
+import { loadPolicy, profileFor } from "../ops/policy.js";
 import { createQlooClient } from "../qloo/client.js";
-import { createMeteredQloo } from "../qloo/metered.js";
+import { createMeteredQloo, type MeteredQloo } from "../qloo/metered.js";
 import { createPgDb, createPgliteDb, type Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { setFlag } from "../store/flags.js";
-import { reserve, setBucket } from "../store/meter.js";
+import { setBucket } from "../store/meter.js";
 import { migrate } from "../store/migrate.js";
 import { createUnavailableAgent, type AgentPort } from "./agent-port.js";
 import { createApp } from "./app.js";
 import { resetInflight } from "./caps.js";
 import { loadServerConfig, type ServerConfig } from "./config.js";
 import { ServerError } from "./errors.js";
-import { failInterruptedRuns, failStaleBriefClaims } from "./runs.js";
+import { failInterruptedRuns, failStaleBriefClaims, type RunSurface } from "./runs.js";
 import { createTurnstileVerifier } from "./turnstile.js";
 
+const POLICY_FILE = fileURLToPath(new URL("../../scripts/budget-policy.json", import.meta.url));
 const DEV_WINDOW_MS = 30 * 24 * 60 * 60 * 1_000;
 // One agent server process owns the database (the same assumption
 // failInterruptedRuns makes), so at start-up no brief can be in progress and
@@ -39,6 +44,22 @@ function codeOf(error: unknown): string {
   return error instanceof ServerError || error instanceof StoreError ? error.code : "UNEXPECTED";
 }
 
+// Every bucket the budget policy names is created, so each surface's share
+// exists in development as it would after the operator's daily roll. The
+// profile for today is used, or the latest one once the policy runs out. The
+// dev caps above then replace the policy's for the shared Qloo and YouTube
+// buckets, and every bucket gets the long dev window instead of a day or a
+// month, so a dev server left running does not lock itself out at midnight.
+async function seedDevBudgets(db: Db, config: ServerConfig): Promise<void> {
+  const policy = await loadPolicy(POLICY_FILE);
+  const now = new Date();
+  const latest = policy.profiles.reduce((last, profile) => (profile.to > last.to ? profile : last));
+  const caps = new Map((profileFor(policy, now) ?? latest).buckets.map((bucket) => [bucket.key, bucket.cap]));
+  for (const [key, cap] of [...DEV_BUCKETS, [ANTHROPIC_DAY, config.anthropicTokensPerDay] as const]) caps.set(key, cap);
+  const windowEnd = new Date(now.getTime() + DEV_WINDOW_MS);
+  for (const [key, cap] of caps) await setBucket(db, { key, cap, windowEnd });
+}
+
 // Production and any configured DATABASE_URL never migrate or seed: the
 // operator does that as the owner role, and the app role could not anyway.
 async function openDb(config: ServerConfig): Promise<Db> {
@@ -47,11 +68,9 @@ async function openDb(config: ServerConfig): Promise<Db> {
 
   const db = await createPgliteDb();
   await migrate(db);
-  const windowEnd = new Date(Date.now() + DEV_WINDOW_MS);
-  for (const [key, cap] of [...DEV_BUCKETS, [ANTHROPIC_DAY, config.anthropicTokensPerDay] as const]) {
-    await setBucket(db, { key, cap, windowEnd });
-  }
+  await seedDevBudgets(db, config);
   await setFlag(db, "live_runs", true);
+  await setFlag(db, MCP_ENABLED_FLAG, true);
   console.log("Using an in-memory development database. Everything in it is lost when the server stops.");
   return db;
 }
@@ -80,18 +99,30 @@ function createAgent(db: Db, config: ServerConfig, qloo: QlooConfig): AgentPort 
     console.log(`The agent is off because ${missing.join(" and ")} ${verb} not set, so every run fails with AGENT_NOT_READY.`);
     return createUnavailableAgent(db);
   }
-  const model = createAnthropicModel({
-    apiKey: config.anthropicApiKey,
-    model: config.model,
-    effort: config.effort,
-    reserveTokens: (amount) => reserve(db, [{ key: ANTHROPIC_DAY, amount }]),
-  });
+  const { anthropicApiKey } = config;
+  // One model and one metered Qloo client per surface, each charging only its
+  // own buckets. The runner picks the pair from the run's stored surface (D3.2).
+  const modelFor = (surface: RunSurface): ModelClient =>
+    createAnthropicModel({
+      apiKey: anthropicApiKey,
+      model: config.model,
+      effort: config.effort,
+      reserveTokens: (amount) => reserveSurfaceTokens(db, surface, amount),
+    });
   // No retries inside the client, so every Qloo attempt takes its own slot
   // from the shared meter (C5.1, C5.2).
   const client = createQlooClient({ apiKey: qloo.apiKey, baseUrl: qloo.baseUrl, maxRetries: 0 });
-  const metered = createMeteredQloo({ client, db, baseUrl: qloo.baseUrl });
+  const meteredFor = (surface: RunSurface): MeteredQloo =>
+    createMeteredQloo({ client, db, baseUrl: qloo.baseUrl, waitForSlot: (target) => waitForSurfaceQlooSlot(target, surface) });
+  const models: Record<RunSurface, ModelClient> = { web: modelFor("web"), mcp: modelFor("mcp") };
+  const qloos: Record<RunSurface, MeteredQloo> = { web: meteredFor("web"), mcp: meteredFor("mcp") };
   console.log(`The agent is on and uses ${config.model}.`);
-  return createAgentRunner({ db, model, qloo: metered, feeds: { searchShows, lookupShow, safeFetch, parseFeed } });
+  return createAgentRunner({
+    db,
+    qlooFor: (surface) => qloos[surface],
+    modelFor: (surface) => models[surface],
+    feeds: { searchShows, lookupShow, safeFetch, parseFeed },
+  });
 }
 
 async function main(): Promise<void> {
@@ -102,6 +133,8 @@ async function main(): Promise<void> {
     await failInterruptedRuns(db);
     await failStaleBriefClaims(db, STALE_BRIEF_CLAIM_MS);
     await resetInflight(db, 0);
+    await resetInflight(db, 0, "mcp");
+    await resetTokenInflight(db);
   } catch (error) {
     await db.close().catch(() => {});
     throw error;
@@ -110,12 +143,22 @@ async function main(): Promise<void> {
   const app = createApp({
     db,
     config,
-    verifyTurnstile: createTurnstileVerifier({ secret: config.turnstileSecret }),
+    // The same URL parser that produced appOrigin gives the hostname, so a
+    // human check counts only when it was solved on that site (C5.9).
+    verifyTurnstile: createTurnstileVerifier({
+      secret: config.turnstileSecret,
+      expectedHostname: new URL(config.appOrigin).hostname,
+    }),
     agent: createAgent(db, config, qloo),
     socketAddress: (c) => getConnInfo(c).remote.address ?? null,
   });
 
-  const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
+  // Set rather than inherited (D2.5): a client gets 20 seconds for its headers
+  // and 30 for the whole request, and the check runs every 5 seconds, so a
+  // slow sender is cut off within half a minute. These bound only reading
+  // the request, so a ten-minute event stream is unaffected.
+  const serverOptions = { headersTimeout: 20_000, requestTimeout: 30_000, keepAliveTimeout: 5_000, connectionsCheckingInterval: 5_000 };
+  const server = serve({ fetch: app.fetch, port: config.port, serverOptions }, (info) => {
     console.log(`Vasal agent server listening on http://localhost:${info.port}`);
   });
 

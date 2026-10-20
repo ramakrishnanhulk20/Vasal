@@ -2,12 +2,15 @@ import type { Db } from "../store/db.js";
 import { appendEvent, markBriefFailed, setRunStatus, type RunInput } from "./runs.js";
 
 /**
- * What the routes ask of the agent. The routes call each method without
- * awaiting it, after every check and cap has passed, and never pass anything
- * the client sent except the checked run input and server-issued ids. While
- * startRun is unsettled the run holds one site-wide in-progress slot. If
- * startRun or continueRun rejects, the route marks the run failed with
- * AGENT_ERROR unless the agent already finished it, so an agent that wants a
+ * What the routes ask of the agent. The routes call each method after every
+ * check and cap has passed, and never pass anything the client sent except
+ * the checked run input and server-issued ids. The website routes do not await
+ * it; the MCP door awaits startRun and polls the store for the others. While a
+ * website startRun is unsettled the run holds one site-wide in-progress slot;
+ * an MCP startRun holds only its key's in-flight slot, and an MCP continueRun
+ * holds the MCP and site slots together. If startRun or continueRun rejects,
+ * the route marks the run failed with AGENT_ERROR unless the agent already
+ * finished it, so an agent that wants a
  * more specific code must set it before rejecting. writeBrief must leave the
  * guest's brief claim done or failed, never pending, because the page waits
  * on it; a writeBrief rejection is only logged.
