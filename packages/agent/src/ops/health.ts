@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { mcpEnabled } from "../mcp/tokens.js";
 import type { Db } from "../store/db.js";
 import { liveRunsEnabled } from "../store/flags.js";
 
@@ -23,6 +24,10 @@ export type HealthReport = {
   databaseReachable: boolean;
   buckets: BucketHealth[] | null;
   liveRuns: boolean | null;
+  mcp: boolean | null;
+  // Live means not revoked and not past its expiry on the database clock,
+  // the same test a request must pass.
+  agentKeys: { live: number; revoked: number } | null;
   runsLast24h: Record<string, number> | null;
   inflight: number | null;
   cacheRows: number | null;
@@ -48,6 +53,7 @@ const instant = z
 const BucketRow = z.object({ key: z.string().min(1).max(200), cap: count, used: count, window_end: instant });
 const StatusRow = z.object({ status: z.string().regex(/^[a-z_]{1,40}$/), n: count });
 const CountRow = z.object({ n: count });
+const KeyCountRow = z.object({ live: count, revoked: count });
 
 const utc = (date: Date) => `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 const grouped = new Intl.NumberFormat("en-US");
@@ -96,6 +102,15 @@ async function readCount(db: Db, text: string, params: unknown[]): Promise<numbe
   return CountRow.parse(rows[0]).n;
 }
 
+async function readAgentKeys(db: Db): Promise<{ live: number; revoked: number }> {
+  const { rows } = await db.query(
+    `SELECT count(*) FILTER (WHERE NOT revoked AND expires_at > now())::int AS live,
+            count(*) FILTER (WHERE revoked)::int AS revoked
+     FROM mcp_tokens`,
+  );
+  return KeyCountRow.parse(rows[0]);
+}
+
 function bucketProblems(buckets: BucketHealth[]): string[] {
   if (buckets.length === 0) return ["No budget buckets are set, so every metered call is refused. Run the budgets command."];
   const problems: string[] = [];
@@ -114,17 +129,19 @@ function bucketProblems(buckets: BucketHealth[]): string[] {
 /**
  * Reads the state an operator checks each day: every budget bucket except the
  * short-lived per-second ones, with used, cap, percent used and window end;
- * the live_runs flag; runs created in the 24 hours before `now`, by status;
- * the in-progress run count; and the number of cached Qloo answers. Each row
- * read passes a schema first (C6.5).
+ * the live_runs flag; the mcp_enabled flag; how many agent keys are live and
+ * how many revoked (counts only, never an id or a hash); runs created in the
+ * 24 hours before `now`, by status; the in-progress run count; and the
+ * number of cached Qloo answers. Each row read passes a schema first (C6.5).
  *
  * `problems` lists, in plain sentences: the database being unreachable; any
  * part that could not be read; no buckets at all; a bucket whose window has
  * ended at or before `now` (it fails closed, C5.7); a bucket with cap 0; a
- * bucket at or over 80 percent of its cap; and live runs being off. Only
- * SELECTs run, so either role can call it. An invalid `now` falls back to
- * the clock. Never throws, and the report never holds a connection string, a
- * key or a driver message.
+ * bucket at or over 80 percent of its cap; and live runs being off. MCP
+ * being off is reported but is not a problem, because the operator may keep
+ * it off on purpose. Only SELECTs run, so either role can call it. An
+ * invalid `now` falls back to the clock. Never throws, and the report never
+ * holds a connection string, a key or a driver message.
  */
 export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
   const checkedAt = now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date();
@@ -133,6 +150,8 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
     databaseReachable: false,
     buckets: null,
     liveRuns: null,
+    mcp: null,
+    agentKeys: null,
     runsLast24h: null,
     inflight: null,
     cacheRows: null,
@@ -148,6 +167,8 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
 
   report.buckets = await readOrNull(() => readBuckets(db, checkedAt));
   report.liveRuns = await liveRunsEnabled(db);
+  report.mcp = await mcpEnabled(db);
+  report.agentKeys = await readOrNull(() => readAgentKeys(db));
   report.runsLast24h = await readOrNull(() => readRuns(db, checkedAt));
   report.inflight = await readOrNull(() => readCount(db, "SELECT n FROM inflight WHERE slot = $1", [INFLIGHT_SLOT]));
   report.cacheRows = await readOrNull(() => readCount(db, "SELECT count(*)::int AS n FROM qloo_cache", []));
@@ -155,6 +176,7 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
   if (report.buckets === null) report.problems.push("The budget buckets could not be read.");
   else report.problems.push(...bucketProblems(report.buckets));
   if (!report.liveRuns) report.problems.push("Live runs are off, so the site shows saved runs only.");
+  if (report.agentKeys === null) report.problems.push("The agent key table could not be read.");
   if (report.runsLast24h === null) report.problems.push("The runs table could not be read.");
   if (report.inflight === null) report.problems.push("The in-progress run counter could not be read, so no run can start.");
   if (report.cacheRows === null) report.problems.push("The Qloo cache could not be read.");
@@ -166,6 +188,9 @@ export function formatHealth(report: HealthReport): string[] {
   const lines = [`Health at ${utc(new Date(report.checkedAt))}`, `  Database: ${report.databaseReachable ? "reachable" : "not reachable"}`];
   if (report.databaseReachable) {
     lines.push(`  Live runs: ${report.liveRuns ? "on" : "off"}`);
+    lines.push(`  MCP: ${report.mcp ? "on" : "off, so no agent key is issued and every MCP request is refused"}`);
+    const keys = report.agentKeys;
+    lines.push(`  Agent keys: ${keys === null ? "unknown" : `${grouped.format(keys.live)} live, ${grouped.format(keys.revoked)} revoked`}`);
     const runs = report.runsLast24h;
     const runText =
       runs === null ? "unknown" : Object.keys(runs).length === 0 ? "none" : Object.entries(runs).map(([status, n]) => `${status} ${n}`).join(", ");

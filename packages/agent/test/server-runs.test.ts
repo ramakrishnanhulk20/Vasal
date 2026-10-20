@@ -1,13 +1,15 @@
 // Covers the run store on PGlite: ids, status rules, events, candidates, the
 // board, briefs, brief claims and their one retry, the restart sweeps for
-// runs and brief claims, and the home-page showcase, including the app
-// role's grants on showcase_runs
-// (roles.sql applied to PGlite). It does not cover races between separate
+// runs and brief claims, the home-page showcase, including the app role's
+// grants on showcase_runs (roles.sql applied to PGlite), and the surface a
+// run is charged to with the reads that act only for the key that made a
+// run. It does not cover races between separate
 // connections (PGlite has one), the other vasal_app grants, the shapes of
 // candidate and brief data (the routes and the agent own those), or the HTTP
 // routes that call these functions.
 import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { issueToken } from "../src/mcp/tokens.js";
 import { ServerError } from "../src/server/errors.js";
 import {
   appendEvent,
@@ -19,7 +21,9 @@ import {
   getBrief,
   getBriefClaim,
   getCandidate,
+  getCandidateForToken,
   getRun,
+  getRunForToken,
   listEventsAfter,
   listShowcase,
   markBriefDone,
@@ -30,6 +34,7 @@ import {
   setRunStatus,
   type RunEventName,
   type RunInput,
+  type RunOrigin,
   type RunStatus,
 } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
@@ -108,6 +113,8 @@ describe("createRun and getRun", () => {
       errorCode: null,
       createdAt: NOW,
       finishedAt: null,
+      surface: "web",
+      tokenId: null,
     });
   });
 
@@ -763,5 +770,87 @@ describe("listShowcase (C6.3, C6.5)", () => {
     expect(owner.rows).toEqual([{ runId: shown.runId, position: 1 }]);
     for (const [text, params] of writes) await db.query(text, params);
     expect(await rowCount("showcase_runs")).toBe(0);
+  });
+});
+
+describe("the surface a run is charged to, and reads for one key only (D3.2, D4.1)", () => {
+  const HOUR_MS = 60 * 60 * 1_000;
+
+  it("stores the origin with the run and reads it back, with website runs as the default", async () => {
+    const { id: tokenId } = await issueToken(db);
+    const plain = await createRun(db, INPUT, NOW);
+    const web = await createRun(db, INPUT, NOW, { surface: "web" });
+    const mcp = await createRun(db, INPUT, NOW, { surface: "mcp", tokenId });
+
+    expect(await getRun(db, plain)).toMatchObject({ surface: "web", tokenId: null });
+    expect(await getRun(db, web)).toMatchObject({ surface: "web", tokenId: null });
+    expect(await getRun(db, mcp)).toMatchObject({ surface: "mcp", tokenId });
+  });
+
+  it("refuses an origin that is not exactly one of the two shapes, and a key row that does not exist, writing nothing", async () => {
+    const { id: tokenId } = await issueToken(db);
+    for (const origin of [
+      { surface: "mcp" },
+      { surface: "mcp", tokenId: "x" },
+      { surface: "mcp", tokenId: tokenId.toUpperCase() },
+      { surface: "web", tokenId },
+      { surface: "site" },
+      null,
+      "mcp",
+    ]) {
+      expect(await codeOf(createRun(db, INPUT, NOW, origin as unknown as RunOrigin)), JSON.stringify(origin)).toBe("SRV_BAD_INPUT");
+    }
+    expect(await codeOf(createRun(db, INPUT, NOW, { surface: "mcp", tokenId: crypto.randomUUID() }))).toBe("SRV_UNAVAILABLE");
+    expect(await rowCount("runs")).toBe(0);
+
+    // The table holds the same rule, so no other writer can store a mixed row.
+    await expect(
+      db.query("INSERT INTO runs (id, status, input, created_at, surface) VALUES ($1::uuid, 'queued', '{}', now(), 'mcp')", [
+        crypto.randomUUID(),
+      ]),
+    ).rejects.toThrow(StoreError);
+  });
+
+  it("getRunForToken gives a run only to the key that made it, never a website run", async () => {
+    const mine = await issueToken(db);
+    const theirs = await issueToken(db);
+    const run = await createRun(db, INPUT, NOW, { surface: "mcp", tokenId: mine.id });
+    const webRun = await createRun(db, INPUT, NOW);
+
+    expect(await getRunForToken(db, run, mine.id)).toMatchObject({ id: run, surface: "mcp", tokenId: mine.id });
+    expect(await getRunForToken(db, run, theirs.id)).toBeNull();
+    expect(await getRunForToken(db, webRun, mine.id)).toBeNull();
+    expect(await getRunForToken(db, crypto.randomUUID(), mine.id)).toBeNull();
+
+    const { db: recording, calls } = recordingDb();
+    expect(await getRunForToken(recording, run.toUpperCase(), mine.id)).toBeNull();
+    expect(await getRunForToken(recording, run, `${mine.id}'--`)).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it("getCandidateForToken matches the exact id on the key's own run, and only within its life", async () => {
+    const mine = await issueToken(db);
+    const theirs = await issueToken(db);
+    const run = await createRun(db, INPUT, NOW, { surface: "mcp", tokenId: mine.id });
+    const [candidateId] = await putCandidates(db, run, [{ name: "synthetic" }]);
+    const webRun = await createRun(db, INPUT, NOW);
+    const [webCandidate] = await putCandidates(db, webRun, [{ name: "web" }]);
+    const fresh = new Date(NOW.getTime() + HOUR_MS - 1);
+
+    expect(await getCandidateForToken(db, candidateId!, mine.id, HOUR_MS, fresh)).toEqual({ runId: run, data: { name: "synthetic" } });
+    expect(await getCandidateForToken(db, candidateId!, theirs.id, HOUR_MS, fresh)).toBeNull();
+    expect(await getCandidateForToken(db, webCandidate!, mine.id, HOUR_MS, fresh)).toBeNull();
+    expect(await getCandidateForToken(db, crypto.randomUUID(), mine.id, HOUR_MS, fresh)).toBeNull();
+    expect(await getCandidateForToken(db, run, mine.id, HOUR_MS, fresh)).toBeNull();
+    expect(await getCandidateForToken(db, candidateId!, mine.id, HOUR_MS, new Date(NOW.getTime() + HOUR_MS))).toBeNull();
+    expect(await getCandidateForToken(db, candidateId!, mine.id, HOUR_MS, new Date(NOW.getTime() + 2 * HOUR_MS))).toBeNull();
+
+    const { db: recording, calls } = recordingDb();
+    expect(await getCandidateForToken(recording, candidateId!.toUpperCase(), mine.id, HOUR_MS, fresh)).toBeNull();
+    expect(calls).toEqual([]);
+    for (const maxAgeMs of [0, -1, 1.5, 86_400_001, Number.NaN]) {
+      expect(await codeOf(getCandidateForToken(db, candidateId!, mine.id, maxAgeMs, fresh))).toBe("SRV_BAD_INPUT");
+    }
+    expect(await codeOf(getCandidateForToken(db, candidateId!, mine.id, HOUR_MS, new Date(Number.NaN)))).toBe("SRV_BAD_INPUT");
   });
 });

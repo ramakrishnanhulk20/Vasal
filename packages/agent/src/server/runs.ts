@@ -8,6 +8,10 @@ export { RUN_EVENTS, type RunEventName } from "./sse.js";
 
 export type RunStatus = "queued" | "awaiting_confirm" | "running" | "done" | "failed";
 export type RunInput = { show: string; exclude: string[] };
+/** Which share a run spends from: the website's or MCP's (D3.2). */
+export type RunSurface = "web" | "mcp";
+/** Recorded on the run when it is created and read back by the runner, never inferred from a request (D3.2, D4.1). */
+export type RunOrigin = { surface: "web" } | { surface: "mcp"; tokenId: string };
 export type RunRecord = {
   id: string;
   status: RunStatus;
@@ -15,9 +19,18 @@ export type RunRecord = {
   errorCode: string | null;
   createdAt: Date;
   finishedAt: Date | null;
+  surface: RunSurface;
+  tokenId: string | null;
 };
 
 const RUN_STATUSES = ["queued", "awaiting_confirm", "running", "done", "failed"] as const satisfies readonly RunStatus[];
+const RUN_SURFACES = ["web", "mcp"] as const satisfies readonly RunSurface[];
+const WEB: RunOrigin = { surface: "web" };
+// A day is far past any candidate's life; the cap only stops a mistaken
+// caller from making every candidate valid forever.
+const MAX_CANDIDATE_AGE_MS = 24 * 60 * 60 * 1_000;
+const RUN_COLUMNS =
+  "id::text AS id, status, input::text AS input, error_code, created_at, finished_at, surface, token_id::text AS token_id";
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set<RunStatus>(["done", "failed"]);
 const TERMINAL_EVENTS: ReadonlySet<string> = new Set<RunEventName>(["done", "failed"]);
 
@@ -109,10 +122,34 @@ const runRow = z
     error_code: z.string().regex(ERROR_CODE).nullable(),
     created_at: instant,
     finished_at: instant.nullable(),
+    surface: z.enum(RUN_SURFACES),
+    token_id: z.string().refine(isId).nullable(),
   })
   // A row in a state the code never writes reads as missing.
   .refine((row) => TERMINAL_STATUSES.has(row.status) === (row.finished_at !== null))
-  .refine((row) => row.error_code === null || row.status === "failed");
+  .refine((row) => row.error_code === null || row.status === "failed")
+  .refine((row) => (row.surface === "mcp") === (row.token_id !== null));
+
+function recordOf(row: z.output<typeof runRow>): RunRecord {
+  return {
+    id: row.id,
+    status: row.status,
+    input: row.input,
+    errorCode: row.error_code,
+    createdAt: row.created_at,
+    finishedAt: row.finished_at,
+    surface: row.surface,
+    tokenId: row.token_id,
+  };
+}
+
+function checkOrigin(origin: unknown): { surface: RunSurface; tokenId: string | null } {
+  if (typeof origin !== "object" || origin === null) throw badInput();
+  const { surface, tokenId } = origin as { surface?: unknown; tokenId?: unknown };
+  if (surface === "web" && tokenId === undefined) return { surface, tokenId: null };
+  if (surface === "mcp" && isId(tokenId)) return { surface, tokenId };
+  throw badInput();
+}
 
 const eventRow = z.object({
   seq: z.number().int().min(1).max(MAX_EVENTS_PER_RUN),
@@ -163,50 +200,101 @@ async function readData(db: Db, text: string, params: string[], maxLength: numbe
  * random bits, never sequential, C6.1). `input` must be exactly
  * { show, exclude } with a show of 1 to 300 characters (String length, so
  * the caller normalises first) and at most 25 exclusions of 1 to 100
- * characters each. Throws ServerError("SRV_BAD_INPUT") for any other input
- * or an invalid date, and ServerError("SRV_UNAVAILABLE") if the database fails.
+ * characters each. `origin` is stored with the run and decides which share
+ * every later spend comes from (D3.2): { surface: "web" }, the default, or
+ * { surface: "mcp", tokenId } with the id of the key row that asked for it
+ * (D4.1), never the key. Throws ServerError("SRV_BAD_INPUT") for any other
+ * input, origin or an invalid date, and ServerError("SRV_UNAVAILABLE") if
+ * the database fails, including for a tokenId with no key row.
  */
-export async function createRun(db: Db, input: RunInput, now: Date = new Date()): Promise<string> {
+export async function createRun(db: Db, input: RunInput, now: Date = new Date(), origin: RunOrigin = WEB): Promise<string> {
   const parsed = runInputSchema.safeParse(input);
   if (!parsed.success) throw badInput();
   checkInstant(now);
+  const { surface, tokenId } = checkOrigin(origin);
   const id = randomUUID();
   await stored(() =>
     db.query(
-      `INSERT INTO runs (id, status, input, error_code, created_at, finished_at)
-       VALUES ($1::uuid, 'queued', $2::text::json, NULL, $3::timestamptz, NULL)`,
-      [id, JSON.stringify(parsed.data), now.toISOString()],
+      `INSERT INTO runs (id, status, input, error_code, created_at, finished_at, surface, token_id)
+       VALUES ($1::uuid, 'queued', $2::text::json, NULL, $3::timestamptz, NULL, $4, $5::uuid)`,
+      [id, JSON.stringify(parsed.data), now.toISOString(), surface, tokenId],
     ),
   );
   return id;
 }
 
 /**
- * Reads one run. Returns null, without querying, for anything that is not a
- * lower-case UUID, and null when the run is missing or its row fails the run
- * schema (C6.5). Throws ServerError("SRV_UNAVAILABLE") if the database fails,
- * so an outage is never mistaken for a missing run.
+ * Reads one run, with the surface and key row id it was created with.
+ * Returns null, without querying, for anything that is not a lower-case
+ * UUID, and null when the run is missing or its row fails the run schema
+ * (C6.5). Throws ServerError("SRV_UNAVAILABLE") if the database fails, so an
+ * outage is never mistaken for a missing run.
  */
 export async function getRun(db: Db, id: string): Promise<RunRecord | null> {
   if (!isId(id)) return null;
+  const { rows } = await stored(() => db.query(`SELECT ${RUN_COLUMNS} FROM runs WHERE id = $1::uuid`, [id]));
+  const parsed = runRow.safeParse(rows[0]);
+  return parsed.success ? recordOf(parsed.data) : null;
+}
+
+/**
+ * Reads a run only for the key that made it (D4.1): both ids must be
+ * lower-case UUIDs, the run must be an MCP run, and its stored key row id
+ * must equal `tokenId` exactly. A website run, another key's run, an unknown
+ * id or a row that fails the run schema all give null, the same answer, so a
+ * caller cannot tell "not yours" from "does not exist". Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getRunForToken(db: Db, runId: string, tokenId: string): Promise<RunRecord | null> {
+  if (!isId(runId) || !isId(tokenId)) return null;
   const { rows } = await stored(() =>
-    db.query(
-      `SELECT id::text AS id, status, input::text AS input, error_code, created_at, finished_at
-       FROM runs WHERE id = $1::uuid`,
-      [id],
-    ),
+    db.query(`SELECT ${RUN_COLUMNS} FROM runs WHERE id = $1::uuid AND surface = 'mcp' AND token_id = $2::uuid`, [
+      runId,
+      tokenId,
+    ]),
   );
   const parsed = runRow.safeParse(rows[0]);
-  if (!parsed.success) return null;
-  const row = parsed.data;
-  return {
-    id: row.id,
-    status: row.status,
-    input: row.input,
-    errorCode: row.error_code,
-    createdAt: row.created_at,
-    finishedAt: row.finished_at,
-  };
+  if (!parsed.success || parsed.data.surface !== "mcp" || parsed.data.token_id !== tokenId) return null;
+  return recordOf(parsed.data);
+}
+
+const tokenCandidateRow = z.object({ run_id: z.string().refine(isId), data: storedJson(MAX_ITEM_JSON) });
+
+/**
+ * Finds a candidate for the key whose run it belongs to (D4.1). Matched by
+ * the exact candidate id the server issued, on an MCP run whose key row id
+ * equals `tokenId`, and only while that run was created less than
+ * `maxAgeMs` before `now`. The run is made a moment before its candidates,
+ * so this ends a candidate's life slightly early, never late. Anything else
+ * (another key's candidate, a website run's, an expired one, an id never
+ * issued, a row that fails its schema, or an id that is not a lower-case
+ * UUID) gives null. Returns the run id with the stored candidate. Throws
+ * ServerError("SRV_BAD_INPUT") for a maxAgeMs outside 1 to 86,400,000 or an
+ * invalid date, and ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getCandidateForToken(
+  db: Db,
+  candidateId: string,
+  tokenId: string,
+  maxAgeMs: number,
+  now: Date = new Date(),
+): Promise<{ runId: string; data: unknown } | null> {
+  if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > MAX_CANDIDATE_AGE_MS) throw badInput();
+  checkInstant(now);
+  if (!isId(candidateId) || !isId(tokenId)) return null;
+  const { rows } = await stored(() =>
+    db.query(
+      `SELECT c.run_id::text AS run_id, c.data::text AS data
+       FROM run_candidates c JOIN runs r ON r.id = c.run_id
+       WHERE c.candidate_id = $1::uuid AND r.surface = 'mcp' AND r.token_id = $2::uuid AND r.created_at > $3::timestamptz
+       LIMIT 2`,
+      [candidateId, tokenId, new Date(now.getTime() - maxAgeMs).toISOString()],
+    ),
+  );
+  // Ids are random, so two rows would mean something wrote them on purpose.
+  if (rows.length !== 1) return null;
+  const parsed = tokenCandidateRow.safeParse(rows[0]);
+  return parsed.success ? { runId: parsed.data.run_id, data: parsed.data.data } : null;
 }
 
 /**
@@ -923,7 +1011,8 @@ const showcaseBoardRow = z.object({ id: z.string().refine(isId), data: storedBoa
 export async function listShowcase(db: Db): Promise<ShowcaseRun[]> {
   const promoted = await stored(() =>
     db.query(
-      `SELECT s.position, r.id::text AS id, r.status, r.input::text AS input, r.error_code, r.created_at, r.finished_at
+      `SELECT s.position, r.id::text AS id, r.status, r.input::text AS input, r.error_code, r.created_at, r.finished_at,
+              r.surface, r.token_id::text AS token_id
        FROM showcase_runs s JOIN runs r ON r.id = s.run_id
        ORDER BY s.position LIMIT $1`,
       [MAX_SHOWCASE_POSITION],

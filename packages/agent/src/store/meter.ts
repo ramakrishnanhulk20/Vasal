@@ -18,6 +18,11 @@ const QLOO_SECOND_PREFIX = "qloo:second:";
 // clock differences between the hosts that share a second (C5.2).
 const QLOO_PER_SECOND_CAP = 4;
 const SECOND_BUCKET_LIFETIME_MS = 2_000;
+// A surface's own month or day cap under the shared ones, such as
+// qloo:month:mcp. The third word is required, so the shared qloo:month and
+// qloo:day, and every per-second bucket, can never be named here.
+const QLOO_EXTRA_KEY = /^qloo:(month|day):[a-z]+$/;
+const MAX_EXTRA_KEYS = 2;
 
 // pg returns bigint columns as digit strings and PGlite as numbers, so both
 // shapes are accepted and checked the same way (C6.5).
@@ -173,7 +178,21 @@ function checkDayKey(dayKey: unknown): string {
   return key;
 }
 
-async function tryQlooCall(db: Db, now: Date, dayKey: string): Promise<Outcome> {
+// A repeated key, or one equal to the day key, would collapse into a single
+// entry in the reservation map and be charged once while the caller believes
+// it was charged twice, so both are refused.
+function checkExtraKeys(extraKeys: unknown, dayKey: string): string[] {
+  if (extraKeys === undefined) return [];
+  if (!Array.isArray(extraKeys) || extraKeys.length > MAX_EXTRA_KEYS) throw badInput();
+  const keys: string[] = [];
+  for (const key of extraKeys as unknown[]) {
+    if (typeof key !== "string" || !QLOO_EXTRA_KEY.test(key) || key === dayKey || keys.includes(key)) throw badInput();
+    keys.push(key);
+  }
+  return keys;
+}
+
+async function tryQlooCall(db: Db, now: Date, dayKey: string, extraKeys: readonly string[]): Promise<Outcome> {
   checkInstant(now);
   const second = secondKeyOf(now);
   return db.transaction(async (tx) => {
@@ -192,6 +211,7 @@ async function tryQlooCall(db: Db, now: Date, dayKey: string): Promise<Outcome> 
         [QLOO_MONTH, 1],
         [dayKey, 1],
         [second, 1],
+        ...extraKeys.map((key): [string, number] => [key, 1]),
       ]),
       now,
     );
@@ -203,41 +223,55 @@ async function tryQlooCall(db: Db, now: Date, dayKey: string): Promise<Outcome> 
  * the current epoch second, all or nothing. The day bucket is qloo:day unless
  * `opts.dayKey` names a share under it, such as "qloo:day:offline" for the
  * offline scripts: that share has its own daily cap but still counts against
- * the one month bucket and the one per-second limit (C5.1). The per-second
- * bucket is created on demand with cap 4 inside the same transaction, so
- * every process sharing the database shares one per-second limit (C5.1,
- * C5.2). Returns false if any of the three is full, missing or expired.
- * Throws StoreError("STORE_BAD_INPUT") for an invalid `now` or a dayKey that
- * is not "qloo:day" or "qloo:day:" followed by more, and
- * StoreError("STORE_UNAVAILABLE") if the database fails.
+ * the one month bucket and the one per-second limit (C5.1). `opts.extraKeys`
+ * adds at most 2 more buckets of the form qloo:month:<word> or
+ * qloo:day:<word>, reserved in the same all-or-nothing transaction; MCP
+ * passes ["qloo:month:mcp"] so its month stays under the shared ceiling
+ * (D3.3). The per-second bucket is created on demand with cap 4 inside the
+ * same transaction, so every process sharing the database shares one
+ * per-second limit (C5.1, C5.2). Returns false if any bucket is full,
+ * missing or expired, and then nothing is added anywhere. Throws
+ * StoreError("STORE_BAD_INPUT") for an invalid `now`, a dayKey that is not
+ * "qloo:day" or "qloo:day:" followed by more, or extraKeys that are not an
+ * array of at most 2 distinct matching keys, each different from the day
+ * key, and StoreError("STORE_UNAVAILABLE") if the database fails.
  */
 export async function reserveQlooCall(
   db: Db,
   now: Date = new Date(),
-  opts: { dayKey?: string } = {},
+  opts: { dayKey?: string; extraKeys?: string[] } = {},
 ): Promise<boolean> {
   const dayKey = checkDayKey(opts.dayKey);
-  return (await tryQlooCall(db, now, dayKey)).ok;
+  const extraKeys = checkExtraKeys(opts.extraKeys, dayKey);
+  return (await tryQlooCall(db, now, dayKey, extraKeys)).ok;
 }
 
 /**
  * Keeps trying reserveQlooCall while only the per-second bucket is full,
  * sleeping until the next second each time. Returns true once a call is
- * reserved. Returns false at once if the day or month bucket refuses, and
- * false when waiting longer would pass maxWaitMs (default 3000). `dayKey`
- * picks the day bucket exactly as in reserveQlooCall. Time is measured as the
- * larger of clock time and time slept, so the loop ends even if an injected
- * clock never moves. Throws StoreError("STORE_BAD_INPUT") for a maxWaitMs
- * outside 0 to 60000 or a bad dayKey, and StoreError("STORE_UNAVAILABLE") if
- * the database fails.
+ * reserved. Returns false at once if the day, month or an extra bucket
+ * refuses, and false when waiting longer would pass maxWaitMs (default
+ * 3000). `dayKey` and `extraKeys` pick the buckets exactly as in
+ * reserveQlooCall. Time is measured as the larger of clock time and time
+ * slept, so the loop ends even if an injected clock never moves. Throws
+ * StoreError("STORE_BAD_INPUT") for a maxWaitMs outside 0 to 60000, a bad
+ * dayKey or bad extraKeys, and StoreError("STORE_UNAVAILABLE") if the
+ * database fails.
  */
 export async function waitForQlooSlot(
   db: Db,
-  opts: { maxWaitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; dayKey?: string } = {},
+  opts: {
+    maxWaitMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => Date;
+    dayKey?: string;
+    extraKeys?: string[];
+  } = {},
 ): Promise<boolean> {
   const maxWaitMs = opts.maxWaitMs ?? 3_000;
   if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0 || maxWaitMs > MAX_WAIT_LIMIT_MS) throw badInput();
   const dayKey = checkDayKey(opts.dayKey);
+  const extraKeys = checkExtraKeys(opts.extraKeys, dayKey);
   const sleep = opts.sleep ?? ((ms: number) => delay(ms));
   const clock = opts.now ?? (() => new Date());
 
@@ -245,7 +279,7 @@ export async function waitForQlooSlot(
   let slept = 0;
   for (;;) {
     const now = checkInstant(clock());
-    const outcome = await tryQlooCall(db, now, dayKey);
+    const outcome = await tryQlooCall(db, now, dayKey, extraKeys);
     if (outcome.ok) return true;
     if (!outcome.refused.every((key) => key.startsWith(QLOO_SECOND_PREFIX))) return false;
 

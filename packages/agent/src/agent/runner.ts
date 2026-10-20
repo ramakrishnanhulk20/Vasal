@@ -21,8 +21,11 @@ import {
   putBrief,
   putCandidates,
   setRunStatus,
+  type RunSurface,
 } from "../server/runs.js";
 import type { Db } from "../store/db.js";
+import { reserve, waitForQlooSlot } from "../store/meter.js";
+import { cleanText } from "../text/normalize.js";
 import { buildBoard, type BoardEntry } from "./board.js";
 import { writeBrief as writeGuestBrief } from "./brief.js";
 import { createRunContext, type RunContext } from "./context.js";
@@ -43,6 +46,7 @@ const MIN_BOARD = 3;
 const UNEXPECTED = "UNEXPECTED";
 const MAX_FIT_IDS = 25;
 const MAX_EPISODE_TITLES = 40;
+const MAX_SHOW_NAME_CHARS = 200;
 const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
 const FILL_TOOLS: readonly ToolName[] = ["audience_of", "trend_of", "shared_taste"];
 
@@ -79,6 +83,47 @@ const BoardRow = z
 const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
 
+type SurfaceBudget = { qlooDayKey: string; qlooExtraKeys: readonly string[]; modelKey: string };
+
+/**
+ * The buckets each surface spends from (D3.1, D3.3). A website run charges
+ * qloo:day and anthropic:day. An MCP run charges qloo:day:mcp and its own
+ * month, qloo:month:mcp, on top of the shared qloo:month and per-second
+ * limit, and anthropic:day:mcp for model tokens, so it never touches the
+ * website's day shares. main.ts builds one Qloo client and one model per
+ * surface from this table.
+ */
+export const SURFACE_BUDGETS: Readonly<Record<RunSurface, SurfaceBudget>> = {
+  web: { qlooDayKey: "qloo:day", qlooExtraKeys: [], modelKey: "anthropic:day" },
+  mcp: { qlooDayKey: "qloo:day:mcp", qlooExtraKeys: ["qloo:month:mcp"], modelKey: "anthropic:day:mcp" },
+};
+
+function budgetOf(surface: unknown): SurfaceBudget {
+  if (surface !== "web" && surface !== "mcp") throw new ServerError("SRV_BAD_INPUT");
+  return SURFACE_BUDGETS[surface];
+}
+
+/**
+ * The Qloo meter for one surface: waitForQlooSlot with that surface's day
+ * bucket and extra buckets from SURFACE_BUDGETS. Passed to createMeteredQloo
+ * as its waitForSlot. Throws ServerError("SRV_BAD_INPUT") for any surface
+ * other than "web" or "mcp", and whatever waitForQlooSlot throws.
+ */
+export async function waitForSurfaceQlooSlot(db: Db, surface: RunSurface): Promise<boolean> {
+  const budget = budgetOf(surface);
+  return waitForQlooSlot(db, { dayKey: budget.qlooDayKey, extraKeys: [...budget.qlooExtraKeys] });
+}
+
+/**
+ * The model-token meter for one surface: reserves `amount` from that
+ * surface's model bucket in SURFACE_BUDGETS. Passed to createAnthropicModel
+ * as its reserveTokens. Throws ServerError("SRV_BAD_INPUT") for any surface
+ * other than "web" or "mcp", and whatever reserve throws.
+ */
+export async function reserveSurfaceTokens(db: Db, surface: RunSurface, amount: number): Promise<boolean> {
+  return reserve(db, [{ key: budgetOf(surface).modelKey, amount }]);
+}
+
 function knownCode(error: unknown): string | null {
   return error instanceof AgentError || error instanceof QlooError || error instanceof FeedError ? error.code : null;
 }
@@ -107,6 +152,12 @@ function knownCode(error: unknown): string | null {
  * logs any removed links in a step, stores the brief, marks the guest's
  * brief claim done (markBriefDone), and appends a "brief" event.
  *
+ * Every spend goes through the Qloo client and model for the surface read
+ * back from the run's own row (qlooFor and modelFor), never from anything a
+ * request carried, so an MCP run charges only MCP's buckets and a website
+ * run only the website's (D3.2). A run whose row cannot be read is never
+ * started or continued.
+ *
  * Any AgentError, QlooError or FeedError in startRun or continueRun ends the
  * run as failed through finishRun with only the error's code (C6.4, C3.6),
  * and the call resolves. In writeBrief it marks the claim failed with only
@@ -119,9 +170,21 @@ function knownCode(error: unknown): string | null {
  * either, the claim stays pending until the startup sweep
  * (failStaleBriefClaims) finds it.
  */
-export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: MeteredQloo; feeds: AgentFeeds; now?: () => Date }): AgentPort {
-  const { db, model, qloo, feeds } = deps;
+export function createAgentRunner(deps: {
+  db: Db;
+  qlooFor: (surface: RunSurface) => MeteredQloo;
+  modelFor: (surface: RunSurface) => ModelClient;
+  feeds: AgentFeeds;
+  now?: () => Date;
+}): AgentPort {
+  const { db, qlooFor, modelFor, feeds } = deps;
   const clock = deps.now ?? (() => new Date());
+
+  const storedRun = async (runId: string) => {
+    const run = await getRun(db, runId);
+    if (run === null) throw new ServerError("SRV_NOT_FOUND");
+    return run;
+  };
 
   const step = async (runId: string, event: StepEvent): Promise<void> => {
     await appendEvent(db, runId, "step", event, clock());
@@ -169,7 +232,7 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
   // One request for every pick, so all fits share one signal and one scale.
   // The answer replaces any affinity seen during research; a pick it leaves
   // out has no fit (fit 0, fitKnown false), never a guessed one.
-  const scoreFit = async (ctx: RunContext, picks: ReadonlyArray<{ personId: string }>): Promise<void> => {
+  const scoreFit = async (qloo: MeteredQloo, ctx: RunContext, picks: ReadonlyArray<{ personId: string }>): Promise<void> => {
     const ids = [...new Set(picks.map((pick) => pick.personId))].filter((id) => ctx.people.has(id)).slice(0, MAX_FIT_IDS);
     if (ids.length === 0) return;
     const { data } = await qloo.call<QlooEntity[]>({
@@ -195,7 +258,13 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
     }
   };
 
-  const fillMissing = async (runId: string, ctx: RunContext, personIds: readonly string[], overTime: () => boolean): Promise<void> => {
+  const fillMissing = async (
+    qloo: MeteredQloo,
+    runId: string,
+    ctx: RunContext,
+    personIds: readonly string[],
+    overTime: () => boolean,
+  ): Promise<void> => {
     const today = clock();
     for (const personId of personIds) {
       for (const tool of FILL_TOOLS) {
@@ -212,6 +281,7 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
 
   return {
     async startRun(runId, input) {
+      const qloo = qlooFor((await storedRun(runId)).surface);
       await setRunStatus(db, runId, "running", undefined, clock());
       await failOnKnownError(runId, async () => {
         const shows = await resolveShow(input, {
@@ -236,8 +306,9 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
 
     async continueRun(runId, candidateId) {
       await failOnKnownError(runId, async () => {
-        const run = await getRun(db, runId);
-        if (run === null) throw new ServerError("SRV_NOT_FOUND");
+        const run = await storedRun(runId);
+        const qloo = qlooFor(run.surface);
+        const model = modelFor(run.surface);
         const candidate = CandidateRow.safeParse(await getCandidate(db, runId, candidateId));
         if (!candidate.success) throw new AgentError("SHOW_NOT_FOUND");
         const show = candidate.data;
@@ -266,16 +337,20 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
         const kept = buildBoard(ctx, picks).map((entry) => entry.personId);
         if (kept.length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
         if (overTime()) throw new AgentError("AGENT_LIMIT");
-        await scoreFit(ctx, picks);
+        await scoreFit(qloo, ctx, picks);
         await step(runId, { tool: "fit", ok: true, label: `Scored ${plural(kept.length, "guest", "guests")} against this show's listeners` });
-        await fillMissing(runId, ctx, kept, overTime);
+        await fillMissing(qloo, runId, ctx, kept, overTime);
 
+        // buildBoard has cleaned every guest name, tag and angle. The show
+        // name rides on every stored row too, and it was read back from the
+        // database, so it is cleaned here at the store point (C3.7).
         const board = buildBoard(ctx, picks);
         if (board.length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
+        const showName = cleanText(ctx.show.name, { maxChars: MAX_SHOW_NAME_CHARS }).trim();
         const guestIds = await putBoard(
           db,
           runId,
-          board.map((entry) => ({ ...entry, showName: ctx.show.name })),
+          board.map((entry) => ({ ...entry, showName })),
         );
         const guests = board.map((entry, index) => ({
           id: guestIds[index],
@@ -293,10 +368,12 @@ export function createAgentRunner(deps: { db: Db; model: ModelClient; qloo: Mete
 
     async writeBrief(runId, guestId) {
       try {
+        const run = await getRun(db, runId);
+        if (run === null) throw new AgentError("AGENT_NO_BOARD");
         const row = BoardRow.safeParse(await getBoardGuest(db, runId, guestId));
         if (!row.success) throw new AgentError("AGENT_NO_BOARD");
         const { showName, ...guest } = row.data;
-        const { brief, removed } = await writeGuestBrief(model, { guest: guest satisfies BoardEntry, showName });
+        const { brief, removed } = await writeGuestBrief(modelFor(run.surface), { guest: guest satisfies BoardEntry, showName });
         if (removed.links + removed.emails > 0) {
           await step(runId, {
             tool: "brief",

@@ -43,6 +43,10 @@ describe("the shipped policy", () => {
           "anthropic:day": ["day", 2_000_000],
           "anthropic:day:offline": ["day", 1_500_000],
           "youtube:day": ["day", 9_000],
+          "qloo:day:mcp": ["day", 150],
+          "qloo:month:mcp": ["month", 1_500],
+          "anthropic:day:mcp": ["day", 500_000],
+          "mcp:keys:day": ["day", 50],
         },
       },
       {
@@ -54,10 +58,26 @@ describe("the shipped policy", () => {
           "anthropic:day": ["day", 3_000_000],
           "anthropic:day:offline": ["day", 500_000],
           "youtube:day": ["day", 9_000],
+          "qloo:day:mcp": ["day", 200],
+          "qloo:month:mcp": ["month", 2_500],
+          "anthropic:day:mcp": ["day", 1_000_000],
+          "mcp:keys:day": ["day", 100],
         },
       },
     ]);
     expect(policy.notes?.join(" ")).toContain("judging");
+    expect(policy.notes?.join(" ")).toContain("qloo:month:mcp");
+  });
+
+  it("keeps MCP's own month well under the shared ceiling and its day share under the website's, in every profile (D3.3)", async () => {
+    const policy = await loadPolicy(SHIPPED);
+    for (const p of policy.profiles) {
+      const cap = (key: string) => p.buckets.find((b) => b.key === key)?.cap ?? Number.NaN;
+      expect(cap("qloo:month:mcp"), p.from).toBeLessThanOrEqual(cap("qloo:month") / 2);
+      expect(cap("qloo:day:mcp"), p.from).toBeLessThan(cap("qloo:day"));
+      expect(cap("anthropic:day:mcp"), p.from).toBeLessThan(cap("anthropic:day"));
+      expect(cap("mcp:keys:day"), p.from).toBeGreaterThan(0);
+    }
   });
 });
 

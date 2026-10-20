@@ -10,8 +10,9 @@
 -- the vasal_app connection string, never the owner's.
 --
 -- What the app role cannot do, by design (C6.6): change the schema, write the
--- kill switch or the showcase, or delete rows. Pruning expired rows, setting
--- caps or flags and promoting runs are operator jobs run as the owner. Postgres 15 and later give PUBLIC no
+-- kill switch or the showcase, change an agent key, or delete rows. Pruning
+-- expired rows, setting caps or flags, revoking agent keys and promoting runs
+-- are operator jobs run as the owner. Postgres 15 and later give PUBLIC no
 -- CREATE on schema public, so this role cannot add tables either; on an older
 -- server, revoke that first.
 
@@ -50,3 +51,15 @@ GRANT UPDATE (status, attempts, error_code) ON run_brief_claims TO vasal_app;
 -- The home page reads the showcase. Only the operator's promote command, run
 -- as the owner, can put a run on it or take one off (C6.3).
 GRANT SELECT ON showcase_runs TO vasal_app;
+
+-- Agent keys. The app may issue a key and read keys, and nothing more: with no
+-- UPDATE or DELETE it cannot revoke, un-revoke or extend one. Revoking is an
+-- owner job through the ops script (D1.6).
+GRANT SELECT, INSERT ON mcp_tokens TO vasal_app;
+
+-- Per-key and per-visitor counters. The app adds rows and moves only the
+-- counts, never the key, the visitor or the day a row belongs to.
+GRANT SELECT, INSERT ON mcp_token_daily, mcp_token_inflight, mcp_key_issue TO vasal_app;
+GRANT UPDATE (runs, finds, briefs) ON mcp_token_daily TO vasal_app;
+GRANT UPDATE (n) ON mcp_token_inflight TO vasal_app;
+GRANT UPDATE (n) ON mcp_key_issue TO vasal_app;

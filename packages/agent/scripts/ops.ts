@@ -1,13 +1,23 @@
 // The operator's jobs, one command each. Every command prints a short plain
 // report and exits 1 when it finds a problem, so it can run from a scheduler.
 // They connect as the database owner (OWNER_DATABASE_URL), because the app
-// role cannot set caps, flip the kill switch, promote runs or delete rows
-// (C6.3, C6.6).
+// role cannot set caps, flip the kill switch or the MCP switch, revoke agent
+// keys, promote runs or delete rows (C6.3, C6.6, D1.6).
 //
 // Usage: npx tsx scripts/ops.ts [--dev] <command>, see USAGE below.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  authenticateToken,
+  issueToken,
+  listTokens,
+  MCP_ENABLED_FLAG,
+  mcpEnabled,
+  revokeAllTokens,
+  revokeToken,
+  TOKEN_LIST_LIMIT,
+} from "../src/mcp/tokens.js";
 import { OpsConfigError, openDevDb, openOwnerDb } from "../src/ops/db.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
 import { loadPolicy, PolicyError } from "../src/ops/policy.js";
@@ -38,15 +48,21 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev] <command>
   migrate                 apply src/store/schema.sql
   roles                   print roles.sql and the psql steps that create the app role
   budgets                 set today's caps from scripts/budget-policy.json (run daily)
-  prune                   delete expired cache rows, per-second buckets and old visitor counters
+  prune                   delete expired cache rows, per-second buckets, old visitor and MCP
+                          counters, and agent keys expired over a week that no run points to
   flag live-runs on|off   switch live runs on the site on or off
+  flag mcp on|off         switch the MCP door on or off: key issue and every MCP request
   health                  print the health report
+  mcp list                list agent keys: id, created, expires, revoked (never the key or its hash)
+  mcp revoke <tokenId>    revoke one agent key at once
+  mcp revoke-all          revoke every agent key at once
   promote <runId> <position> [--yes]
                           print a run's board; with --yes, put it on the home page at position 1 to 12
   unpromote <runId>       take a run off the home page
   showcase                list the runs on the home page
   selftest                with --dev only: budgets, health, flag live-runs off, health, then
-                          promote, list and unpromote a synthetic finished run
+                          promote, list and unpromote a synthetic finished run, then flag mcp
+                          on, mcp list, mcp revoke and mcp revoke-all on synthetic keys
 
 --dev uses a throwaway in-memory database with the schema applied and live
 runs on. Without it every command except roles needs OWNER_DATABASE_URL.
@@ -58,9 +74,19 @@ type PlainCommand = "migrate" | "roles" | "budgets" | "prune" | "health" | "show
 // One member per name, so a check on the name narrows the whole command.
 type Command =
   | { [Name in PlainCommand]: { name: Name } }[PlainCommand]
-  | { name: "flag"; liveRuns: boolean }
+  | { name: "flag"; flag: Switch; on: boolean }
+  | { name: "mcp"; action: "list" | "revoke-all" }
+  | { name: "mcp"; action: "revoke"; tokenId: string }
   | { name: "promote"; runId: string; position: number; yes: boolean }
   | { name: "unpromote"; runId: string };
+
+type Switch = "live-runs" | "mcp";
+// Each switch the operator can flip, the app_flags row behind it, and how
+// the read back is named in the report.
+const SWITCHES: Record<Switch, { flag: string; label: string; read: (db: Db) => Promise<boolean> }> = {
+  "live-runs": { flag: "live_runs", label: "Live runs", read: liveRunsEnabled },
+  mcp: { flag: MCP_ENABLED_FLAG, label: "MCP", read: mcpEnabled },
+};
 
 // Digits only, so " 3", "3.0" and "0x3" are refused rather than read as 3.
 const positionFrom = (text: string): number => (/^\d{1,2}$/.test(text) ? Number(text) : Number.NaN);
@@ -95,8 +121,15 @@ function readArgs(argv: string[]): { dev: boolean; command: Command } | undefine
     return { dev, command: { name, runId } };
   }
   if (name === "flag") {
-    if (rest.length !== 2 || rest[0] !== "live-runs" || (rest[1] !== "on" && rest[1] !== "off")) return undefined;
-    return { dev, command: { name, liveRuns: rest[1] === "on" } };
+    const [flag, state] = rest;
+    if (rest.length !== 2 || (flag !== "live-runs" && flag !== "mcp") || (state !== "on" && state !== "off")) return undefined;
+    return { dev, command: { name, flag, on: state === "on" } };
+  }
+  if (name === "mcp") {
+    const [action, tokenId] = rest;
+    if ((action === "list" || action === "revoke-all") && rest.length === 1) return { dev, command: { name, action } };
+    if (action === "revoke" && rest.length === 2 && tokenId !== undefined) return { dev, command: { name, action, tokenId } };
+    return undefined;
   }
   if (rest.length !== 0) return undefined;
   if (
@@ -156,16 +189,56 @@ async function runPrune(db: Db): Promise<boolean> {
   console.log(
     `Pruned ${grouped.format(counts.cacheRows)} expired cache rows, ${grouped.format(counts.secondBuckets)} per-second buckets and ${grouped.format(counts.visitorCounters)} old visitor counters.`,
   );
+  console.log(
+    `Pruned ${grouped.format(counts.mcpTokens)} agent keys expired over a week, ${grouped.format(counts.mcpTokenDaily)} old agent key counters and ${grouped.format(counts.mcpKeyIssue)} old key-issue counters.`,
+  );
   return true;
 }
 
-async function runFlag(db: Db, liveRuns: boolean): Promise<boolean> {
-  await setFlag(db, "live_runs", liveRuns);
-  const readBack = await liveRunsEnabled(db);
-  console.log(`Live runs are now ${readBack ? "on" : "off"}.`);
-  if (readBack === liveRuns) return true;
-  printProblems([`The flag was set ${liveRuns ? "on" : "off"} but reads back ${readBack ? "on" : "off"}.`]);
+async function runFlag(db: Db, which: Switch, on: boolean): Promise<boolean> {
+  const { flag, label, read } = SWITCHES[which];
+  await setFlag(db, flag, on);
+  const readBack = await read(db);
+  console.log(`${label} ${which === "mcp" ? "is" : "are"} now ${readBack ? "on" : "off"}.`);
+  if (readBack === on) return true;
+  printProblems([`The flag was set ${on ? "on" : "off"} but reads back ${readBack ? "on" : "off"}.`]);
   return false;
+}
+
+// Lists ids and times only. A key's hash is never printed, and the key itself
+// is never stored anywhere this could read it from (D1.1, D1.4).
+async function runMcpList(db: Db): Promise<boolean> {
+  const { total, tokens } = await listTokens(db);
+  const shown = total > TOKEN_LIST_LIMIT ? `, showing the newest ${grouped.format(TOKEN_LIST_LIMIT)}` : "";
+  console.log(`${grouped.format(total)} agent ${total === 1 ? "key" : "keys"}${shown}${total === 0 ? "." : ":"}`);
+  for (const token of tokens) {
+    console.log(`  ${token.id}  created ${utc(token.createdAt)}  expires ${utc(token.expiresAt)}  ${token.revoked ? "revoked" : "active"}`);
+  }
+  const unreadable = Math.min(total, TOKEN_LIST_LIMIT) - tokens.length;
+  if (unreadable <= 0) return true;
+  printProblems([`${grouped.format(unreadable)} key rows could not be read and were left out.`]);
+  return false;
+}
+
+const TOKEN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+async function runMcpRevoke(db: Db, tokenId: string): Promise<boolean> {
+  if (!TOKEN_ID.test(tokenId)) {
+    console.log("That is not a key id. Copy the id from mcp list: lower-case letters, digits and dashes.");
+    return false;
+  }
+  if (!(await revokeToken(db, tokenId))) {
+    printProblems([`No agent key has the id ${tokenId}.`]);
+    return false;
+  }
+  console.log(`Agent key ${tokenId} is revoked. Its next request is refused.`);
+  return true;
+}
+
+async function runMcpRevokeAll(db: Db): Promise<boolean> {
+  const changed = await revokeAllTokens(db);
+  console.log(`Revoked ${grouped.format(changed)} agent ${changed === 1 ? "key" : "keys"}. Every key is now refused.`);
+  return true;
 }
 
 async function runHealth(db: Db): Promise<{ ok: boolean; problems: string[] }> {
@@ -271,6 +344,61 @@ async function selftestShowcase(db: Db): Promise<string[]> {
   return failures;
 }
 
+// Prints as usual and also hands back what was printed, so the self-test can
+// check the operator's view itself, not only the data behind it.
+async function printed<T>(work: () => Promise<T>): Promise<{ result: T; text: string }> {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+    original(...args);
+  };
+  try {
+    return { result: await work(), text: lines.join("\n") };
+  } finally {
+    console.log = original;
+  }
+}
+
+// Two synthetic keys issued inside this process. Neither key is ever printed;
+// they exist only so the commands have something to list and revoke.
+async function selftestMcp(db: Db): Promise<string[]> {
+  const failures: string[] = [];
+  console.log("$ ops --dev flag mcp on");
+  if (!(await runFlag(db, "mcp", true))) failures.push("MCP did not switch on");
+  const kept = await issueToken(db);
+  const leaked = await issueToken(db);
+
+  console.log("");
+  console.log("$ ops --dev mcp list");
+  const list = await printed(() => runMcpList(db));
+  if (!list.result || !list.text.includes(kept.id) || !list.text.includes(leaked.id)) failures.push("mcp list did not show both keys");
+  if (/vsl_|[0-9a-f]{64}/.test(list.text)) failures.push("mcp list printed a key or a hash");
+
+  console.log("");
+  console.log(`$ ops --dev mcp revoke ${leaked.id}`);
+  if (!(await runMcpRevoke(db, leaked.id))) failures.push("mcp revoke reported a problem");
+  if ((await authenticateToken(db, leaked.token)) !== null) failures.push("the revoked key still worked");
+  if ((await authenticateToken(db, kept.token))?.id !== kept.id) failures.push("revoking one key stopped the other");
+
+  console.log("");
+  console.log("$ ops --dev mcp revoke-all");
+  if (!(await runMcpRevokeAll(db))) failures.push("mcp revoke-all reported a problem");
+  if ((await authenticateToken(db, kept.token)) !== null) failures.push("a key still worked after revoke-all");
+
+  console.log("");
+  console.log("$ ops --dev health");
+  const health = await printed(() => runHealth(db));
+  if (!health.text.includes("  MCP: on") || !health.text.includes("  Agent keys: 0 live, 2 revoked")) {
+    failures.push("health did not show MCP on with 2 revoked keys");
+  }
+
+  console.log("");
+  console.log("$ ops --dev flag mcp off");
+  if (!(await runFlag(db, "mcp", false))) failures.push("MCP did not switch off");
+  return failures;
+}
+
 async function runSelftest(db: Db): Promise<boolean> {
   const failures: string[] = [];
   console.log("$ ops --dev budgets");
@@ -281,7 +409,7 @@ async function runSelftest(db: Db): Promise<boolean> {
   if (!first.ok) failures.push("the first health check was not clean");
   console.log("");
   console.log("$ ops --dev flag live-runs off");
-  if (!(await runFlag(db, false))) failures.push("live runs did not switch off");
+  if (!(await runFlag(db, "live-runs", false))) failures.push("live runs did not switch off");
   console.log("");
   console.log("$ ops --dev health");
   const second = await runHealth(db);
@@ -290,9 +418,11 @@ async function runSelftest(db: Db): Promise<boolean> {
   console.log("");
   failures.push(...(await selftestShowcase(db)));
   console.log("");
+  failures.push(...(await selftestMcp(db)));
+  console.log("");
   if (failures.length === 0) {
     console.log(
-      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, and a synthetic finished run went on the home page and came off again.",
+      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, a synthetic finished run went on the home page and came off again, and MCP switched on, listed two synthetic keys with no hash, revoked one, then all, and switched off.",
     );
     return true;
   }
@@ -346,7 +476,11 @@ async function main(): Promise<number> {
       case "prune":
         return (await runPrune(db)) ? 0 : 1;
       case "flag":
-        return (await runFlag(db, command.liveRuns)) ? 0 : 1;
+        return (await runFlag(db, command.flag, command.on)) ? 0 : 1;
+      case "mcp":
+        if (command.action === "list") return (await runMcpList(db)) ? 0 : 1;
+        if (command.action === "revoke") return (await runMcpRevoke(db, command.tokenId)) ? 0 : 1;
+        return (await runMcpRevokeAll(db)) ? 0 : 1;
       case "health":
         return (await runHealth(db)).ok ? 0 : 1;
       case "promote":

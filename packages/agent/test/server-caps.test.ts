@@ -1,10 +1,18 @@
-// Covers the per-visitor daily cap and the site-wide in-progress slots on
-// PGlite. It does not cover races between separate connections (PGlite has
-// one connection, so simultaneous calls are serialised; the cross-connection
-// race is proven later on hosted Postgres), the vasal_app grants, or pruning
+// Covers the per-visitor daily cap, the site-wide in-progress slots and MCP's
+// share of them on PGlite. It does not cover races between separate
+// connections (PGlite has one connection, so simultaneous calls are
+// serialised; the cross-connection race is proven later on hosted Postgres),
+// the vasal_app grants (mcp-usage.test.ts covers the MCP ones), or pruning
 // old counter rows, which is an operator job.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { acquireInflightSlot, countVisitorRun, releaseInflightSlot, resetInflight } from "../src/server/caps.js";
+import {
+  acquireInflightSlot,
+  acquireMcpRunSlots,
+  countVisitorRun,
+  releaseInflightSlot,
+  releaseMcpRunSlots,
+  resetInflight,
+} from "../src/server/caps.js";
 import { ServerError } from "../src/server/errors.js";
 import { visitorKey } from "../src/net/visitor-key.js";
 import type { Db } from "../src/store/db.js";
@@ -40,8 +48,8 @@ async function codeOf(promise: Promise<unknown>): Promise<string | undefined> {
   return undefined;
 }
 
-async function inflight(): Promise<number> {
-  const { rows } = await db.query<{ n: number }>("SELECT n FROM inflight WHERE slot = 'runs'");
+async function inflight(slot = "runs"): Promise<number> {
+  const { rows } = await db.query<{ n: number }>("SELECT n FROM inflight WHERE slot = $1", [slot]);
   return rows[0]!.n;
 }
 
@@ -143,5 +151,71 @@ describe("in-progress slots (C5.8)", () => {
     await db.query("DELETE FROM inflight");
     expect(await acquireInflightSlot(db, 3)).toBe(false);
     expect(await codeOf(resetInflight(db, 0))).toBe("SRV_UNAVAILABLE");
+  });
+});
+
+describe("MCP's share of the in-progress slots (D3.3)", () => {
+  it("fails for MCP while its slot is held, and a website start still gets a place", async () => {
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(false);
+    expect(await acquireInflightSlot(db, 3)).toBe(true);
+    expect(await acquireInflightSlot(db, 3)).toBe(true);
+
+    expect(await inflight("mcp")).toBe(1);
+    expect(await inflight()).toBe(3);
+  });
+
+  it("takes both places or neither when the site is full", async () => {
+    for (let i = 0; i < 3; i += 1) expect(await acquireInflightSlot(db, 3)).toBe(true);
+
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(false);
+
+    expect(await inflight("mcp")).toBe(0);
+    expect(await inflight()).toBe(3);
+  });
+
+  it("gives exactly 1 of 10 simultaneous MCP starts against a share of 1, and the release frees both places", async () => {
+    const results = await Promise.all(Array.from({ length: 10 }, () => acquireMcpRunSlots(db, 1, 3)));
+
+    expect(results.filter((acquired) => acquired)).toHaveLength(1);
+    expect([await inflight("mcp"), await inflight()]).toEqual([1, 1]);
+
+    await releaseMcpRunSlots(db);
+    expect([await inflight("mcp"), await inflight()]).toEqual([0, 0]);
+    await releaseMcpRunSlots(db);
+    expect([await inflight("mcp"), await inflight()]).toEqual([0, 0]);
+    expect(await acquireMcpRunSlots(db, undefined, 3)).toBe(true);
+  });
+
+  it("refuses an MCP share that is not below the site's, a bad slot name, and fails closed with the MCP row missing", async () => {
+    for (const [mcpMax, siteMax] of [
+      [3, 3],
+      [4, 3],
+      [0, 3],
+      [1, 0],
+      [1, 21],
+      [1.5, 3],
+    ] as const) {
+      expect(await codeOf(acquireMcpRunSlots(db, mcpMax, siteMax)), `${mcpMax} of ${siteMax}`).toBe("SRV_BAD_INPUT");
+    }
+    for (const slot of ["Runs", "", "mcp ", "showcase"]) {
+      expect(await codeOf(acquireInflightSlot(db, 3, slot as "runs"))).toBe("SRV_BAD_INPUT");
+      expect(await codeOf(releaseInflightSlot(db, slot as "runs"))).toBe("SRV_BAD_INPUT");
+      expect(await codeOf(resetInflight(db, 0, slot as "runs"))).toBe("SRV_BAD_INPUT");
+    }
+
+    await db.query("DELETE FROM inflight WHERE slot = 'mcp'");
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(false);
+    expect(await inflight()).toBe(0);
+    expect(await codeOf(resetInflight(db, 0, "mcp"))).toBe("SRV_UNAVAILABLE");
+  });
+
+  it("resets the MCP slot at startup on its own", async () => {
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+
+    await resetInflight(db, 0, "mcp");
+
+    expect([await inflight("mcp"), await inflight()]).toEqual([0, 1]);
   });
 });

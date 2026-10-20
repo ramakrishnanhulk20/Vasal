@@ -3,6 +3,7 @@
 // cover a hosted Postgres that answers slowly, or the app role's read grants.
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { issueToken, MCP_ENABLED_FLAG, revokeToken } from "../src/mcp/tokens.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
 import { cachePut } from "../src/store/cache.js";
 import { createPgDb, type Db } from "../src/store/db.js";
@@ -60,6 +61,8 @@ describe("healthReport", () => {
         { key: "qloo:month", used: 1, cap: 9_000, percentUsed: 0, windowEnd: FAR_FUTURE.toISOString(), windowEnded: false },
       ],
       liveRuns: true,
+      mcp: false,
+      agentKeys: { live: 0, revoked: 0 },
       runsLast24h: { done: 2, failed: 1 },
       inflight: 0,
       cacheRows: 1,
@@ -116,6 +119,52 @@ describe("healthReport", () => {
     const report = await healthReport(db, new Date(NOW.getTime() + 10_000));
     expect(report.buckets?.map((bucket) => bucket.key)).toEqual(["qloo:day", "qloo:month"]);
     expect(report.problems).toEqual([]);
+  });
+
+  it("reports the MCP flag and how many agent keys are live and revoked, with no id or hash (D1.6)", async () => {
+    await healthySite();
+    const live = await issueToken(db);
+    const revoked = await issueToken(db);
+    const expired = await issueToken(db);
+    await revokeToken(db, revoked.id);
+    await db.query(
+      "UPDATE mcp_tokens SET created_at = now() - interval '31 days', expires_at = now() - interval '1 day' WHERE id = $1::uuid",
+      [expired.id],
+    );
+
+    const off = await healthReport(db, NOW);
+    expect(off.mcp).toBe(false);
+    expect(off.agentKeys).toEqual({ live: 1, revoked: 1 });
+    expect(off.problems).toEqual([]);
+    expect(formatHealth(off)).toContain("  MCP: off, so no agent key is issued and every MCP request is refused");
+
+    await setFlag(db, MCP_ENABLED_FLAG, true);
+    const on = await healthReport(db, NOW);
+    expect(on.mcp).toBe(true);
+    const lines = formatHealth(on);
+    expect(lines).toContain("  MCP: on");
+    expect(lines).toContain("  Agent keys: 1 live, 1 revoked");
+    const text = JSON.stringify(on) + lines.join("\n");
+    for (const issued of [live, revoked, expired]) {
+      expect(text).not.toContain(issued.id);
+      expect(text).not.toContain(issued.token);
+    }
+    expect(text).not.toMatch(/[0-9a-f]{64}/);
+  });
+
+  it("names an unreadable agent key table as a problem", async () => {
+    await healthySite();
+    const keysFail: Db = {
+      query: (text, params) => (text.includes("mcp_tokens") ? Promise.reject(new Error(MARKER)) : db.query(text, params)),
+      transaction: (fn) => db.transaction(fn),
+      close: async () => {},
+    };
+
+    const report = await healthReport(keysFail, NOW);
+
+    expect(report.agentKeys).toBeNull();
+    expect(report.problems).toEqual(["The agent key table could not be read."]);
+    expect(JSON.stringify(report)).not.toContain(MARKER);
   });
 
   it("reports an unreachable database without the connection string in any output", async () => {

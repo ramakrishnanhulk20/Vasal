@@ -340,6 +340,88 @@ describe("offline Qloo share (dayKey)", () => {
   });
 });
 
+describe("a surface's own month under the shared ceiling (extraKeys, D3.3)", () => {
+  const MCP = { dayKey: "qloo:day:mcp", extraKeys: ["qloo:month:mcp"] };
+
+  async function openMcpShare(dayCap: number, monthCap: number): Promise<void> {
+    await setBucket(db, { key: "qloo:day:mcp", cap: dayCap, windowEnd: FAR_FUTURE });
+    await setBucket(db, { key: "qloo:month:mcp", cap: monthCap, windowEnd: FAR_FUTURE });
+  }
+
+  it("charges the MCP day, the MCP month, the shared month and the second together, and leaves qloo:day alone", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openMcpShare(50, 500);
+
+    expect(await reserveQlooCall(db, NOW, MCP)).toBe(true);
+
+    expect(await usedOf("qloo:day:mcp")).toBe(1);
+    expect(await usedOf("qloo:month:mcp")).toBe(1);
+    expect(await usedOf("qloo:month")).toBe(1);
+    expect(await usedOf(`qloo:second:${Math.floor(NOW.getTime() / 1_000)}`)).toBe(1);
+    expect(await usedOf("qloo:day")).toBe(0);
+  });
+
+  it("refuses every bucket when the MCP month is full, though its day and the shared month have room", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openMcpShare(50, 2);
+    expect(await reserveQlooCall(db, NOW, MCP)).toBe(true);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 1_000), MCP)).toBe(true);
+
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 2_000), MCP)).toBe(false);
+
+    expect(await usedOf("qloo:month:mcp")).toBe(2);
+    expect(await usedOf("qloo:day:mcp")).toBe(2);
+    expect(await usedOf("qloo:month")).toBe(2);
+    expect(await usedOf(`qloo:second:${Math.floor(NOW.getTime() / 1_000) + 2}`)).toBe(0);
+    expect(await reserveQlooCall(db, new Date(NOW.getTime() + 2_000))).toBe(true);
+  });
+
+  it("refuses when the MCP month was never set, and waitForQlooSlot gives up at once without sleeping", async () => {
+    await openQlooBuckets(100, 1_000);
+    await setBucket(db, { key: "qloo:day:mcp", cap: 50, windowEnd: FAR_FUTURE });
+    const sleeps: number[] = [];
+
+    expect(await reserveQlooCall(db, NOW, MCP)).toBe(false);
+    expect(
+      await waitForQlooSlot(db, {
+        ...MCP,
+        now: () => NOW,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      }),
+    ).toBe(false);
+
+    expect(sleeps).toEqual([]);
+    expect(await usedOf("qloo:month")).toBe(0);
+    expect(await usedOf("qloo:day:mcp")).toBe(0);
+  });
+
+  it("refuses extra keys outside the qloo:month:<word> and qloo:day:<word> forms, repeats and too many, before touching any bucket", async () => {
+    await openQlooBuckets(100, 1_000);
+    await openMcpShare(50, 500);
+    const bad: unknown[] = [
+      ["qloo:month"],
+      ["qloo:day"],
+      ["qloo:second:1"],
+      ["anthropic:day"],
+      ["qloo:month:MCP"],
+      ["qloo:month:mcp:x"],
+      ["qloo:month:mcp", "qloo:month:mcp"],
+      ["qloo:day:mcp"],
+      ["qloo:month:mcp", "qloo:day:extra", "qloo:month:other"],
+      "qloo:month:mcp",
+      [5],
+    ];
+    for (const extraKeys of bad) {
+      const opts = { dayKey: "qloo:day:mcp", extraKeys: extraKeys as string[] };
+      expect(await codeOf(reserveQlooCall(db, NOW, opts)), JSON.stringify(extraKeys)).toBe("STORE_BAD_INPUT");
+      expect(await codeOf(waitForQlooSlot(db, opts)), JSON.stringify(extraKeys)).toBe("STORE_BAD_INPUT");
+    }
+    expect(await usedOf("qloo:month")).toBe(0);
+  });
+});
+
 describe("pruneSecondBuckets", () => {
   it("deletes only per-second buckets whose window has ended", async () => {
     await openQlooBuckets(100, 1_000);
