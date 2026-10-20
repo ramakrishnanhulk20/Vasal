@@ -951,6 +951,7 @@ export type ShowcaseGuest = {
   reach: string;
   rising: string;
   bringsNew: string | null;
+  sharedTags: string[];
 };
 export type ShowcaseRun = { runId: string; position: number; showName: string; finishedAt: Date; guests: ShowcaseGuest[] };
 
@@ -996,6 +997,7 @@ export function showcaseView(
       reach: guest.reach,
       rising: guest.rising.state,
       bringsNew: guest.bringsNew?.label ?? null,
+      sharedTags: [...guest.sharedTags],
     })),
   };
 }

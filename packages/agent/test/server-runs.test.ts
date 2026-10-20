@@ -691,6 +691,7 @@ describe("listShowcase (C6.3, C6.5)", () => {
     reach: "bookable",
     rising: "rising",
     bringsNew: n % 2 === 0 ? "listeners 25 to 29" : null,
+    sharedTags: ["synthetic taste"],
   });
 
   async function endedRun(status: "done" | "failed", guests: unknown[]): Promise<{ runId: string; guestIds: string[] }> {

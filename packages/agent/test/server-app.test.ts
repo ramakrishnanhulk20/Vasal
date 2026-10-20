@@ -8,6 +8,7 @@
 import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { kolamFor, type Kolam } from "../src/kolam/kolam.js";
 import { createUnavailableAgent, type AgentPort } from "../src/server/agent-port.js";
 import { createApp, type AppDeps } from "../src/server/app.js";
 import type { ServerConfig } from "../src/server/config.js";
@@ -183,6 +184,24 @@ async function runWithBoard(guests: unknown[]): Promise<{ runId: string; guestId
   const guestIds = await putBoard(db, runId, guests);
   await setRunStatus(db, runId, "done", undefined, NOW);
   return { runId, guestIds };
+}
+
+// A synthetic guest in the shape the agent runner stores (C7.3).
+function storedGuest(n: number, sharedTags: string[], overrides: Record<string, unknown> = {}) {
+  return {
+    personId: `00000000-0000-4000-8000-0000000005${String(n).padStart(2, "0")}`,
+    name: `Synthetic Guest ${n}`,
+    fit: n / 100,
+    fitKnown: true,
+    fitRank: n,
+    reach: "bookable",
+    rising: { state: "steady", points: 0 },
+    bringsNew: null,
+    sharedTags,
+    angle: "A synthetic angle.",
+    showName: "Synthetic Show",
+    ...overrides,
+  };
 }
 
 describe("run store additions", () => {
@@ -558,16 +577,55 @@ describe("GET /runs/:id", () => {
         { id: candidateIds[0], appleId: "1521578868", name: "SmartLess", publisher: "SmartLess Media", qlooName: "SmartLess" },
       ],
       board: [],
+      kolam: null,
     });
     expect(JSON.stringify(await (await app.request(`/runs/${runId}`)).json())).not.toContain("feeds.example");
 
     await setRunStatus(db, runId, "done", undefined, NOW);
-    const done = (await (await app.request(`/runs/${runId}`)).json()) as { board: unknown[]; finishedAt: string };
+    const done = (await (await app.request(`/runs/${runId}`)).json()) as { board: unknown[]; finishedAt: string; kolam: unknown };
     expect(done.board).toEqual([
       { name: "first", id: guestIds[0] },
       { name: "second", id: guestIds[1] },
     ]);
     expect(done.finishedAt).toBe(NOW.toISOString());
+    // Neither row reads back as a runner's guest, so there is nothing to draw.
+    expect(done.kolam).toBeNull();
+  });
+
+  it("carries a kolam of the board's ids and tag counts once the run is done, null before, and none of the board's text (C3.9)", async () => {
+    const { app } = build();
+    const runId = await createRun(db, INPUT, NOW);
+    await setRunStatus(db, runId, "running", undefined, NOW);
+    const guestIds = await putBoard(db, runId, [
+      storedGuest(1, ["MARKER-k1", "late-night radio", "jazz"]),
+      storedGuest(2, ["MARKER-k1"], { name: "MARKER-k2" }),
+      storedGuest(3, []),
+      { name: "a row the runner could not have written", sharedTags: ["one", "two"] },
+    ]);
+
+    const running = (await (await app.request(`/runs/${runId}`)).json()) as { kolam: unknown };
+    expect(running.kolam).toBeNull();
+
+    await setRunStatus(db, runId, "done", undefined, NOW);
+    const text = await (await app.request(`/runs/${runId}`)).text();
+    const body = JSON.parse(text) as { kolam: Kolam | null };
+    const expected = kolamFor(runId, [
+      { guestId: guestIds[0]!, fitRank: 1, tagCount: 3 },
+      { guestId: guestIds[1]!, fitRank: 2, tagCount: 1 },
+      { guestId: guestIds[2]!, fitRank: 3, tagCount: 0 },
+    ]);
+    expect(expected).not.toBeNull();
+    expect(body.kolam).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(body.kolam?.rings.map((ring) => ring.guestId)).toEqual(guestIds.slice(0, 2));
+    expect(body.kolam?.dots).toHaveLength(4);
+
+    // The markers are on the page's board, so their absence below is the kolam's doing.
+    expect(text).toContain("MARKER-k1");
+    expect(text).toContain("MARKER-k2");
+    const drawing = JSON.stringify(body.kolam);
+    for (const absent of ["MARKER-k1", "MARKER-k2", "late-night radio", guestIds[2]!, guestIds[3]!]) {
+      expect(drawing).not.toContain(absent);
+    }
   });
 
   it("gives 404 for a non-UUID, an unknown id or a re-spelled id, and marks run responses noindex and no-store (C6.1, C3.8)", async () => {
@@ -673,7 +731,10 @@ describe("GET /showcase (C5.4, C6.3)", () => {
         reach: "well known",
         rising: "steady",
         bringsNew: null,
+        sharedTags: [],
       })),
+      // No guest shares a tag, so there is nothing to draw.
+      kolam: null,
     });
     expect(body.runs[1]!.guests.map((shown) => shown.id)).toEqual(first.guestIds.slice(0, 3));
     expect(text).not.toContain(unpromoted.runId);
@@ -692,6 +753,32 @@ describe("GET /showcase (C5.4, C6.3)", () => {
     expect(counting.texts.length).toBeGreaterThan(0);
     expect(counting.texts.filter((query) => /usage_buckets|app_flags|inflight/.test(query))).toHaveLength(0);
     expect(counting.texts.filter((query) => !/^\s*SELECT\b/i.test(query))).toHaveLength(0);
+  });
+
+  it("gives each run its guests' shared tags and a kolam drawn from their ids and tag counts (C3.9)", async () => {
+    const { app } = build();
+    const tags = [["jazz", "MARKER-k1"], ["late-night radio"], ["film", "food", "travel", "books", "chess"]];
+    const shown = await runWithBoard([...tags.map((sharedTags, k) => ({ ...guest(k + 1), sharedTags })), guest(4)]);
+    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 1, $2::timestamptz)", [
+      shown.runId,
+      NOW.toISOString(),
+    ]);
+
+    const body = (await (await app.request("/showcase")).json()) as {
+      runs: Array<{ runId: string; guests: Array<{ id: string; sharedTags: string[] }>; kolam: Kolam | null }>;
+    };
+    const [run] = body.runs;
+    expect(run!.guests.map((entry) => entry.sharedTags)).toEqual(tags);
+    const expected = kolamFor(
+      shown.runId,
+      shown.guestIds.slice(0, 3).map((guestId, k) => ({ guestId, fitRank: k + 1, tagCount: tags[k]!.length })),
+    );
+    expect(expected).not.toBeNull();
+    expect(run!.kolam).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(run!.kolam?.rings.map((ring) => ring.guestId)).toEqual(shown.guestIds.slice(0, 3));
+    expect(run!.kolam?.dots).toHaveLength(8);
+    expect(JSON.stringify(run!.kolam)).not.toContain("MARKER-k1");
+    expect(JSON.stringify(run!.kolam)).not.toContain(shown.guestIds[3]);
   });
 });
 

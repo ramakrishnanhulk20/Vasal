@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { routePath } from "hono/route";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
+import { kolamFor, type Kolam } from "../kolam/kolam.js";
 import { createMcpRoute } from "../mcp/server.js";
 import { visitorKey } from "../net/visitor-key.js";
 import type { Db } from "../store/db.js";
@@ -29,6 +30,7 @@ import {
   listCandidates,
   listEventsAfter,
   listShowcase,
+  parseBoardGuest,
   setRunStatus,
   type RunInput,
 } from "./runs.js";
@@ -130,6 +132,18 @@ function withIds(items: Array<{ id: string; data: unknown }>): Array<Record<stri
   return items.flatMap((item) => (isPlainObject(item.data) ? [{ ...item.data, id: item.id }] : []));
 }
 
+// Only rows the runner's own schema reads back are drawn (C6.5), and only
+// their server id, rank and tag count reach the drawing, never their text (C3.9).
+function boardKolam(runId: string, board: Array<{ id: string; data: unknown }>): Kolam | null {
+  return kolamFor(
+    runId,
+    board.flatMap((item) => {
+      const row = parseBoardGuest(JSON.stringify(item.data));
+      return row === null ? [] : [{ guestId: item.id, fitRank: row.fitRank, tagCount: row.sharedTags.length }];
+    }),
+  );
+}
+
 // A stored candidate also holds its feed URL, which the server keeps to itself
 // and fetches only through a handle (C1.5). The page gets the same fields the
 // candidates event carries, chosen by name so a new stored field stays private.
@@ -153,6 +167,8 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * method gives 404 NOT_FOUND, and there is no way to list visitor runs
  * (C6.1). GET /showcase lists only the runs the operator promoted (C6.3),
  * from storage alone, cacheable for 60 seconds and open to indexing.
+ * GET /runs/:id for a done run, and each showcase run, carry a kolam drawn
+ * from board numbers and guest ids only (kolam/kolam.ts, C3.9), or null.
  * Confirm and brief act only on ids the server issued for that run (C6.2).
  * Each guest's brief is claimed once, at most 5 claims per run, and a brief
  * that failed may be asked for once more; after a second failure the POST
@@ -388,7 +404,18 @@ export function createApp(deps: AppDeps): Hono {
   // kill switch or meter is touched (C5.4), and only the operator's promote
   // command decides what it lists (C6.3). Unlike a visitor's run it is meant
   // to be public, so it may be cached and indexed.
-  app.get("/showcase", async (c) => c.json({ runs: await listShowcase(db) }, 200, { "Cache-Control": "public, max-age=60" }));
+  app.get("/showcase", async (c) => {
+    // Showcase guests are the board's first 3 in rank order, and the runner
+    // stores fitRank as that rank, so place + 1 is each guest's fitRank.
+    const runs = (await listShowcase(db)).map((run) => ({
+      ...run,
+      kolam: kolamFor(
+        run.runId,
+        run.guests.map((guest, place) => ({ guestId: guest.id, fitRank: place + 1, tagCount: guest.sharedTags.length })),
+      ),
+    }));
+    return c.json({ runs }, 200, { "Cache-Control": "public, max-age=60" });
+  });
 
   app.post("/runs", sameSiteJson, smallBody, async (c) => {
     const body = await readBody(c, startBody);
@@ -441,6 +468,7 @@ export function createApp(deps: AppDeps): Hono {
       // Only a finished run shows its board, so a run that stopped early is
       // never shown with partial results (C6.4).
       board: run.status === "done" ? withIds(board) : [],
+      kolam: run.status === "done" ? boardKolam(run.id, board) : null,
     });
   });
 
