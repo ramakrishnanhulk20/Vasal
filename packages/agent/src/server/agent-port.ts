@@ -16,6 +16,12 @@ import { appendEvent, markBriefFailed, setRunStatus, type RunInput } from "./run
  * on it; a writeBrief rejection is only logged.
  */
 export type AgentPort = {
+  /**
+   * False only for the unavailable agent. When it is false the brief routes
+   * refuse before claiming, so a server with no keys never spends a guest's
+   * attempts. Every other agent leaves it out, and absent means ready.
+   */
+  ready?: boolean;
   startRun(runId: string, input: RunInput): Promise<void>;
   continueRun(runId: string, candidateId: string): Promise<void>;
   writeBrief(runId: string, guestId: string): Promise<void>;
@@ -29,7 +35,9 @@ const AGENT_NOT_READY = "AGENT_NOT_READY";
  * AGENT_NOT_READY and append a "failed" event { code: "AGENT_NOT_READY" },
  * which is the honest answer, never a made-up result. writeBrief stores
  * nothing and marks the guest's pending brief claim failed with
- * AGENT_NOT_READY, so the page shows that failure instead of waiting.
+ * AGENT_NOT_READY, so the page shows that failure instead of waiting. Its
+ * ready is false, so the brief routes refuse with AGENT_NOT_READY before
+ * they claim, and writeBrief runs only for a caller that skips that check.
  * startRun and continueRun reject with the run store's ServerError if the
  * run is unknown or already finished, or the database fails; writeBrief
  * rejects with it for a bad id or a database failure.
@@ -40,6 +48,7 @@ export function createUnavailableAgent(db: Db): AgentPort {
     await appendEvent(db, runId, "failed", { code: AGENT_NOT_READY });
   };
   return {
+    ready: false,
     startRun: (runId) => refuse(runId),
     continueRun: (runId) => refuse(runId),
     writeBrief: async (runId, guestId) => {

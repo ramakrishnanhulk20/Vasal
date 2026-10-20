@@ -30,6 +30,7 @@ export type HealthReport = {
   agentKeys: { live: number; revoked: number } | null;
   runsLast24h: Record<string, number> | null;
   inflight: number | null;
+  mcpInflight: number | null;
   cacheRows: number | null;
   problems: string[];
 };
@@ -39,6 +40,7 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
 // two seconds after it starts, so listing them would only show noise.
 const SECOND_BUCKET_PREFIX = "qloo:second:";
 const INFLIGHT_SLOT = "runs";
+const MCP_INFLIGHT_SLOT = "mcp";
 const MAX_BUCKET_ROWS = 200;
 
 // pg returns bigint columns as digit strings and PGlite as numbers (C6.5).
@@ -131,8 +133,9 @@ function bucketProblems(buckets: BucketHealth[]): string[] {
  * short-lived per-second ones, with used, cap, percent used and window end;
  * the live_runs flag; the mcp_enabled flag; how many agent keys are live and
  * how many revoked (counts only, never an id or a hash); runs created in the
- * 24 hours before `now`, by status; the in-progress run count; and the
- * number of cached Qloo answers. Each row read passes a schema first (C6.5).
+ * 24 hours before `now`, by status; the in-progress run counts for the site
+ * and for MCP; and the number of cached Qloo answers. Each row read passes a
+ * schema first (C6.5).
  *
  * `problems` lists, in plain sentences: the database being unreachable; any
  * part that could not be read; no buckets at all; a bucket whose window has
@@ -154,6 +157,7 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
     agentKeys: null,
     runsLast24h: null,
     inflight: null,
+    mcpInflight: null,
     cacheRows: null,
     problems: [],
   };
@@ -171,6 +175,7 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
   report.agentKeys = await readOrNull(() => readAgentKeys(db));
   report.runsLast24h = await readOrNull(() => readRuns(db, checkedAt));
   report.inflight = await readOrNull(() => readCount(db, "SELECT n FROM inflight WHERE slot = $1", [INFLIGHT_SLOT]));
+  report.mcpInflight = await readOrNull(() => readCount(db, "SELECT n FROM inflight WHERE slot = $1", [MCP_INFLIGHT_SLOT]));
   report.cacheRows = await readOrNull(() => readCount(db, "SELECT count(*)::int AS n FROM qloo_cache", []));
 
   if (report.buckets === null) report.problems.push("The budget buckets could not be read.");
@@ -179,6 +184,7 @@ export async function healthReport(db: Db, now: Date): Promise<HealthReport> {
   if (report.agentKeys === null) report.problems.push("The agent key table could not be read.");
   if (report.runsLast24h === null) report.problems.push("The runs table could not be read.");
   if (report.inflight === null) report.problems.push("The in-progress run counter could not be read, so no run can start.");
+  if (report.mcpInflight === null) report.problems.push("The MCP in-progress run counter could not be read, so no MCP run can start.");
   if (report.cacheRows === null) report.problems.push("The Qloo cache could not be read.");
   return report;
 }
@@ -196,6 +202,7 @@ export function formatHealth(report: HealthReport): string[] {
       runs === null ? "unknown" : Object.keys(runs).length === 0 ? "none" : Object.entries(runs).map(([status, n]) => `${status} ${n}`).join(", ");
     lines.push(`  Runs started in the last 24 hours: ${runText}`);
     lines.push(`  Runs in progress: ${report.inflight ?? "unknown"}`);
+    lines.push(`  MCP runs in progress: ${report.mcpInflight ?? "unknown"}`);
     lines.push(`  Cached Qloo answers: ${report.cacheRows === null ? "unknown" : grouped.format(report.cacheRows)}`);
     const buckets = report.buckets ?? [];
     lines.push(report.buckets === null ? "  Budgets: unknown" : buckets.length === 0 ? "  Budgets: none" : "  Budgets:");

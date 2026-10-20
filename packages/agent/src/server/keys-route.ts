@@ -10,6 +10,7 @@ import type { AppDeps } from "./app.js";
 import { clientAddressFrom, isAllowedPost } from "./guards.js";
 import { TURNSTILE_ACTIONS } from "./turnstile.js";
 
+const ROUTE = "/agent-keys";
 const MAX_BODY_BYTES = 4 * 1024;
 const MAX_TOKEN_LENGTH = 2_048;
 /** The global daily cap on agent keys, set by the budget policy like every other bucket (D1.5). */
@@ -32,7 +33,8 @@ class IssueRefused extends Error {
 /**
  * Builds POST /agent-keys, which app.ts mounts. A website visitor who passes
  * the human check gets one agent key (F9). The checks run in this order, and
- * each refusal answers { error: CODE } and changes nothing:
+ * each refusal answers { error: CODE }, changes nothing, and writes one warn
+ * line holding only the route and the code:
  * - C5.5: Origin equal to the app origin and Content-Type application/json,
  *   else 403 FORBIDDEN_ORIGIN;
  * - a body of at most 4 KiB, else 413 TOO_LARGE, holding exactly
@@ -58,7 +60,12 @@ export function createAgentKeysRoute(deps: AppDeps): Hono {
   const now = deps.now ?? (() => new Date());
   const route = new Hono();
 
-  const refuse = (c: Context, status: ContentfulStatusCode, code: string): Response => c.json({ error: code }, status);
+  // One line per refusal for the operator: this route and the code only,
+  // never a header, a body, an address or a key (C3.6, D1.4).
+  const refuse = (c: Context, status: ContentfulStatusCode, code: string): Response => {
+    console.warn(JSON.stringify({ level: "warn", route: ROUTE, code }));
+    return c.json({ error: code }, status);
+  };
 
   const socketOf = (c: Context): string | null => {
     try {
@@ -86,7 +93,7 @@ export function createAgentKeysRoute(deps: AppDeps): Hono {
   };
   const smallBody = bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => refuse(c, 413, "TOO_LARGE") });
 
-  route.post("/agent-keys", sameSiteJson, smallBody, async (c) => {
+  route.post(ROUTE, sameSiteJson, smallBody, async (c) => {
     let value: unknown;
     try {
       value = JSON.parse(await c.req.text());

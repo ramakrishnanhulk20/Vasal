@@ -1,13 +1,15 @@
 // Covers GET /runs/:id/events through app.request() on a migrated PGlite
 // database: replay after Last-Event-ID, the ways a stream ends, pings, the
-// per-run stream cap and frame safety. It does not cover a real socket or a
-// browser's EventSource (the live smoke uses curl), proxies that buffer, or
-// streams spread over several server processes, whose counts are separate.
+// per-run and site-wide stream caps and frame safety. It does not cover a
+// real socket or a browser's EventSource (the live smoke uses curl), proxies
+// that buffer, or streams spread over several server processes, whose counts
+// are separate.
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentPort } from "../src/server/agent-port.js";
 import { createApp, type AppDeps } from "../src/server/app.js";
 import type { ServerConfig } from "../src/server/config.js";
+import { ServerError } from "../src/server/errors.js";
 import { appendEvent, createRun, setRunStatus } from "../src/server/runs.js";
 import { SSE_PING } from "../src/server/sse.js";
 import type { Db } from "../src/store/db.js";
@@ -48,7 +50,7 @@ afterEach(async () => {
   await db.close();
 });
 
-function build(extra: Partial<Pick<AppDeps, "now" | "streamPollMs" | "streamLifetimeMs">> = {}) {
+function build(extra: Partial<Pick<AppDeps, "now" | "streamPollMs" | "streamLifetimeMs" | "maxOpenStreams">> = {}) {
   const agent: AgentPort = {
     startRun: vi.fn(async () => {}),
     continueRun: vi.fn(async () => {}),
@@ -175,6 +177,58 @@ describe("GET /runs/:id/events", () => {
     expect(replacement.status).toBe(200);
     for (const res of [open[1]!, open[2]!, replacement, elsewhere]) await res.body!.cancel();
     expect((await events(app, runId)).status).toBe(200);
+  });
+
+  it("refuses a stream past the site-wide total with 503 STREAMS_FULL and Retry-After 5, and opens one once a place frees (C5.8)", async () => {
+    for (const bad of [0, 1_001, 1.5]) {
+      let code: string | undefined;
+      try {
+        build({ maxOpenStreams: bad });
+      } catch (error) {
+        code = error instanceof ServerError ? error.code : String(error);
+      }
+      expect(code, String(bad)).toBe("SRV_BAD_INPUT");
+    }
+    const app = build({ maxOpenStreams: 2 });
+    const [first, second, third] = [await openRun(), await openRun(), await openRun()];
+    const open = [await events(app, first), await events(app, second)];
+    expect(open.map((res) => res.status)).toEqual([200, 200]);
+
+    const full = await events(app, third);
+    expect(full.status).toBe(503);
+    expect(full.headers.get("retry-after")).toBe("5");
+    expect(await full.json()).toEqual({ error: "STREAMS_FULL" });
+    // The total is checked before the run's own cap, which still has room here.
+    expect((await events(app, first)).status).toBe(503);
+
+    await open[0]!.body!.cancel();
+    expect((await events(app, third)).status).toBe(200);
+  });
+
+  it("gives the site-wide place back exactly once whichever way a stream ends: lifetime, done event or client abort", async () => {
+    const app = build({ maxOpenStreams: 1, streamLifetimeMs: 300 });
+    const running = await openRun();
+    const finished = await openRun();
+    await appendEvent(db, finished, "done", {}, NOW);
+
+    const timedOut = await events(app, running);
+    expect(timedOut.status).toBe(200);
+    expect(await timedOut.text()).toBe("");
+
+    const ended = await events(app, finished);
+    expect(ended.status).toBe(200);
+    expect(framesOf(await ended.text()).map((frame) => frame.event)).toEqual(["done"]);
+
+    const controller = new AbortController();
+    const aborted = await app.request(`/runs/${running}/events`, { signal: controller.signal });
+    opened.push(aborted);
+    expect(aborted.status).toBe(200);
+    controller.abort();
+
+    // With a cap of 1, one stream opening and the next refused shows the
+    // count came back to exactly 0, not below it.
+    expect((await events(app, running)).status).toBe(200);
+    expect((await events(app, finished)).status).toBe(503);
   });
 
   it("keeps a feed title that imitates stream lines inside one data line (C3.3)", async () => {

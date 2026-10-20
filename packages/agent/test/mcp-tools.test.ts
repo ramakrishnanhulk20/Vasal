@@ -28,7 +28,7 @@ import { registerTools, TOOL_NAMES } from "../src/mcp/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
-import type { AgentPort } from "../src/server/agent-port.js";
+import { createUnavailableAgent, type AgentPort } from "../src/server/agent-port.js";
 import { createApp } from "../src/server/app.js";
 import { acquireInflightSlot } from "../src/server/caps.js";
 import type { ServerConfig } from "../src/server/config.js";
@@ -54,6 +54,7 @@ import { StoreError } from "../src/store/errors.js";
 import { setFlag } from "../src/store/flags.js";
 import { setBucket, usage } from "../src/store/meter.js";
 import { migratedPglite } from "./helpers/pglite.js";
+import { SETTLE } from "./helpers/settle.js";
 
 const APP_ORIGIN = "http://localhost:3000";
 const IP_HEADER = "x-test-client-ip";
@@ -92,7 +93,7 @@ beforeEach(async () => {
 afterEach(async () => {
   for (const client of open.splice(0)) await client.close();
   vi.restoreAllMocks();
-  await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }));
+  await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }), SETTLE);
   await db.close();
 });
 
@@ -433,7 +434,7 @@ describe("book_guests (F12, D3.3, D3.4)", () => {
     expect((out(result)["guests"] as Array<{ guestId: string }>).map((guest) => guest.guestId)).toEqual(board.map((guest) => guest.id));
     expect(textOf(result)).not.toContain(PERSON_MARKER);
     expect(await counts()).toEqual({ runs: 1, finds: 1, briefs: 0 });
-    await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }));
+    await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }), SETTLE);
 
     const again = await call(client, "book_guests", { candidateId });
     expect(out(again)).toEqual(out(result));
@@ -545,7 +546,7 @@ describe("book_guests (F12, D3.3, D3.4)", () => {
     const kept = await found(ended);
     expect(out(await call(ended, "book_guests", { candidateId: kept.candidateId }))).toEqual({ error: "not_found" });
     expect(await getRun(db, kept.runId)).toMatchObject({ status: "failed", errorCode: "SHOW_NOT_FOUND" });
-    await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }));
+    await vi.waitFor(async () => expect(await slots()).toEqual({ mcp: 0, runs: 0 }), SETTLE);
   });
 
   it("returns the run id to poll when the board takes longer than the wait, and get_board shows the board once it lands", async () => {
@@ -566,7 +567,7 @@ describe("book_guests (F12, D3.3, D3.4)", () => {
     expect(await slots()).toEqual({ mcp: 1, runs: 1 });
 
     release();
-    await vi.waitFor(async () => expect((await getRun(db, runId))?.status).toBe("done"));
+    await vi.waitFor(async () => expect((await getRun(db, runId))?.status).toBe("done"), SETTLE);
     expect(out(await call(client, "get_board", { runId }))).toMatchObject({ status: "done", runId });
     expect(agent.continueRun).toHaveBeenCalledOnce();
   });
@@ -649,7 +650,7 @@ describe("write_brief (F13, D3.5)", () => {
     expect(agent.writeBrief).toHaveBeenCalledOnce();
 
     release();
-    await vi.waitFor(async () => expect(out(await call(client, "write_brief", { runId, guestId }))).toMatchObject({ status: "done" }));
+    await vi.waitFor(async () => expect(out(await call(client, "write_brief", { runId, guestId }))).toMatchObject({ status: "done" }), SETTLE);
     expect(await counts()).toMatchObject({ briefs: 1 });
   });
 
@@ -699,6 +700,18 @@ describe("write_brief (F13, D3.5)", () => {
     await finishRun(db, sixGuests, "done", { name: "done", data: { guests: 6 } });
     for (const guestId of ids.slice(0, 5)) expect(out(await call(client, "write_brief", { runId: sixGuests, guestId }))).toMatchObject({ status: "done" });
     expect(out(await call(client, "write_brief", { runId: sixGuests, guestId: ids[5]! }))).toEqual({ error: "budget_exhausted" });
+  });
+
+  it("with the unavailable agent, answers upstream_failed every time without counting the key's briefs or claiming (C5.8)", async () => {
+    const { runId, guestIds } = await booked(await connect());
+    const client = await connect({ agent: createUnavailableAgent(db) });
+
+    for (let i = 0; i < 3; i += 1) {
+      expect(out(await call(client, "write_brief", { runId, guestId: guestIds[0]! }))).toEqual({ error: "upstream_failed" });
+    }
+
+    expect(await counts()).toMatchObject({ briefs: 0 });
+    expect((await db.query("SELECT count(*)::int AS n FROM run_brief_claims")).rows).toEqual([{ n: 0 }]);
   });
 });
 

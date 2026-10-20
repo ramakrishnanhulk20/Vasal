@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { issueToken, MCP_ENABLED_FLAG, revokeToken } from "../src/mcp/tokens.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
+import { acquireMcpRunSlots } from "../src/server/caps.js";
 import { cachePut } from "../src/store/cache.js";
 import { createPgDb, type Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
@@ -65,10 +66,27 @@ describe("healthReport", () => {
       agentKeys: { live: 0, revoked: 0 },
       runsLast24h: { done: 2, failed: 1 },
       inflight: 0,
+      mcpInflight: 0,
       cacheRows: 1,
       problems: [],
     });
     expect(formatHealth(report).at(-1)).toBe("No problems.");
+  });
+
+  it("shows MCP's in-progress runs apart from the site's, and flags a missing MCP counter", async () => {
+    await healthySite();
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+
+    const busy = await healthReport(db, NOW);
+
+    expect([busy.inflight, busy.mcpInflight]).toEqual([1, 1]);
+    expect(formatHealth(busy)).toEqual(expect.arrayContaining(["  Runs in progress: 1", "  MCP runs in progress: 1"]));
+
+    await db.query("DELETE FROM inflight WHERE slot = 'mcp'");
+    const missing = await healthReport(db, NOW);
+
+    expect(missing.mcpInflight).toBeNull();
+    expect(missing.problems).toEqual(["The MCP in-progress run counter could not be read, so no MCP run can start."]);
   });
 
   it("flags a bucket at 80 percent but not one just under it", async () => {

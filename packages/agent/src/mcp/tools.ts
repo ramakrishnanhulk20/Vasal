@@ -63,8 +63,8 @@ const AGENT_ERROR = "AGENT_ERROR";
 const MAX_SHOW_LENGTH = 300;
 const MAX_ID_LENGTH = 100;
 
-// The website's show rule (app.ts showText): NFC, trimmed, then 1 to 300 by
-// String length, which is what createRun accepts.
+// The website's show rule (app.ts showText): NFC, trimmed, then 1 to 300 code
+// points as zod counts them, which is what createRun accepts.
 const showText = z
   .string()
   .min(1)
@@ -176,8 +176,9 @@ async function pollUntil(
  * looked up only for the calling key, so another key's, a website run's and
  * an unknown id are all not_found (D4.1). A run whose agent call rejects is
  * marked failed with AGENT_ERROR unless the agent already ended it, so no
- * run is left looking alive (C6.4). Must be called before the server
- * connects. Never throws.
+ * run is left looking alive (C6.4). write_brief with an agent that is not
+ * ready answers upstream_failed before it counts or claims anything. Must be
+ * called before the server connects. Never throws.
  */
 export function registerTools(server: McpServer, deps: ToolDeps): void {
   const { db, agent, config, now, waitMs, tokenId } = deps;
@@ -365,6 +366,9 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       if (held?.status === "done") return errorReply("upstream_failed");
 
       if (!(await liveRunsEnabled(db))) return errorReply("mcp_off");
+      // An agent with no keys would only fail the brief, so neither the key's
+      // daily count nor the guest's claim is spent on it.
+      if (agent.ready === false) return errorReply("upstream_failed");
       if (!(await countTokenUse(db, tokenId, "briefs", MCP_LIMITS.briefsPerDay, now()))) return errorReply("budget_exhausted");
       // The claim is the one gate in front of the model, so parallel calls
       // make one model call (D3.5, C5.8).

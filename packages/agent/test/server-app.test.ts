@@ -35,6 +35,7 @@ import type { Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
 import { setBucket } from "../src/store/meter.js";
 import { migratedPglite } from "./helpers/pglite.js";
+import { SETTLE } from "./helpers/settle.js";
 
 const NOW = new Date("2026-10-19T12:00:00.000Z");
 const INPUT: RunInput = { show: "SmartLess", exclude: [] };
@@ -149,7 +150,7 @@ async function snapshot(): Promise<string> {
 }
 
 async function settled(expected = 0): Promise<void> {
-  await vi.waitFor(async () => expect(await inflight()).toBe(expected));
+  await vi.waitFor(async () => expect(await inflight()).toBe(expected), SETTLE);
 }
 
 // Records every statement the app sends, so a test can count meter reads
@@ -483,7 +484,7 @@ describe("POST /runs", () => {
     expect(await visitorRuns()).toBe(2);
     expect(agent.startRun).toHaveBeenCalledTimes(2);
 
-    await vi.waitFor(() => expect(settle).toHaveLength(2));
+    await vi.waitFor(() => expect(settle).toHaveLength(2), SETTLE);
     settle[0]!();
     await settled(1);
     expect((await start(app, undefined, { [IP_HEADER]: "198.51.100.3" })).status).toBe(202);
@@ -782,6 +783,61 @@ describe("onError (C3.6)", () => {
   });
 });
 
+function captureConsole(): string[] {
+  const lines: string[] = [];
+  for (const method of ["log", "info", "warn", "error", "debug"] as const) {
+    vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    });
+  }
+  return lines;
+}
+
+describe("refusal logs (6e, C3.6)", () => {
+  it("writes exactly one line per refusal, holding only the level, the route pattern and the code", async () => {
+    const lines = captureConsole();
+    const { app } = build();
+    const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }]);
+    const refusals: Array<[() => Promise<Response>, number, { level: string; route: string; code: string }]> = [
+      [() => start(app, { show: "SmartLess", turnstileToken: "tok", note: MARKER }), 400, { level: "warn", route: "/runs", code: "BAD_INPUT" }],
+      [
+        () => postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] }, { origin: "https://evil.example" }),
+        403,
+        { level: "warn", route: "/runs/:id/confirm", code: "FORBIDDEN_ORIGIN" },
+      ],
+      [() => postJson(app, "/agent-keys", { turnstileToken: "tok", visitor: MARKER }), 400, { level: "warn", route: "/agent-keys", code: "BAD_INPUT" }],
+    ];
+
+    for (const [send, status, line] of refusals) {
+      lines.length = 0;
+      const res = await send();
+      expect(res.status, line.route).toBe(status);
+      expect(await res.json()).toEqual({ error: line.code });
+      expect(lines.map((text) => JSON.parse(text) as unknown)).toEqual([line]);
+    }
+  });
+
+  it("logs a 404 under the route pattern, never the path the caller sent", async () => {
+    const lines = captureConsole();
+    const { app } = build();
+    const cases: Array<[string, string]> = [
+      [`/admin/${MARKER}`, "unmatched"],
+      [`/runs/${MARKER}`, "/runs/:id"],
+      [`/runs/${MARKER}/briefs/${MARKER}`, "/runs/:id/briefs/:guestId"],
+    ];
+
+    for (const [path, route] of cases) {
+      lines.length = 0;
+      const res = await app.request(path, { headers: { [IP_HEADER]: VISITOR } });
+      expect(res.status, path).toBe(404);
+      expect(lines, path).toHaveLength(1);
+      expect(lines[0]).not.toContain(MARKER);
+      expect(lines[0]).not.toContain(VISITOR);
+      expect(JSON.parse(lines[0]!)).toEqual({ level: "warn", route, code: "NOT_FOUND" });
+    }
+  });
+});
+
 async function awaitingRun(candidates: unknown[]): Promise<{ runId: string; candidateIds: string[] }> {
   const runId = await createRun(db, INPUT, NOW);
   await setRunStatus(db, runId, "awaiting_confirm", undefined, NOW);
@@ -860,7 +916,7 @@ describe("POST /runs/:id/confirm", () => {
     expect((await getRun(db, second.runId))?.status).toBe("awaiting_confirm");
 
     finish();
-    await vi.waitFor(async () => expect((await db.query("SELECT n FROM inflight WHERE slot = 'runs'")).rows).toEqual([{ n: 0 }]));
+    await vi.waitFor(async () => expect((await db.query("SELECT n FROM inflight WHERE slot = 'runs'")).rows).toEqual([{ n: 0 }]), SETTLE);
     expect((await confirm(second)).status).toBe(202);
     expect(agent.continueRun).toHaveBeenCalledTimes(2);
   });
@@ -870,7 +926,7 @@ describe("POST /runs/:id/confirm", () => {
     const { app } = build({ agent: { continueRun: async () => Promise.reject(new Error(MARKER)) } });
     const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }]);
     expect((await postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] })).status).toBe(202);
-    await vi.waitFor(async () => expect((await getRun(db, runId))?.errorCode).toBe("AGENT_ERROR"));
+    await vi.waitFor(async () => expect((await getRun(db, runId))?.errorCode).toBe("AGENT_ERROR"), SETTLE);
     expect(await listEventsAfter(db, runId, 0)).toEqual([{ seq: 1, event: "failed", data: { code: "AGENT_ERROR" } }]);
   });
 });
@@ -956,7 +1012,7 @@ describe("POST /runs/:id/brief", () => {
     const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
     const boardBefore = await listBoard(db, runId);
     expect((await postJson(app, `/runs/${runId}/brief`, { guestId: guestIds[0] })).status).toBe(202);
-    await vi.waitFor(() => expect(lines).toHaveLength(1));
+    await vi.waitFor(() => expect(lines).toHaveLength(1), SETTLE);
     expect(JSON.parse(lines[0]!)).toEqual({ level: "error", route: "agent.writeBrief", code: "UNEXPECTED" });
     expect((await getRun(db, runId))?.status).toBe("done");
     expect(await listBoard(db, runId)).toEqual(boardBefore);
@@ -978,6 +1034,7 @@ describe("POST /runs/:id/brief", () => {
     expect(await first.json()).toEqual({ status: "pending" });
     await vi.waitFor(async () =>
       expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" }),
+      SETTLE,
     );
 
     const second = await ask();
@@ -987,13 +1044,18 @@ describe("POST /runs/:id/brief", () => {
     expect(agent.writeBrief).toHaveBeenNthCalledWith(2, runId, guestId);
     await vi.waitFor(async () =>
       expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 2, errorCode: "MODEL_TIMEOUT" }),
+      SETTLE,
     );
 
+    const lines = captureConsole();
     for (let i = 0; i < 2; i += 1) {
       const refused = await ask();
       expect(refused.status).toBe(409);
       expect(await refused.json()).toEqual({ error: "BRIEF_FAILED", code: "MODEL_TIMEOUT" });
     }
+    // Logged like every other refusal, with the fixed code and not the stored one.
+    const line = { level: "warn", route: "/runs/:id/brief", code: "BRIEF_FAILED" };
+    expect(lines.map((text) => JSON.parse(text) as unknown)).toEqual([line, line]);
     expect(agent.writeBrief).toHaveBeenCalledTimes(2);
     expect((await getRun(db, runId))?.status).toBe("done");
   });
@@ -1032,7 +1094,7 @@ describe("POST /runs/:id/brief", () => {
     expect(await getBriefClaim(db, runId, fresh)).toBeNull();
   });
 
-  it("with the unavailable agent, leaves the claim failed with AGENT_NOT_READY instead of pending", async () => {
+  it("with the unavailable agent, refuses every brief with 503 AGENT_NOT_READY before claiming, so no attempt is spent", async () => {
     const app = createApp({
       db,
       config: CONFIG,
@@ -1042,18 +1104,18 @@ describe("POST /runs/:id/brief", () => {
     });
     const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
     const guestId = guestIds[0]!;
+    const before = await snapshot();
 
-    const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
-    expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ status: "pending" });
+    for (let i = 0; i < 3; i += 1) {
+      const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "AGENT_NOT_READY" });
+    }
 
-    await vi.waitFor(async () =>
-      expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "failed", attempts: 1, errorCode: "AGENT_NOT_READY" }),
-    );
-    const poll = await app.request(`/runs/${runId}/briefs/${guestId}`);
-    expect(await poll.json()).toEqual({ status: "failed", code: "AGENT_NOT_READY" });
+    expect(await getBriefClaim(db, runId, guestId)).toBeNull();
+    expect(await snapshot()).toBe(before);
+    expect(await (await app.request(`/runs/${runId}/briefs/${guestId}`)).json()).toEqual({ status: "none" });
     expect((await getRun(db, runId))?.status).toBe("done");
-    expect(await listEventsAfter(db, runId, 0)).toEqual([]);
   });
 });
 

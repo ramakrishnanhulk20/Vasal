@@ -21,6 +21,7 @@ import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { AgentError } from "../src/agent/errors.js";
 import { createAnthropicModel } from "../src/agent/model.js";
+import { SETTLE } from "./helpers/settle.js";
 
 const MARKER = "MARKER-7a11e";
 const API_KEY = `sk-ant-test-${MARKER}-key`;
@@ -235,7 +236,7 @@ describe("createAnthropicModel time limits (C2.4)", () => {
     const caller = new AbortController();
     const reading = build(neverAnswers(() => new DOMException(`${MARKER} aborted`, "AbortError") as unknown as Error));
     const pending = agentErrorOf(reading.model.turn(turnInput(), { signal: caller.signal, timeoutMs: 60_000 }));
-    await vi.waitFor(() => expect(reading.create).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(reading.create).toHaveBeenCalledTimes(1), SETTLE);
     caller.abort();
     const error = await pending;
     expect(error.code).toBe("MODEL_TIMEOUT");

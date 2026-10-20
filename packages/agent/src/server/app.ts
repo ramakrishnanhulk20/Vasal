@@ -44,6 +44,7 @@ export type AppDeps = {
   now?: () => Date;
   streamPollMs?: number; // default 500
   streamLifetimeMs?: number; // default 600000
+  maxOpenStreams?: number; // default 100, across every run in this process
 };
 
 const MAX_BODY_BYTES = 8 * 1024;
@@ -53,6 +54,11 @@ const MAX_EXCLUSION_LENGTH = 100;
 const MAX_TOKEN_LENGTH = 2_048;
 const MAX_BRIEFS_PER_RUN = 5;
 const MAX_STREAMS_PER_RUN = 3;
+// Each open stream polls the database twice every streamPollMs, so this cap
+// bounds the polling load one process can be made to carry.
+const DEFAULT_MAX_OPEN_STREAMS = 100;
+const MAX_OPEN_STREAMS = 1_000;
+const STREAMS_FULL_RETRY_SECONDS = "5";
 const STREAM_PING_MS = 15_000;
 const DEFAULT_STREAM_POLL_MS = 500;
 const MAX_STREAM_POLL_MS = 60_000;
@@ -61,8 +67,8 @@ const EVENT_PAGE = 100;
 const EVENTS_ROUTE = "/runs/:id/events";
 const SSE_HEADERS = { "Content-Type": "text/event-stream; charset=utf-8" };
 
-// String length, not code points, because createRun caps the same way and the
-// two must agree. The check runs after NFC, which can lengthen text (C8.1).
+// zod counts code points here and in createRun alike, so the two agree. The
+// check runs after NFC, which can lengthen text (C8.1).
 const showText = z
   .string()
   .transform((text) => text.normalize("NFC").trim())
@@ -94,10 +100,20 @@ function logFailure(route: string, error: unknown): void {
   console.error(JSON.stringify({ level: "error", route, code: errorCodeOf(error) }));
 }
 
-function wholeMs(value: number | undefined, fallback: number, max: number): number {
-  const ms = value ?? fallback;
-  if (!Number.isSafeInteger(ms) || ms < 1 || ms > max) throw new ServerError("SRV_BAD_INPUT");
-  return ms;
+// The registered pattern, such as /runs/:id, never the path the caller sent.
+function patternOf(c: Context, fallback: string): string {
+  try {
+    return routePath(c);
+  } catch {
+    // The pattern is only a label for the log line.
+    return fallback;
+  }
+}
+
+function wholeNumber(value: number | undefined, fallback: number, max: number): number {
+  const chosen = value ?? fallback;
+  if (!Number.isSafeInteger(chosen) || chosen < 1 || chosen > max) throw new ServerError("SRV_BAD_INPUT");
+  return chosen;
 }
 
 function isRunPath(path: string): boolean {
@@ -141,33 +157,53 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * Each guest's brief is claimed once, at most 5 claims per run, and a brief
  * that failed may be asked for once more; after a second failure the POST
  * gives 409 { error: "BRIEF_FAILED", code } (C5.8), even with live runs
- * off, which refuse only a brief that would call the model. GET
+ * off, which refuse only a brief that would call the model. An agent that
+ * is not ready gets that same brief 503 AGENT_NOT_READY, before any claim,
+ * so a server with no keys spends no guest's attempts. GET
  * /runs/:id/briefs/:guestId reports { status: "done", brief },
  * { status: "pending" }, { status: "failed", code } or { status: "none" }
  * from storage alone. The event stream writes only formatSseFrame
- * frames and pings (C3.3), allows 3 open streams per run in this process, and
- * ends at a done or failed event, a finished and drained run, or
- * streamLifetimeMs; pings follow the `now` clock, checked once per poll.
+ * frames and pings (C3.3), allows 3 open streams per run and
+ * maxOpenStreams (100 by default) in all, in this process, and ends at a
+ * done or failed event, a finished and drained run, or streamLifetimeMs;
+ * pings follow the `now` clock, checked once per poll. The total is checked
+ * first, and a full one gives 503 STREAMS_FULL with Retry-After: 5; a full
+ * run gives 429 TOO_MANY_STREAMS. The page then reads GET /runs/:id instead.
  * Every POST that can spend must pass the Origin and Content-Type check, the
  * 8 KiB body cap and a strict body schema before anything else runs (C5.5,
  * C8.1), and a GET or HEAD never spends (C5.4). POST /runs also needs a
  * human check solved on this site for the run-start action (C5.9), checked
  * before the visitor is counted. Refusals are JSON
- * { error: CODE } and change nothing. An unexpected failure gives 500
+ * { error: CODE }, change nothing, and each writes one warn line holding only
+ * the route pattern and the code (C3.6). An unexpected failure gives 500
  * { error: "INTERNAL" } and one log line holding only the route pattern and
  * a fixed code (C3.6). Throws ServerError("SRV_BAD_INPUT") while building if
- * streamPollMs is outside 1 to 60,000 or streamLifetimeMs outside 1 to
- * 600,000.
+ * streamPollMs is outside 1 to 60,000, streamLifetimeMs outside 1 to
+ * 600,000, or maxOpenStreams outside 1 to 1,000.
  */
 export function createApp(deps: AppDeps): Hono {
   const { db, config, agent } = deps;
   const now = deps.now ?? (() => new Date());
-  const pollMs = wholeMs(deps.streamPollMs, DEFAULT_STREAM_POLL_MS, MAX_STREAM_POLL_MS);
-  const lifetimeMs = wholeMs(deps.streamLifetimeMs, DEFAULT_STREAM_LIFETIME_MS, DEFAULT_STREAM_LIFETIME_MS);
+  const pollMs = wholeNumber(deps.streamPollMs, DEFAULT_STREAM_POLL_MS, MAX_STREAM_POLL_MS);
+  const lifetimeMs = wholeNumber(deps.streamLifetimeMs, DEFAULT_STREAM_LIFETIME_MS, DEFAULT_STREAM_LIFETIME_MS);
+  const maxOpenStreams = wholeNumber(deps.maxOpenStreams, DEFAULT_MAX_OPEN_STREAMS, MAX_OPEN_STREAMS);
   const openStreams = new Map<string, number>();
+  let totalStreams = 0;
   const app = new Hono();
 
-  const refuse = (c: Context, status: ContentfulStatusCode, code: string): Response => c.json({ error: code }, status);
+  // One line per refusal so the operator sees every one, holding the same
+  // fixed fields as a failure line and nothing the caller sent (C3.6, 6e).
+  const logRefusal = (route: string, code: string): void => {
+    console.warn(JSON.stringify({ level: "warn", route, code }));
+  };
+  const refuse = (c: Context, status: ContentfulStatusCode, code: string, headers?: Record<string, string>): Response => {
+    logRefusal(patternOf(c, "unmatched"), code);
+    return c.json({ error: code }, status, headers);
+  };
+  const briefFailed = (c: Context, code: string | null): Response => {
+    logRefusal(patternOf(c, "unmatched"), "BRIEF_FAILED");
+    return c.json({ error: "BRIEF_FAILED", code }, 409);
+  };
 
   const socketOf = (c: Context): string | null => {
     try {
@@ -233,8 +269,8 @@ export function createApp(deps: AppDeps): Hono {
     return parsed.success ? parsed.data : null;
   };
 
-  // The caller has already counted this stream in openStreams; shutdown gives
-  // that place back exactly once, whichever way the stream ends.
+  // The caller has already counted this stream in openStreams and the total;
+  // shutdown gives both places back exactly once, whichever way it ends.
   const eventStream = (runId: string, afterSeq: number, signal: AbortSignal): ReadableStream<Uint8Array> => {
     const encoder = new TextEncoder();
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -251,6 +287,7 @@ export function createApp(deps: AppDeps): Hono {
       const open = (openStreams.get(runId) ?? 1) - 1;
       if (open > 0) openStreams.set(runId, open);
       else openStreams.delete(runId);
+      totalStreams -= 1;
       if (closeBody) {
         try {
           controller?.close();
@@ -414,9 +451,11 @@ export function createApp(deps: AppDeps): Hono {
     // the run's places until its lifetime ran out.
     if (c.req.method === "HEAD") return c.body(null, 200, SSE_HEADERS);
 
+    if (totalStreams >= maxOpenStreams) return refuse(c, 503, "STREAMS_FULL", { "Retry-After": STREAMS_FULL_RETRY_SECONDS });
     const open = openStreams.get(run.id) ?? 0;
     if (open >= MAX_STREAMS_PER_RUN) return refuse(c, 429, "TOO_MANY_STREAMS");
     openStreams.set(run.id, open + 1);
+    totalStreams += 1;
     const afterSeq = parseLastEventId(c.req.header("last-event-id"));
     return c.body(eventStream(run.id, afterSeq, c.req.raw.signal), 200, SSE_HEADERS);
   });
@@ -467,16 +506,17 @@ export function createApp(deps: AppDeps): Hono {
     // all answered from storage first. claimBrief below stays the only gate
     // that lets a model call through.
     const held = await getBriefClaim(db, run.id, guestId);
-    if (held?.status === "failed" && held.attempts === 2) return c.json({ error: "BRIEF_FAILED", code: held.errorCode }, 409);
+    if (held?.status === "failed" && held.attempts === 2) return briefFailed(c, held.errorCode);
     if (held?.status === "pending" || held?.status === "done") return c.json({ status: "pending" }, 202);
     if (!(await liveRunsEnabled(db))) return refuse(c, 503, "LIVE_RUNS_OFF");
+    if (agent.ready === false) return refuse(c, 503, "AGENT_NOT_READY");
 
     const claim = await claimBrief(db, run.id, guestId, MAX_BRIEFS_PER_RUN, now());
     if (claim === "limit") return refuse(c, 429, "BRIEF_LIMIT");
     if (claim === "failed") {
       // A claim that failed twice never changes again, so this reads the code claimBrief saw.
       const failed = await getBriefClaim(db, run.id, guestId);
-      return c.json({ error: "BRIEF_FAILED", code: failed?.errorCode ?? null }, 409);
+      return briefFailed(c, failed?.errorCode ?? null);
     }
     if (claim === "claimed") {
       // A failed brief leaves the finished run and its board alone.
@@ -506,16 +546,15 @@ export function createApp(deps: AppDeps): Hono {
 
   app.route("/", createAgentKeysRoute(deps));
 
-  app.notFound((c) => refuse(c, 404, "NOT_FOUND"));
+  // No route matched, so the only pattern on hand is the catch-all's; a
+  // fixed label tells the operator this was an unknown path.
+  app.notFound((c) => {
+    logRefusal("unmatched", "NOT_FOUND");
+    return c.json({ error: "NOT_FOUND" }, 404);
+  });
 
   app.onError((error, c) => {
-    let route = "unknown";
-    try {
-      route = routePath(c);
-    } catch {
-      // The pattern is only a label for the log line.
-    }
-    logFailure(route, error);
+    logFailure(patternOf(c, "unknown"), error);
     return c.json({ error: "INTERNAL" }, 500);
   });
 

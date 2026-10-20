@@ -9,5 +9,8 @@ export default defineConfig({
     // limits stop a slow machine from failing setup that is merely queued.
     hookTimeout: 60_000,
     maxWorkers: 8,
+    // Every refusal writes a log line, so passing tests would print hundreds.
+    // A failing test still shows its own output.
+    silent: "passed-only",
   },
 });
