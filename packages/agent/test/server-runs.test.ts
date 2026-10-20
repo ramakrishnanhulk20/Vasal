@@ -1,7 +1,8 @@
 // Covers the run store on PGlite: ids, status rules, events, candidates, the
 // board, briefs, brief claims and their one retry, the restart sweeps for
 // runs and brief claims, the home-page showcase, including the app role's
-// grants on showcase_runs (roles.sql applied to PGlite), and the surface a
+// grants on showcase_runs and run_brief_claims (roles.sql applied to
+// PGlite), and the surface a
 // run is charged to with the reads that act only for the key that made a
 // run. It does not cover races between separate
 // connections (PGlite has one), the other vasal_app grants, the shapes of
@@ -28,6 +29,7 @@ import {
   listShowcase,
   markBriefDone,
   markBriefFailed,
+  parseBoardGuest,
   putBoard,
   putBrief,
   putCandidates,
@@ -496,6 +498,21 @@ describe("brief claims (C5.8)", () => {
     expect(await rowCount("run_brief_claims")).toBe(1);
   });
 
+  it("times a retried claim from when it was retried, not from the first attempt", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    await claimBrief(db, run, guest!, 5, NOW);
+    await markBriefFailed(db, run, guest!, "MODEL_TIMEOUT");
+
+    expect(await claimBrief(db, run, guest!, 5, LATER)).toBe("claimed");
+
+    const { rows } = await db.query<{ created_at: Date }>(
+      "SELECT created_at FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+      [run, guest],
+    );
+    expect(new Date(rows[0]!.created_at)).toEqual(LATER);
+  });
+
   it("gives one winner when a failed brief is re-claimed twice at once", async () => {
     const run = await createRun(db, INPUT, NOW);
     const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
@@ -623,6 +640,20 @@ describe("failStaleBriefClaims (C6.4)", () => {
     expect(await claimBrief(db, run, old!, 10, NOW)).toBe("claimed");
   });
 
+  it("spares a retry claimed 10 seconds ago and fails a first claim older than a minute", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [retried, stale] = await putBoard(db, run, [{ n: 1 }, { n: 2 }]);
+    await claimBrief(db, run, retried!, 10, NOW);
+    await markBriefFailed(db, run, retried!, "MODEL_TIMEOUT");
+    await claimBrief(db, run, stale!, 10, NOW);
+    expect(await claimBrief(db, run, retried!, 10, new Date(LATER.getTime() - 10_000))).toBe("claimed");
+
+    expect(await failStaleBriefClaims(db, 60_000, LATER)).toBe(1);
+
+    expect(await getBriefClaim(db, run, retried!)).toEqual({ status: "pending", attempts: 2, errorCode: null });
+    expect(await getBriefClaim(db, run, stale!)).toEqual({ status: "failed", attempts: 1, errorCode: "SERVER_RESTART" });
+  });
+
   it("refuses a bad age or date and changes nothing", async () => {
     const run = await createRun(db, INPUT, NOW);
     const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
@@ -725,6 +756,30 @@ describe("listShowcase (C6.3, C6.5)", () => {
     expect(JSON.stringify(await listShowcase(db))).not.toContain(unpromoted.runId);
   });
 
+  it("parses a guest whose text fields are emoji at the runner's caps and refuses one more, guarding against a zod change in how string length is counted", () => {
+    const emoji = "\u{1F600}";
+    const row = guest(1, {
+      name: emoji.repeat(200),
+      bringsNew: { segment: emoji.repeat(100), label: emoji.repeat(100), gap: 0.4 },
+      sharedTags: [emoji.repeat(40), emoji.repeat(200)],
+      angle: emoji.repeat(400),
+      showName: emoji.repeat(200),
+    });
+
+    expect(parseBoardGuest(JSON.stringify(row))).toEqual(row);
+    for (const over of [
+      { name: emoji.repeat(201) },
+      { bringsNew: { segment: emoji.repeat(101), label: "x", gap: 0.4 } },
+      { bringsNew: { segment: "x", label: emoji.repeat(101), gap: 0.4 } },
+      { sharedTags: [emoji.repeat(201)] },
+      { angle: emoji.repeat(401) },
+      { showName: emoji.repeat(201) },
+      { name: "" },
+    ]) {
+      expect(parseBoardGuest(JSON.stringify({ ...row, ...over })), JSON.stringify(Object.keys(over))).toBeNull();
+    }
+  });
+
   it("gives an empty list when nothing is promoted", async () => {
     await endedRun("done", [guest(1), guest(2), guest(3)]);
 
@@ -743,10 +798,13 @@ describe("listShowcase (C6.3, C6.5)", () => {
     for (const statement of statements) await db.query(statement);
   }
 
-  it("lets the app role read the showcase and refuses it every write (C6.3, C6.6)", async () => {
+  it("lets the app role read the showcase and refuses it every write, and lets it retime a brief claim but never move its ids (C6.3, C6.6)", async () => {
     const shown = await endedRun("done", [guest(1), guest(2), guest(3)]);
     const other = await endedRun("done", [guest(4), guest(5), guest(6)]);
     await promote(shown.runId, 1);
+    const claimed = shown.guestIds[0]!;
+    await claimBrief(db, shown.runId, claimed, 5, NOW);
+    await markBriefFailed(db, shown.runId, claimed, "MODEL_TIMEOUT");
     await applyRoles();
     const writes: Array<[string, unknown[]]> = [
       ["INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 2, now())", [other.runId]],
@@ -761,7 +819,21 @@ describe("listShowcase (C6.3, C6.5)", () => {
       await expect(db.query(text, params), text).rejects.toThrow(StoreError);
     }
     expect((await listShowcase(db)).map((run) => [run.runId, run.position])).toEqual([[shown.runId, 1]]);
+    // The retry is the app's own write of created_at.
+    expect(await claimBrief(db, shown.runId, claimed, 5, LATER)).toBe("claimed");
+    const claimIdWrites: Array<[string, unknown[]]> = [
+      ["UPDATE run_brief_claims SET run_id = $2::uuid WHERE run_id = $1::uuid", [shown.runId, other.runId]],
+      ["UPDATE run_brief_claims SET guest_id = $2::uuid WHERE run_id = $1::uuid", [shown.runId, crypto.randomUUID()]],
+    ];
+    for (const [text, params] of claimIdWrites) {
+      await expect(db.query(text, params), text).rejects.toThrow(StoreError);
+    }
     await db.query("RESET ROLE");
+    const claim = await db.query<{ run_id: string; guest_id: string; created_at: Date }>(
+      "SELECT run_id::text AS run_id, guest_id::text AS guest_id, created_at FROM run_brief_claims",
+    );
+    expect(claim.rows.map((row) => [row.run_id, row.guest_id, new Date(row.created_at)])).toEqual([[shown.runId, claimed, LATER]]);
+    for (const [text, params] of claimIdWrites) await db.query(text, params);
 
     // The same statements work for the owner, so each refusal above was the grant, not the SQL.
     const owner = await db.query<{ runId: string; position: number }>(

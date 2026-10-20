@@ -169,6 +169,36 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
     expect(((structured(body)["brief"] ?? {}) as { pitchBody: string }).pitchBody).toBe("Hello,\n\nWe would love to have you on.\n\nThanks");
   });
 
+  it("returns emoji at the full caps for candidates, guests and briefs, guarding against a zod change in how string length is counted", () => {
+    const emoji = "\u{1F600}";
+    const found = candidatesReply(items([candidateRow({ name: emoji.repeat(200), publisher: emoji.repeat(200), qlooName: emoji.repeat(200) })]));
+    expect(structured(found)["candidates"]).toEqual([
+      expect.objectContaining({ name: emoji.repeat(120), publisher: emoji.repeat(120), qlooName: emoji.repeat(120) }),
+    ]);
+
+    const tags = Array.from({ length: 5 }, () => emoji.repeat(40));
+    const board = boardReply(
+      RUN_ID,
+      items([1, 2, 3].map((n) => boardRow(n, { name: emoji.repeat(120), sharedTags: tags, angle: emoji.repeat(400), showName: emoji.repeat(120) }))),
+      APP_ORIGIN,
+    );
+    expect(structured(board)["showName"]).toBe(emoji.repeat(120));
+    const guests = structured(board)["guests"] as Array<{ name: string; sharedTags: string[]; angle: string }>;
+    expect(guests).toHaveLength(3);
+    for (const listed of guests) expect(listed).toMatchObject({ name: emoji.repeat(120), sharedTags: tags, angle: emoji.repeat(400) });
+
+    // One field at the full cap: two would pass the 16 KiB result cap, since an emoji is four UTF-8 bytes.
+    const brief = briefReply(RUN_ID, randomUUID(), storedBrief({ why: emoji.repeat(2_500), pitch_subject: emoji.repeat(500) }));
+    expect(structured(brief)["brief"]).toMatchObject({ why: emoji.repeat(2_000), pitchSubject: emoji.repeat(500) });
+  });
+
+  it("reads a stored pitch body of 30,000 characters and cuts it to 2,000, never upstream_failed", () => {
+    const result = briefReply(RUN_ID, randomUUID(), storedBrief({ pitch_body: "b".repeat(30_000) }));
+
+    expect(result.isError).toBeUndefined();
+    expect(((structured(result)["brief"] ?? {}) as { pitchBody: string }).pitchBody).toBe("b".repeat(2_000));
+  });
+
   it("cleans names the code filled into a stored brief, so a link inside a guest name never reaches the caller", () => {
     const result = briefReply(RUN_ID, randomUUID(), storedBrief({ why: "Book Ada https://evil.example/x today", pitch_body: "Write to bob@evil.example\nsoon" }));
     expect(textOf(result)).not.toContain("evil.example");

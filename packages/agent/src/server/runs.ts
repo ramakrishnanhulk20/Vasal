@@ -198,10 +198,12 @@ async function readData(db: Db, text: string, params: string[], maxLength: numbe
 /**
  * Creates a queued run and returns its id, a fresh crypto.randomUUID (122
  * random bits, never sequential, C6.1). `input` must be exactly
- * { show, exclude } with a show of 1 to 300 characters (String length, so
- * the caller normalises first) and at most 25 exclusions of 1 to 100
- * characters each. `origin` is stored with the run and decides which share
- * every later spend comes from (D3.2): { surface: "web" }, the default, or
+ * { show, exclude } with a show of 1 to 300 code points and at most 25
+ * exclusions of 1 to 100 code points each. zod counts these lengths in code
+ * points, the same way app.ts and mcp/tools.ts count the show, and checks
+ * the text as given, so the caller normalises first. `origin` is stored
+ * with the run and decides which share every later spend comes from
+ * (D3.2): { surface: "web" }, the default, or
  * { surface: "mcp", tokenId } with the id of the key row that asked for it
  * (D4.1), never the key. Throws ServerError("SRV_BAD_INPUT") for any other
  * input, origin or an invalid date, and ServerError("SRV_UNAVAILABLE") if
@@ -758,9 +760,10 @@ const briefClaimRow = z
  * - none: "limit" if the run already has `maxPerRun` claims, otherwise it
  *   inserts a pending claim with attempts 1 and returns "claimed";
  * - pending or done: "exists";
- * - failed after 1 attempt: one UPDATE moves it to pending with attempts 2,
- *   only WHERE status = 'failed' AND attempts = 1, and returns "claimed";
- *   the retry reuses the claim, so it does not count against the limit;
+ * - failed after 1 attempt: one UPDATE moves it to pending with attempts 2
+ *   and created_at `now`, only WHERE status = 'failed' AND attempts = 1, and
+ *   returns "claimed"; the retry reuses the claim, so it does not count
+ *   against the limit;
  * - failed after 2 attempts: "failed".
  * A claim row that fails its schema counts as "exists", so it never leads to
  * a model call (C6.5). Two requests at once queue on the lock and give one
@@ -797,11 +800,13 @@ export async function claimBrief(
         const claim = briefClaimRow.safeParse(held.rows[0]);
         if (!claim.success || claim.data.status !== "failed") return "exists";
         if (claim.data.attempts === MAX_BRIEF_ATTEMPTS) return "failed";
+        // created_at is when the current attempt was claimed, so a stale sweep
+        // with a threshold never fails a retry that has just started.
         const retried = await tx.query(
-          `UPDATE run_brief_claims SET status = 'pending', attempts = 2, error_code = NULL
+          `UPDATE run_brief_claims SET status = 'pending', attempts = 2, error_code = NULL, created_at = $3::timestamptz
            WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'failed' AND attempts = 1
            RETURNING guest_id`,
-          [id, guest],
+          [id, guest, now.toISOString()],
         );
         return retried.rows.length === 1 ? "claimed" : "exists";
       }
@@ -884,8 +889,9 @@ export async function markBriefFailed(db: Db, runId: string, guestId: string, co
 }
 
 /**
- * Startup step: marks every pending brief claim created more than
- * `olderThanMs` before `now` as failed with SERVER_RESTART, in one
+ * Startup step: marks every pending brief claim whose current attempt was
+ * claimed more than `olderThanMs` before `now` (a retry counts from its own
+ * claim, not the first attempt's) as failed with SERVER_RESTART, in one
  * statement, so a brief whose writer died with the last process is never
  * left pending (C6.4). Attempts are left as they are, so a first attempt
  * may still be retried once. Claims created at or after the cutoff, and done

@@ -42,11 +42,13 @@ GRANT SELECT ON inflight TO vasal_app;
 GRANT UPDATE (n) ON inflight TO vasal_app;
 
 -- Brief claims cannot be deleted, so a claim cannot be undone to spend again.
--- The app may move a claim's status, code and attempts. The table's check
--- stops attempts at 2; that attempts never go back down is held only by the
--- app's own UPDATE, which raises it from 1 to 2 and nothing else.
+-- The app may move a claim's status, code and attempts, and its created_at,
+-- which a retry resets so the stale sweep times the retry from its own claim.
+-- It can never move a claim to another run or guest. The table's check stops
+-- attempts at 2; that attempts never go back down is held only by the app's
+-- own UPDATE, which raises it from 1 to 2 and nothing else.
 GRANT SELECT, INSERT ON run_brief_claims TO vasal_app;
-GRANT UPDATE (status, attempts, error_code) ON run_brief_claims TO vasal_app;
+GRANT UPDATE (status, attempts, error_code, created_at) ON run_brief_claims TO vasal_app;
 
 -- The home page reads the showcase. Only the operator's promote command, run
 -- as the owner, can put a run on it or take one off (C6.3).

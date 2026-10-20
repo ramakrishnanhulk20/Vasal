@@ -35,9 +35,11 @@ const MAX_TAGS = 5;
 const MAX_CANDIDATES = 10;
 const MAX_GUESTS = 50;
 const MAX_QUESTIONS = 5;
-// Stored text far past any cap is cut by the caps anyway; this only bounds
-// the work spent cleaning a row that should never exist.
-const MAX_STORED_CHARS = 20_000;
+// The same bound putBrief stores a whole brief under (MAX_BRIEF_JSON in
+// runs.ts), so a filled brief that fits in storage is read and cut by
+// cleanForCaller rather than refused as upstream_failed. It still bounds the
+// work spent cleaning one field.
+const MAX_STORED_CHARS = 65_536;
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const APPLE_ID = /^[0-9]{1,20}$/;
 const APPLE_URL = /^https:\/\/podcasts\.apple\.com\/podcast\/id[0-9]{1,20}$/;
