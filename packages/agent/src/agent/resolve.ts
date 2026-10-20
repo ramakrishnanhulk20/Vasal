@@ -8,7 +8,7 @@ import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo } from "../qloo/metered.js";
 import type { QlooEntity } from "../qloo/schemas.js";
 import type { RunInput } from "../server/runs.js";
-import { stripBidiControls } from "../text/normalize.js";
+import { cleanText } from "../text/normalize.js";
 import { AgentError } from "./errors.js";
 
 export type ResolvedShow = {
@@ -30,11 +30,14 @@ const MAX_NAME_CHARS = 200;
 // id can always be sent back to Qloo later in the run.
 const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
 
-// Directory and Qloo text is written by strangers. It is shown to the
-// visitor, so direction controls go (C3.7) and length is capped by whole
-// code points.
+// Directory, feed and Qloo text is written by strangers and is shown to the
+// visitor and, as the Qloo name, told to the model, so it goes through the
+// shared cleaner when the candidate is built (C3.7, C2.8). It is trimmed
+// between cleaning and the cap, so spaces hidden behind an invisible
+// character never use up the cap.
 function clean(text: string): string {
-  return [...stripBidiControls(text).trim()].slice(0, MAX_NAME_CHARS).join("").trim();
+  const whole = cleanText(text, { maxChars: Number.POSITIVE_INFINITY }).trim();
+  return cleanText(whole, { maxChars: MAX_NAME_CHARS }).trim();
 }
 
 function fromDirectory(show: ShowCandidate): Listed {
@@ -95,8 +98,9 @@ async function feedTitle(
  * again through a fresh handle. Episode titles are not kept at this step.
  * Each candidate then gets one metered Qloo search (podcasts only, take 5)
  * and pickPodcastMatch; a candidate with no single match is dropped, never
- * guessed (C8.4). Names are cleaned of direction controls and capped at 200
- * characters.
+ * guessed (C8.4). Names, publishers and Qloo names go through cleanText
+ * (controls, invisible and direction characters removed, NFC) and are capped
+ * at 200 code points (C3.7).
  *
  * Throws AgentError SHOW_NOT_FOUND when the directory has nothing,
  * FEED_UNAVAILABLE when a pasted feed fails to fetch or parse (any

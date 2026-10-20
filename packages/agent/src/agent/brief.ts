@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { stripBidiControls } from "../text/normalize.js";
+import { cleanText } from "../text/normalize.js";
 import type { BoardEntry } from "./board.js";
 import { AgentError } from "./errors.js";
 import type { ModelClient } from "./model.js";
@@ -39,7 +39,7 @@ const RISING_WORDS: Record<BoardEntry["rising"]["state"], string> = {
 };
 
 function cleanFact(text: string): string {
-  return [...stripBidiControls(text).replace(/\s+/gu, " ").trim()].slice(0, MAX_FACT_CHARS).join("").trim();
+  return [...cleanText(text, { maxChars: Number.MAX_SAFE_INTEGER }).replace(/\s+/gu, " ").trim()].slice(0, MAX_FACT_CHARS).join("").trim();
 }
 
 // The model is given placeholders and what each stands for, never a name or

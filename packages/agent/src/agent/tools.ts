@@ -4,7 +4,7 @@ import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo } from "../qloo/metered.js";
 import type { EntityType, QlooOperation } from "../qloo/request.js";
 import type { QlooCompareTag, QlooDemographic, QlooEntity, QlooTrendRow } from "../qloo/schemas.js";
-import { stripBidiControls } from "../text/normalize.js";
+import { cleanText } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, StepSummary } from "./context.js";
 import { checkProse } from "./prose.js";
@@ -192,10 +192,13 @@ const isFiniteNumber = (value: unknown): value is number => typeof value === "nu
 const round2 = (value: number) => Math.round(value * 100) / 100 || 0;
 const isoDate = (date: Date) => date.toISOString().slice(0, 10);
 
-// Upstream text is cleaned once on the way in: direction controls go (C3.7),
-// and it is capped by whole code points so a character is never split.
-function cleanText(value: string, maxChars: number): string {
-  return [...stripBidiControls(value).trim()].slice(0, maxChars).join("").trim();
+// Upstream text is cleaned once on the way in by the shared cleaner, before
+// the model or a page sees it (C2.8, C3.7). It is trimmed between cleaning
+// and the cap, so spaces hidden behind an invisible character never use up
+// the cap.
+function cleanField(value: string, maxChars: number): string {
+  const whole = cleanText(value, { maxChars: Number.POSITIVE_INFINITY }).trim();
+  return cleanText(whole, { maxChars }).trim();
 }
 
 function step(ctx: RunContext, tool: StepSummary["tool"], ok: boolean, summary: string): void {
@@ -225,7 +228,7 @@ function listOf<T>(data: unknown): T[] {
 
 function recordPerson(ctx: RunContext, entity: QlooEntity, affinity: number | null): { personId: string; name: string } | null {
   if (!QLOO_ID.test(entity.entity_id)) return null;
-  const name = cleanText(entity.name, MAX_NAME_CHARS);
+  const name = cleanField(entity.name, MAX_NAME_CHARS);
   if (name === "") return null;
   const popularity = isFiniteNumber(entity.popularity) ? entity.popularity : null;
   const known = ctx.people.get(entity.entity_id);
@@ -342,7 +345,7 @@ const sharedTaste: Handler<"shared_taste"> = async (ctx, qloo, input) => {
     take: COMPARE_TAKE,
   });
   const tags = listOf<QlooCompareTag>(data)
-    .map((tag) => ({ name: cleanText(tag.name, MAX_NAME_CHARS), score: isFiniteNumber(tag.query?.score) ? tag.query.score : null }))
+    .map((tag) => ({ name: cleanField(tag.name, MAX_NAME_CHARS), score: isFiniteNumber(tag.query?.score) ? tag.query.score : null }))
     .filter((tag) => tag.name !== "");
   ctx.compares.set(input.personId, tags);
   const top = [...tags]
@@ -362,7 +365,7 @@ const upcomingReleases: Handler<"upcoming_releases"> = async (ctx, qloo, input, 
     ...(input.kind === "book" ? { publicationYearMin: today.getUTCFullYear() } : { releaseDateMin: isoDate(today) }),
   });
   const titles = listOf<QlooEntity>(data)
-    .map((entity) => cleanText(entity.name, MAX_TITLE_CHARS))
+    .map((entity) => cleanField(entity.name, MAX_TITLE_CHARS))
     .filter((title) => title !== "");
   step(ctx, "upcoming_releases", true, `found ${titles.length} upcoming ${RELEASE_WORDS[input.kind]}`);
   return { content: listContent("titles", titles), isError: false };
@@ -385,7 +388,7 @@ const findPerson: Handler<"find_person"> = async (ctx, qloo, input) => {
 const recentEpisodeTitles: Handler<"recent_episode_titles"> = async (ctx) => {
   const titles = ctx.episodeTitles
     .slice(0, MAX_EPISODE_TITLES)
-    .map((title) => cleanText(title, MAX_TITLE_CHARS))
+    .map((title) => cleanField(title, MAX_TITLE_CHARS))
     .filter((title) => title !== "");
   step(ctx, "recent_episode_titles", true, `shared ${titles.length} episode titles`);
   return { content: listContent("titles", titles), isError: false };
@@ -407,7 +410,10 @@ const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input) => {
       continue;
     }
     seen.add(pick.personId);
-    const check = checkProse(pick.angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [] });
+    // Cleaned before checkProse, so a link split by an invisible character is
+    // found and removed whole instead of being joined back up by a later clean.
+    const angle = cleanText(pick.angle, { maxChars: MAX_ANGLE_INPUT_CHARS });
+    const check = checkProse(angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [] });
     if (!check.ok) {
       rejected.push({ index, reason: check.reason ?? "empty" });
       continue;
@@ -456,7 +462,9 @@ async function dispatch<K extends ToolName>(
  * schema, and a personId no tool returned in this run are each refused with
  * no Qloo call (C2.2). Every attempt at a known tool counts toward its limit.
  * Qloo requests are built from checked fields only (C2.3). Content is JSON of
- * at most 4,000 characters (C2.8). A QlooError becomes an error outcome whose
+ * at most 4,000 characters, and every Qloo name, tag and title and every
+ * episode title in it has been through cleanText (C2.8). Angles are cleaned
+ * the same way before checkProse. A QlooError becomes an error outcome whose
  * content is only its code, never a message, URL or key (C2.6). Each call adds
  * one step summary of fixed words and counts, with no ids and no upstream
  * text, so it is safe to stream.

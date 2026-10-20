@@ -1,4 +1,4 @@
-import { normalizeName } from "../text/normalize.js";
+import { cleanText, normalizeName } from "../text/normalize.js";
 import type { Demographics, RunContext, SharedTag, TrendRow } from "./context.js";
 
 export type Rising = { state: "rising" | "steady" | "falling" | "unknown"; points: number | null };
@@ -28,6 +28,9 @@ const FALLING_AT_POINTS = -2;
 const HOUSEHOLD_NAME_AT = 0.95;
 const WELL_KNOWN_AT = 0.8;
 const SHARED_TAGS_SHOWN = 5;
+const MAX_NAME_CHARS = 120;
+const MAX_TAG_CHARS = 40;
+const MAX_ANGLE_CHARS = 400;
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -63,6 +66,15 @@ const byScoreDesc = (a: SharedTag, b: SharedTag) => {
   if (b.score === null) return -1;
   return b.score - a.score;
 };
+
+// The board is what gets stored and shown, so it cleans every name, tag and
+// angle itself rather than trusting whatever filled the context (C3.7,
+// D5.2). Trimming comes between cleaning and the cap, so spaces hidden behind
+// an invisible character never use up the cap.
+function cleanLine(text: string, maxChars: number): string {
+  const whole = cleanText(text, { maxChars: Number.POSITIVE_INFINITY }).trim();
+  return cleanText(whole, { maxChars }).trim();
+}
 
 /**
  * Turns weekly trending rows into rising, steady or falling. Takes the newest
@@ -156,9 +168,12 @@ export function reachFrom(popularity: number | null): BoardEntry["reach"] {
  * Computes the ranked guest board from the model's picks. Pure.
  *
  * A pick is kept only if its personId is one a tool returned in this run, it
- * is not a repeat of an earlier pick, and the person's name does not match an
- * exclusion. Names and exclusions both go through normalizeName, so case,
- * spacing and invisible characters do not matter (C2.7, C8.3). Every number
+ * is not a repeat of an earlier pick, and the person's cleaned name is not
+ * empty and does not match an exclusion. Names, shared tags and angles go
+ * through cleanText and are capped at 120, 40 and 400 code points (C3.7,
+ * D5.2). The exclusion check uses the cleaned name, the one the page shows,
+ * and both sides go through normalizeName, so case, spacing and invisible
+ * characters do not matter (C2.7, C8.3). Every number
  * comes from the context: fit is the Qloo affinity rounded to 2 decimals,
  * ranked highest first, ties broken by lower popularity and then by pick
  * order. A person with no affinity gets fit 0, fitKnown false, and ranks
@@ -174,12 +189,13 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
     const person = ctx.people.get(pick.personId);
     if (person === undefined || seen.has(pick.personId)) continue;
     seen.add(pick.personId);
-    if (excluded.has(normalizeName(person.name))) continue;
+    const name = cleanLine(person.name, MAX_NAME_CHARS);
+    if (name === "" || excluded.has(normalizeName(name))) continue;
     const { affinity } = person;
     kept.push({
       personId: pick.personId,
-      angle: pick.angle,
-      name: person.name,
+      angle: cleanLine(pick.angle, MAX_ANGLE_CHARS),
+      name,
       fit: isFiniteNumber(affinity) ? round2(affinity) : 0,
       fitKnown: isFiniteNumber(affinity),
       popularity: isFiniteNumber(person.popularity) ? person.popularity : null,
@@ -199,8 +215,9 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
     const personDemographics = ctx.personDemographics.get(entry.personId);
     const sharedTags = [...(ctx.compares.get(entry.personId) ?? [])]
       .sort(byScoreDesc)
-      .slice(0, SHARED_TAGS_SHOWN)
-      .map((tag) => tag.name);
+      .map((tag) => cleanLine(tag.name, MAX_TAG_CHARS))
+      .filter((tag) => tag !== "")
+      .slice(0, SHARED_TAGS_SHOWN);
     return {
       personId: entry.personId,
       name: entry.name,

@@ -1,5 +1,5 @@
 import { LinkifyIt, REBuilder } from "linkify-it";
-import { stripBidiControls } from "../text/normalize.js";
+import { cleanText } from "../text/normalize.js";
 
 export type ProseCheck = {
   ok: boolean;
@@ -40,7 +40,17 @@ const refuse = (reason: NonNullable<ProseCheck["reason"]>, removed: ProseCheck["
   reason,
 });
 
-function withoutLinks(text: string): { text: string; removed: ProseCheck["removed"] } {
+/**
+ * Removes every link, bare domain and email address linkify-it finds in
+ * `text` and counts them (C3.5, D5.3). The scan repeats until nothing is
+ * found, so a cut that joins two pieces into a new link is caught too. When
+ * anything was removed, runs of spaces (not newlines) collapse to one and the
+ * result is trimmed; otherwise `text` comes back unchanged. Clean the text
+ * with cleanText first, because an invisible character inside a link hides
+ * it from the scan. It does not catch spelled out forms such as "evil dot
+ * com". Never throws for a string.
+ */
+export function withoutLinks(text: string): { text: string; removed: ProseCheck["removed"] } {
   const removed = { links: 0, emails: 0 };
   let current = text;
   // Each pass removes at least one character, so this ends. It repeats
@@ -80,7 +90,9 @@ export function checkProse(raw: string, opts: { maxChars: number; placeholders: 
   const noneRemoved = { links: 0, emails: 0 };
   if (typeof raw !== "string") return refuse("empty", noneRemoved);
 
-  const trimmed = stripBidiControls(raw).trim();
+  // Cleaned before the link scan: a zero-width character inside "https://" hides a
+  // link from linkify-it, and cleaning only afterwards would hand the page a working URL.
+  const trimmed = cleanText(raw, { maxChars: Number.MAX_SAFE_INTEGER, keepNewlines: true }).trim();
   if (trimmed === "") return refuse("empty", noneRemoved);
   if ([...trimmed].length > opts.maxChars) return refuse("too_long", noneRemoved);
 

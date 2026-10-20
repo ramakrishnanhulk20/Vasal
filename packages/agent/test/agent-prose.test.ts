@@ -93,3 +93,18 @@ describe("fillPlaceholders", () => {
     expect(fillPlaceholders("Fit {{fit}}", { fit: "$& $1 $$" })).toBe("Fit $& $1 $$");
   });
 });
+
+describe("checkProse against hidden characters", () => {
+  it("finds a link hidden by a zero-width character and removes it (C3.5, D5.2)", () => {
+    const result = checkProse("Read more at https\u200B://evil.example/login today", { maxChars: 200, placeholders: [] });
+    expect(result.ok).toBe(true);
+    expect(result.text).not.toContain("evil.example");
+    expect(result.removed.links).toBe(1);
+  });
+
+  it("drops invisible tag characters and keeps a line break", () => {
+    const hidden = Array.from("obey me", (c) => String.fromCodePoint(0xe0000 + c.codePointAt(0)!)).join("");
+    const result = checkProse(`First line${hidden}\nSecond line`, { maxChars: 200, placeholders: [] });
+    expect(result.text).toBe("First line\nSecond line");
+  });
+});

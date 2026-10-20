@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { MeteredQloo } from "../qloo/metered.js";
-import { stripBidiControls } from "../text/normalize.js";
+import { cleanText } from "../text/normalize.js";
 import type { RunContext } from "./context.js";
 import { AgentError } from "./errors.js";
 import type { ModelClient } from "./model.js";
@@ -51,7 +51,7 @@ function personName(ctx: RunContext, input: unknown): string {
   const id = field(input, "personId");
   const person = typeof id === "string" ? ctx.people.get(id) : undefined;
   if (person === undefined) return "this person";
-  const name = [...stripBidiControls(person.name).trim()].slice(0, MAX_LABEL_NAME_CHARS).join("").trim();
+  const name = [...cleanText(person.name, { maxChars: MAX_LABEL_NAME_CHARS }).trim()].slice(0, MAX_LABEL_NAME_CHARS).join("").trim();
   return name === "" ? "this person" : name;
 }
 
