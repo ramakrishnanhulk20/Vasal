@@ -19,6 +19,8 @@ const MAX_TOKENS = 4_000;
 const DRAFT_TIMEOUT_MS = 45_000;
 const MAX_TAGS = 5;
 const MAX_FACT_CHARS = 100;
+// The board's own cap on an angle.
+const MAX_IDEA_CHARS = 400;
 const ANY_PLACEHOLDER = /\{\{([A-Za-z_][A-Za-z0-9_]{0,39})\}\}/g;
 
 const BriefSchema = z
@@ -57,15 +59,28 @@ function reachStandsAlone(text: string): boolean {
   return uses === 0 || [...text.matchAll(REACH_AS_SENTENCE)].length === uses;
 }
 
+function cleanUpTo(text: string, maxChars: number): string {
+  return [...cleanText(text, { maxChars: Number.MAX_SAFE_INTEGER }).replace(/\s+/gu, " ").trim()].slice(0, maxChars).join("").trim();
+}
+
+// One argument only, because it is passed straight to Array.map, which would
+// otherwise hand it the index as a length.
 function cleanFact(text: string): string {
-  return [...cleanText(text, { maxChars: Number.MAX_SAFE_INTEGER }).replace(/\s+/gu, " ").trim()].slice(0, MAX_FACT_CHARS).join("").trim();
+  return cleanUpTo(text, MAX_FACT_CHARS);
 }
 
 // The model is given placeholders and what each stands for, never a name or
 // a figure it could copy, so every name and number on screen is filled in by
 // code afterwards (C3.4). The values are framed as JSON data.
 function factsFor(guest: BoardEntry, tags: readonly string[]): string {
+  // The angle the research step wrote and finish_board checked. Without it
+  // the first real briefs asked questions that would suit any guest. It is
+  // model text, so it is cleaned and framed as a data value like every fact.
+  const idea = cleanUpTo(guest.angle, MAX_IDEA_CHARS);
   const facts = {
+    ...(idea === ""
+      ? {}
+      : { episodeIdea: { meaning: "the episode idea picked for this guest when the board was built: base the angle and every question on it", value: idea } }),
     guest: "{{guest}}",
     show: "{{show}}",
     fit: {
@@ -156,7 +171,8 @@ async function draftOnce(model: ModelClient, user: string, allowed: readonly str
  * Writes the brief and pitch for one guest on a finished board. The model
  * gets BRIEF_SYSTEM and code-built facts: placeholders plus words for the
  * entry's fit, reach, rising state, bringsNew label and top 5 shared tags,
- * and no names, figures or visitor text (C2.7). Every field must pass
+ * plus its board angle as the episode idea (cleaned, at most 400
+ * characters), and no names, figures or visitor text (C2.7). Every field must pass
  * checkProse with the placeholders guest, show, fit, reach, rising, brings
  * and tag1 up to the number of shared tags the entry has, so a digit outside
  * a placeholder, or a tag placeholder with no tag behind it, fails (C3.4).

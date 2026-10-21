@@ -206,6 +206,27 @@ describe("writeBrief wording", () => {
     expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toContain("so booking will take some work.");
   });
 
+  it("gives the model the board's angle as the episode idea, cleaned and capped, and leaves it out when empty", async () => {
+    const withIdea = fakeModel([GOOD]);
+    await writeBrief(withIdea.model, { guest: GUEST, showName: SHOW_NAME });
+    expect(factsOf(withIdea.calls[0]!.user)["episodeIdea"]).toEqual({
+      meaning: "the episode idea picked for this guest when the board was built: base the angle and every question on it",
+      value: GUEST.angle,
+    });
+    expect(BRIEF_SYSTEM).toContain("Base the angle and every question on the episode idea");
+
+    const long = fakeModel([GOOD]);
+    await writeBrief(long.model, { guest: { ...GUEST, angle: `  A ${"very ".repeat(120)}long​ idea  ` }, showName: SHOW_NAME });
+    const idea = (factsOf(long.calls[0]!.user)["episodeIdea"] as unknown as { value: string }).value;
+    expect([...idea].length).toBeLessThanOrEqual(400);
+    expect(idea.startsWith("A very")).toBe(true);
+    expect(idea).not.toContain("​");
+
+    const none = fakeModel([GOOD]);
+    await writeBrief(none.model, { guest: { ...GUEST, angle: "   " }, showName: SHOW_NAME });
+    expect(factsOf(none.calls[0]!.user)).not.toHaveProperty("episodeIdea");
+  });
+
   it("describes a shared tag to the model as a word for both audiences, not a thing", async () => {
     const { model, calls } = fakeModel([GOOD]);
     await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });

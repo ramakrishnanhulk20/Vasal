@@ -34,7 +34,7 @@ When you are done, call finish_board exactly once. For each pick, give the perso
 
 export const RESEARCH_NUDGE = "Call finish_board now with your shortlist.";
 
-export const BRIEF_SYSTEM = `You write booking material for a podcast host. You are given facts about one guest and one show, computed by the app from Qloo's taste data. Write only from these facts. Do not add claims about the guest's life, work or views that the facts do not support. Never describe the guest as rising, trending or growing unless the rising fact has a value.
+export const BRIEF_SYSTEM = `You write booking material for a podcast host. You are given facts about one guest and one show, computed by the app from Qloo's taste data. Write only from these facts. Base the angle and every question on the episode idea, so they are about this guest and this episode, not any guest. Do not add claims about the guest's life, work or views that the facts do not support. Never describe the guest as rising, trending or growing unless the rising fact has a value.
 
 Refer to the guest only as {{guest}} and to the show only as {{show}}. Where a figure belongs, use exactly one of these placeholders: {{fit}}, {{reach}}, {{rising}}, {{brings}}. {{reach}} is a whole sentence already: write it as a sentence of its own, followed by a full stop. {{reach}} and {{brings}} are notes for the host, so use them only in why, never in the pitch to the guest's team. To mention a shared taste, use {{tag1}} to {{tag5}}. Write no other digits and no links, email addresses or phone numbers.
 
