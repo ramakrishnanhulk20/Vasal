@@ -158,6 +158,7 @@ function printPlan(shows: ShowConfig[]): void {
     "Episode: has a public view count (hiddenViews).",
     `Episode: published from ${WINDOW_FROM} to ${WINDOW_TO} inclusive, UTC (notInWindow).`,
     `Episode: at least ${MIN_DURATION_SEC / 60} minutes long (tooShort).`,
+    "Episode: the model cannot read the title (extractFailed).",
     "Episode: the model names exactly one guest (noSingleGuest).",
     "Episode: that name appears in the title under the shared normaliser (nameNotInTitle).",
     "Episode: Qloo's top person result has the same normalised name (guestNotResolved).",

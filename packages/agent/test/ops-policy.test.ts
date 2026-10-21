@@ -41,7 +41,7 @@ describe("the shipped policy", () => {
           "qloo:day": ["day", 1_000],
           "qloo:day:offline": ["day", 6_000],
           "anthropic:day": ["day", 2_000_000],
-          "anthropic:day:offline": ["day", 1_500_000],
+          "anthropic:day:offline": ["day", 4_000_000],
           "youtube:day": ["day", 9_000],
           "qloo:day:mcp": ["day", 300],
           "qloo:month:mcp": ["month", 2_000],

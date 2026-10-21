@@ -1,3 +1,4 @@
+import { AgentError, type AgentErrorCode } from "../agent/errors.js";
 import { normalizeName } from "../text/normalize.js";
 import {
   isBeforeWindow,
@@ -19,6 +20,14 @@ const MAX_ID_LENGTH = 200;
 // YouTube titles are at most 100 characters, so a longer "name" can only
 // look like it is in the title because invisible characters were stripped.
 const MAX_GUEST_NAME_LENGTH = 300;
+// A reply that was cut off, failed the schema, timed out or was declined is
+// a failure on one title, so only that episode is dropped. Any other error,
+// MODEL_BUDGET above all, would hit every later title too, so it stops the
+// build rather than silently dropping the rest of the sample.
+const TITLE_READ_FAILURES: ReadonlySet<AgentErrorCode> = new Set(["MODEL_TRUNCATED", "AGENT_BAD_PROSE", "MODEL_TIMEOUT", "MODEL_REFUSED"]);
+// A run of failed reads means the model is unreachable, not that the titles
+// are hard, and dropping every later title would quietly shrink the sample.
+const MAX_FAILED_READS_IN_A_ROW = 20;
 
 export type FitScore = { affinity: number; popularity: number | null };
 
@@ -44,6 +53,7 @@ export type PipelineDeps = {
 type Person = { id: string; name: string };
 type NamedEpisode = { episode: Episode; guestName: string };
 type ResolvedEpisode = NamedEpisode & { person: Person };
+type Guest = Awaited<ReturnType<PipelineDeps["extractGuest"]>>;
 
 function emptyDrops(): DropCounts {
   return {
@@ -51,6 +61,7 @@ function emptyDrops(): DropCounts {
     notInWindow: 0,
     tooShort: 0,
     hiddenViews: 0,
+    extractFailed: 0,
     noSingleGuest: 0,
     nameNotInTitle: 0,
     guestNotResolved: 0,
@@ -100,7 +111,11 @@ function asScore(value: unknown): FitScore | null {
  * Per upload, in order: on a shared channel, a title that does not contain
  * the show's `titleMustContain` after normalizeName (notThisShow); no public
  * stats (hiddenViews); outside the window (notInWindow); under 20 minutes
- * or of unknown length (tooShort); not exactly one guest (noSingleGuest);
+ * or of unknown length (tooShort); the model's read of the title fails
+ * with AgentError MODEL_TRUNCATED, AGENT_BAD_PROSE, MODEL_TIMEOUT or
+ * MODEL_REFUSED (extractFailed), though the 20th such failure in a row,
+ * counted across the whole pull and reset by any read that succeeds, ends
+ * the build with that error; not exactly one guest (noSingleGuest);
  * the name not in the title (nameNotInTitle, C9.1); no Qloo person whose
  * normalised name equals the extracted one (guestNotResolved); no fit score
  * (noFitScore); no popularity in that same response (noFame). A show is
@@ -115,9 +130,10 @@ function asScore(value: unknown): FitScore | null {
  *
  * Throws RangeError when now() is not at least a day after the window ends,
  * because ages would be zero or negative. Throws Error when YouTube returns
- * a video that was not asked for or that belongs to another channel. Any
- * error from a dependency is passed through, so a failed call stops the
- * build instead of silently shrinking the sample.
+ * a video that was not asked for or that belongs to another channel. Apart
+ * from those four title read failures, any error from a dependency is
+ * passed through, MODEL_BUDGET included, so a failed call stops the build
+ * instead of silently shrinking the sample.
  */
 export async function buildDataset(shows: ShowConfig[], deps: PipelineDeps): Promise<Dataset> {
   const now = deps.now();
@@ -138,6 +154,20 @@ export async function buildDataset(shows: ShowConfig[], deps: PipelineDeps): Pro
     const matched = person !== null && normalizeName(person.name) === normalizeName(name) ? person : null;
     people.set(name, matched);
     return matched;
+  };
+
+  let failedReadsInARow = 0;
+  const readGuest = async (title: string): Promise<Guest | null> => {
+    try {
+      const guest = await deps.extractGuest(title);
+      failedReadsInARow = 0;
+      return guest;
+    } catch (error) {
+      if (!(error instanceof AgentError) || !TITLE_READ_FAILURES.has(error.code)) throw error;
+      failedReadsInARow += 1;
+      if (failedReadsInARow >= MAX_FAILED_READS_IN_A_ROW) throw error;
+      return null;
+    }
   };
 
   for (const show of shows) {
@@ -236,7 +266,11 @@ export async function buildDataset(shows: ShowConfig[], deps: PipelineDeps): Pro
         drops.tooShort += 1;
         continue;
       }
-      const guest = await deps.extractGuest(episode.title);
+      const guest = await readGuest(episode.title);
+      if (guest === null) {
+        drops.extractFailed += 1;
+        continue;
+      }
       if (guest.kind !== "one" || typeof guest.name !== "string") {
         drops.noSingleGuest += 1;
         continue;

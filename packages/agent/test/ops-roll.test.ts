@@ -85,6 +85,7 @@ describe("rollBuckets", () => {
     expect(await usage(db, "qloo:day")).toEqual({ cap: 1_000, used: 0, windowEnd: day });
     expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 6_000, used: 0, windowEnd: day });
     expect(await usage(db, "anthropic:day")).toEqual({ cap: 2_000_000, used: 0, windowEnd: day });
+    expect(await usage(db, "anthropic:day:offline")).toEqual({ cap: 4_000_000, used: 0, windowEnd: day });
     expect(await usage(db, "youtube:day")).toEqual({ cap: 9_000, used: 0, windowEnd: day });
     expect(await usage(db, "qloo:day:mcp")).toEqual({ cap: 300, used: 0, windowEnd: day });
     expect(await usage(db, "qloo:month:mcp")).toEqual({ cap: 2_000, used: 0, windowEnd: month });

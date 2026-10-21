@@ -1,14 +1,16 @@
 // Covers buildDataset with synthetic stub dependencies: the order of the
 // pre-registered rules, every drop counter, the fit batch cap, and that
 // YouTube is read only through the pinned channel. It does not cover the
-// real YouTube, Qloo or model adapters (not wired yet), how well the model
-// extracts names, or the statistics themselves (backtest-stats.test.ts).
+// real YouTube, Qloo or model adapters (backtest-live.test.ts and the
+// clients' own tests), how well the model extracts names, or the statistics
+// themselves (backtest-stats.test.ts).
 // Every id, name and score here is invented; no Qloo data is used.
 import { describe, expect, it } from "vitest";
+import { AgentError } from "../src/agent/errors.js";
 import { analyse } from "../src/backtest/analyse.js";
 import { buildDataset, type FitScore, type PipelineDeps } from "../src/backtest/pipeline.js";
 import { mulberry32 } from "../src/backtest/random.js";
-import type { Dataset, DatasetRow, ShowConfig, ShowOutcome } from "../src/backtest/types.js";
+import { DatasetSchema, type Dataset, type DatasetRow, type ShowConfig, type ShowOutcome } from "../src/backtest/types.js";
 
 const NOW = new Date("2026-10-19T00:00:00.000Z");
 const IN_WINDOW = "2025-06-01T12:00:00Z";
@@ -21,7 +23,8 @@ type Video = { videoId: string; title: string; publishedAt: string; durationSec:
 type World = {
   channels: Map<string, Video[]>;
   podcasts: Map<string, Array<{ id: string; name: string }>>;
-  guests: Map<string, Guest>;
+  // An Error is thrown by the fake extractor in place of an answer.
+  guests: Map<string, Guest | Error>;
   people: Map<string, Person | null>;
   fit: Map<string, FitScore>;
 };
@@ -52,7 +55,7 @@ function pinned(name: string, key: string | null, titleMustContain?: string): Sh
 // a test can tell it apart from the fame that fitScores returns.
 const SEARCH_POPULARITY = 0.99;
 
-function addVideo(world: World, key: string, video: Partial<Video> & { title: string }, guest?: Guest): Video {
+function addVideo(world: World, key: string, video: Partial<Video> & { title: string }, guest?: Guest | Error): Video {
   const list = world.channels.get(channelIdFor(key)) ?? [];
   world.channels.set(channelIdFor(key), list);
   const full: Video = {
@@ -145,7 +148,9 @@ function stubDeps(world: World, now: Date = NOW) {
     },
     async extractGuest(title) {
       calls.extracted.push(title);
-      return world.guests.get(title) ?? { kind: "none" };
+      const answer = world.guests.get(title);
+      if (answer instanceof Error) throw answer;
+      return answer ?? { kind: "none" };
     },
     async resolvePerson(name) {
       calls.resolved.push(name);
@@ -163,6 +168,17 @@ function stubDeps(world: World, now: Date = NOW) {
     now: () => now,
   };
   return { deps, calls };
+}
+
+// The hard titles come first in upload order, then 30 readable guest
+// episodes, so a kept show proves the build carried on past them. An answer
+// that is not an Error is a read that worked.
+function hardTitleWorld(answers: Array<Guest | Error>) {
+  const world = emptyWorld();
+  world.podcasts.set("Read Show", [{ id: "synthetic-podcast-read", name: "Read Show" }]);
+  for (const [i, answer] of answers.entries()) addVideo(world, "read", { title: `Hard Title ${i} | Synthetic Show read` }, answer);
+  for (let i = 0; i < 30; i += 1) addGuestEpisode(world, "read", `Remy Read${i}`);
+  return world;
 }
 
 // One run that trips every drop reason at least once.
@@ -193,6 +209,8 @@ function busyWorld() {
   addVideo(world, "main", { title: "Early Guest | Synthetic Show main", publishedAt: "2024-09-30T23:59:00Z" }, { kind: "one", name: "Early Guest" });
   addVideo(world, "main", { title: "Short Guest | Synthetic Show main", durationSec: 1_199 }, { kind: "one", name: "Short Guest" });
   addVideo(world, "main", { title: "Unknown Length | Synthetic Show main", durationSec: null }, { kind: "one", name: "Unknown Length" });
+  addVideo(world, "main", { title: "Cut off read | Synthetic Show main" }, new AgentError("MODEL_TRUNCATED"));
+  addVideo(world, "main", { title: "Unreadable read | Synthetic Show main" }, new AgentError("AGENT_BAD_PROSE"));
   addVideo(world, "main", { title: "Best of the year | Synthetic Show main" }, { kind: "none" });
   addVideo(world, "main", { title: "Ann Lee and Bo Park | Synthetic Show main" }, { kind: "several" });
   addVideo(world, "main", { title: "A mystery guest | Synthetic Show main" }, { kind: "one", name: "Invented Person" });
@@ -231,6 +249,7 @@ describe("buildDataset", () => {
       hiddenViews: 1,
       notInWindow: 1,
       tooShort: 2,
+      extractFailed: 2,
       noSingleGuest: 2,
       nameNotInTitle: 1,
       guestNotResolved: 2,
@@ -246,7 +265,7 @@ describe("buildDataset", () => {
       ["Main Show", "kept"],
       ["Small Show", "tooFewEpisodes"],
     ]);
-    expect(dataset.shows[3]).toMatchObject({ podcastId: "synthetic-podcast-main", uploadsRead: 73, eligibleEpisodes: 65, resolvedGuests: 63, rows: 61, cutShort: false });
+    expect(dataset.shows[3]).toMatchObject({ podcastId: "synthetic-podcast-main", uploadsRead: 75, eligibleEpisodes: 65, resolvedGuests: 63, rows: 61, cutShort: false });
     expect(dataset.rows).toHaveLength(61);
     expect(new Set(dataset.rows.map((row) => row.showName))).toEqual(new Set(["Main Show"]));
     expect(dataset.builtAt).toBe(NOW.toISOString());
@@ -417,6 +436,64 @@ describe("buildDataset", () => {
     expect(calls.findPodcasts).toEqual([]);
   });
 
+  it("drops a title the model cannot read as extractFailed and carries on with the rest of the show", async () => {
+    const codes = ["MODEL_TRUNCATED", "AGENT_BAD_PROSE", "MODEL_TIMEOUT", "MODEL_REFUSED"] as const;
+    const { deps, calls } = stubDeps(hardTitleWorld(codes.map((code) => new AgentError(code))));
+    const dataset = await buildDataset([pinned("Read Show", "read")], deps);
+
+    expect(dataset.drops).toEqual({ ...NO_DROPS, extractFailed: 4 });
+    expect(dataset.shows[0]).toMatchObject({ status: "kept", uploadsRead: 34, eligibleEpisodes: 30, rows: 30 });
+    expect(calls.extracted).toHaveLength(34);
+    expect(calls.resolved.some((name) => name.startsWith("Hard Title"))).toBe(false);
+  });
+
+  it("stops on MODEL_BUDGET instead of dropping every title after it", async () => {
+    const budget = new AgentError("MODEL_BUDGET");
+    const { deps, calls } = stubDeps(hardTitleWorld([new AgentError("MODEL_TRUNCATED"), budget]));
+
+    await expect(buildDataset([pinned("Read Show", "read")], deps)).rejects.toBe(budget);
+    expect(calls.extracted).toHaveLength(2);
+    expect(calls.resolved).toEqual([]);
+  });
+
+  it("passes on a plain Error, a look-alike carrying a dropped code, and every other AgentError", async () => {
+    for (const error of [
+      new Error("synthetic failure"),
+      Object.assign(new Error("synthetic look-alike"), { code: "MODEL_TRUNCATED" }),
+      new AgentError("MODEL_RATE_LIMIT"),
+      new AgentError("MODEL_OVERLOADED"),
+      new AgentError("MODEL_UPSTREAM"),
+      new AgentError("MODEL_AUTH"),
+    ]) {
+      const { deps } = stubDeps(hardTitleWorld([error]));
+      await expect(buildDataset([pinned("Read Show", "read")], deps)).rejects.toBe(error);
+    }
+  });
+
+  it("counts every failed read when one read that works breaks the run at 19", async () => {
+    const run = () => Array.from({ length: 19 }, () => new AgentError("MODEL_TIMEOUT"));
+    const { deps } = stubDeps(hardTitleWorld([...run(), { kind: "none" }, ...run()]));
+    const dataset = await buildDataset([pinned("Read Show", "read")], deps);
+
+    expect(dataset.drops).toEqual({ ...NO_DROPS, extractFailed: 38, noSingleGuest: 1 });
+    expect(dataset.shows[0]).toMatchObject({ status: "kept", uploadsRead: 69, rows: 30 });
+  });
+
+  it("stops on the 20th failed read in a row with that read's error, also when the run spans two shows", async () => {
+    const run = Array.from({ length: 20 }, (_, i) => new AgentError(i % 2 === 0 ? "MODEL_TIMEOUT" : "MODEL_TRUNCATED"));
+    const { deps, calls } = stubDeps(hardTitleWorld(run));
+    await expect(buildDataset([pinned("Read Show", "read")], deps)).rejects.toBe(run[19]);
+    expect(calls.extracted).toHaveLength(20);
+
+    const world = emptyWorld();
+    world.podcasts.set("First Show", [{ id: "synthetic-podcast-first", name: "First Show" }]);
+    world.podcasts.set("Second Show", [{ id: "synthetic-podcast-second", name: "Second Show" }]);
+    for (let i = 0; i < 30; i += 1) addGuestEpisode(world, "first", `Remy First${i}`);
+    for (const [i, error] of run.entries()) addVideo(world, i < 10 ? "first" : "second", { title: `Hard Title ${i} | Synthetic Show` }, error);
+    const shows = [pinned("First Show", "first"), pinned("Second Show", "second")];
+    await expect(buildDataset(shows, stubDeps(world).deps)).rejects.toBe(run[19]);
+  });
+
   it("stops when YouTube returns a video from another channel", async () => {
     const world = emptyWorld();
     world.podcasts.set("Mixed Show", [{ id: "synthetic-podcast-mixed", name: "Mixed Show" }]);
@@ -440,6 +517,7 @@ const NO_DROPS = {
   notInWindow: 0,
   tooShort: 0,
   hiddenViews: 0,
+  extractFailed: 0,
   noSingleGuest: 0,
   nameNotInTitle: 0,
   guestNotResolved: 0,
@@ -553,6 +631,14 @@ describe("analyse", () => {
     expect(result.drops).toEqual(dataset.drops);
     expect(result.showOutcomes).toEqual(dataset.shows);
     expect(result.sample).toEqual({ shows: 1, episodes: 61 });
+  });
+
+  it("needs extractFailed in a stored dataset, so one written before the counter existed is refused", () => {
+    const dataset = syntheticDataset(6, 1);
+    expect(DatasetSchema.safeParse(dataset).success).toBe(true);
+    const olderDrops: Record<string, number> = { ...dataset.drops };
+    delete olderDrops["extractFailed"];
+    expect(DatasetSchema.safeParse({ ...dataset, drops: olderDrops }).success).toBe(false);
   });
 
   it("refuses a stored dataset that breaks the inclusion rule", () => {

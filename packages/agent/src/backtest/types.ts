@@ -75,6 +75,7 @@ export const DropCountsSchema = z
     notInWindow: Count,
     tooShort: Count,
     hiddenViews: Count,
+    extractFailed: Count,
     noSingleGuest: Count,
     nameNotInTitle: Count,
     guestNotResolved: Count,

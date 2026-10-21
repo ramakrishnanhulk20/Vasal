@@ -28,11 +28,11 @@ function fakeModel(answer: unknown) {
 }
 
 describe("createGuestExtractor", () => {
-  it("returns the one guest a title names, sending the title as the user text", async () => {
+  it("returns the one guest a title names, trimmed, sending the title as the user text with 1,024 max tokens", async () => {
     const { extract, calls } = fakeModel({ kind: "one", name: " Michael Douglas " });
 
     expect(await extract("#2040 - Michael Douglas")).toEqual({ kind: "one", name: "Michael Douglas" });
-    expect(calls).toEqual([{ system: EXTRACT_SYSTEM, user: "#2040 - Michael Douglas", schema: calls[0]!.schema, maxTokens: 200 }]);
+    expect(calls).toEqual([{ system: EXTRACT_SYSTEM, user: "#2040 - Michael Douglas", schema: calls[0]!.schema, maxTokens: 1_024 }]);
   });
 
   it("passes several and none through, ignoring any name sent with them", async () => {
@@ -40,11 +40,14 @@ describe("createGuestExtractor", () => {
     expect(await fakeModel({ kind: "none", name: null }).extract("Best of the year")).toEqual({ kind: "none" });
   });
 
-  it("refuses one with an empty, missing or too long name", async () => {
+  it("treats one with a null, empty or blank name as none", async () => {
+    for (const name of [null, "", "   "]) {
+      expect(await fakeModel({ kind: "one", name }).extract("Synthetic Whistleblower: a warning")).toEqual({ kind: "none" });
+    }
+  });
+
+  it("refuses a too long name, an unknown kind and an extra field", async () => {
     for (const answer of [
-      { kind: "one", name: "" },
-      { kind: "one", name: "   " },
-      { kind: "one", name: null },
       { kind: "one", name: "x".repeat(101) },
       { kind: "maybe", name: "Dax" },
       { kind: "one", name: "Dax", extra: true },

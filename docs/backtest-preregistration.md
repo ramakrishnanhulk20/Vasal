@@ -84,3 +84,8 @@ If fewer than 6 shows pass, we report "insufficient data" and make no claim abou
   3. Hot Ones and Conan O'Brien Needs A Friend share their YouTube channels with other shows (First We Feast and Team Coco). On those two channels an episode counts only if its normalised title contains the show's normalised name. The rule is set in docs/backtest-shows.json as `titleMustContain`.
   4. Fame is the guest's Qloo popularity percentile from the same /v2/insights response that gives the fit score, as written above. At most the 2,000 most recent uploads per channel are read. A channel whose 2,000th upload is still inside the window is reported as cut short.
   SmartLess has no official full-episode channel that a permitted source links, so its channel id is null and it is excluded by the existing rule.
+- 21 Oct 2026, after the Qloo key arrived and before any data pull: a pre-flight ran the title reader on 12 real titles from two pinned channels. Only titles and the names read from them were looked at, never views or fit.
+  1. The reader's output allowance rises from 200 to 1,024 tokens, because on 3 of the 12 titles the model's thinking used up all 200 before it answered.
+  2. A "one guest" answer that gives no name counts as no single guest.
+  3. A title the model cannot read (its reply is cut off, unreadable or declined, or the call times out) is dropped and counted as extractFailed, rather than ending the pull. Twenty failed reads in a row still end it, because that means the model is unreachable, and going on would quietly shrink the sample.
+  None of these looks at any outcome data.

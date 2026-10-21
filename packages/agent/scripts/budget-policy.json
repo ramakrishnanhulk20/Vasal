@@ -5,7 +5,7 @@
     "A profile covers its from date up to, but not including, its to date, in UTC. Profiles may touch but must not overlap.",
     "qloo:month is the hard ceiling for every Qloo call, from the site, the agent and the offline scripts alike. The day buckets only spread that month out. qloo:day is the share for live runs on the site. qloo:day:offline is the share for the backtest and the seed script, which still count against the same month and the same per-second limit.",
     "The judging reserve comes from the split across the two profiles. October keeps the public share small and gives the offline share room for the backtest pull. November's day shares (1,400 public, 300 MCP, 300 offline) add up to 2,000 a day, so the 15 judging days (2 to 16 Nov) fit inside its 32,000 even if every day runs at its cap.",
-    "anthropic:day:offline is the model-token share for the backtest title reads (about 500 tokens a title), kept apart from anthropic:day so a data pull never uses up the tokens live runs need.",
+    "anthropic:day:offline is the model-token share for the backtest title reads, kept apart from anthropic:day so a data pull never uses up the tokens live runs need. Each read reserves its full 1,024-token output allowance plus the prompt, about 1,560 tokens, while real use in the 21 Oct pre-flight was about 680. So the 1,865 reads of the October pull reserve about 2.9 million, and October's 4,000,000 leaves room for that one pull.",
     "anthropic:day counts model tokens and youtube:day counts YouTube Data API units. Google's free daily quota is 10,000 units, so 9,000 leaves a margin for calls made outside this meter.",
     "The MCP door has its own shares, so agents can never spend what the website needs. qloo:day:mcp is MCP's daily Qloo share and qloo:month:mcp its own month, well under qloo:month; every MCP call also counts against qloo:month and the per-second limit. anthropic:day:mcp is MCP's model-token share. mcp:keys:day caps how many agent keys are issued in a day across all visitors. October keeps MCP small while it is new; November raises it for judging."
   ],
@@ -38,7 +38,7 @@
         {
           "key": "anthropic:day:offline",
           "window": "day",
-          "cap": 1500000
+          "cap": 4000000
         },
         {
           "key": "youtube:day",
