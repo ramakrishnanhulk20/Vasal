@@ -571,6 +571,25 @@ describe("createYouTubeClient", () => {
     }
   });
 
+  it("reads a scheduled premiere with no duration yet as unknown length, instead of failing the whole batch", async () => {
+    const [premiere, normal] = [5, 6].map(videoId) as [string, string];
+    const { fetchImpl } = fakeFetch(() =>
+      json(200, {
+        items: [
+          { ...videoItem(premiere, "0"), contentDetails: {}, snippet: { ...videoItem(premiere).snippet, liveBroadcastContent: "upcoming" } },
+          videoItem(normal),
+        ],
+      }),
+    );
+
+    const stats = await client(fetchImpl).videoStats([premiere, normal]);
+
+    expect(stats.map((row) => [row.videoId, row.durationSec])).toEqual([
+      [premiere, null],
+      [normal, 3723],
+    ]);
+  });
+
   it("drops a video whose view count is hidden instead of reading it as 0", async () => {
     const [visibleZero, hidden, noStatistics, oddDuration] = [1, 2, 3, 4].map(videoId) as [string, string, string, string];
     const { fetchImpl } = fakeFetch(() =>

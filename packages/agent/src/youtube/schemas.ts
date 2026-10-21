@@ -87,7 +87,10 @@ const VideosSchema = z
             // A channel can hide its counts; then viewCount is absent and the
             // caller drops the video rather than read it as 0.
             statistics: z.object({ viewCount: ViewCount.optional() }).passthrough().optional(),
-            contentDetails: z.object({ duration: z.string() }).passthrough(),
+            // A scheduled premiere or live stream has no duration until it
+            // airs. The first live pull met one (Club Shay Shay, 21 Oct 2026)
+            // and stopped, so a missing duration reads as unknown length.
+            contentDetails: z.object({ duration: z.string().optional() }).passthrough(),
           })
           .passthrough(),
       )

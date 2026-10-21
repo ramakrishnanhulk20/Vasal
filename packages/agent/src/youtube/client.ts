@@ -323,7 +323,7 @@ export function createYouTubeClient(opts: YouTubeClientOptions): YouTubeClient {
             title: item.snippet.title,
             publishedAt: item.snippet.publishedAt,
             viewCount,
-            durationSec: isoDurationSeconds(item.contentDetails.duration),
+            durationSec: item.contentDetails.duration === undefined ? null : isoDurationSeconds(item.contentDetails.duration),
           });
         }
       }
