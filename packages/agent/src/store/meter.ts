@@ -14,9 +14,11 @@ const MAX_WAIT_LIMIT_MS = 60_000;
 const QLOO_MONTH = "qloo:month";
 const QLOO_DAY = "qloo:day";
 const QLOO_SECOND_PREFIX = "qloo:second:";
-// Qloo allows about 5 calls a second. Holding back one leaves room for small
-// clock differences between the hosts that share a second (C5.2).
-const QLOO_PER_SECOND_CAP = 4;
+// Qloo's own headers report 10 calls a second (key day, 21 Oct). Holding back
+// two leaves room for clock differences between the hosts that share a second
+// and for calls this meter never sees, such as the harness's own (C5.2).
+/** How many Qloo calls the meter lets through in one UTC second, across every share. */
+export const QLOO_PER_SECOND_CAP = 8;
 const SECOND_BUCKET_LIFETIME_MS = 2_000;
 // A surface's own month or day cap under the shared ones, such as
 // qloo:month:mcp. The third word is required, so the shared qloo:month and

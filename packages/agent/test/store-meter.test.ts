@@ -7,6 +7,7 @@ import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
 import {
   pruneSecondBuckets,
+  QLOO_PER_SECOND_CAP,
   reserve,
   reserveQlooCall,
   setBucket,
@@ -170,17 +171,19 @@ describe("setBucket", () => {
 });
 
 describe("reserveQlooCall", () => {
-  it("allows exactly 4 calls in one second, refuses a 5th, and allows one a second later (C5.2)", async () => {
+  it("allows exactly the per-second cap in one second, refuses one more, and allows one a second later (C5.2)", async () => {
     await openQlooBuckets(100, 1_000);
-    const sameSecond = [0, 200, 400, 600, 899].map((ms) => new Date(NOW.getTime() + ms));
+    const sameSecond = Array.from({ length: QLOO_PER_SECOND_CAP + 1 }, (_, k) =>
+      new Date(NOW.getTime() + Math.floor((k * 899) / QLOO_PER_SECOND_CAP)),
+    );
 
     const results: boolean[] = [];
     for (const at of sameSecond) results.push(await reserveQlooCall(db, at));
 
-    expect(results).toEqual([true, true, true, true, false]);
+    expect(results).toEqual([...Array<boolean>(QLOO_PER_SECOND_CAP).fill(true), false]);
     expect(await reserveQlooCall(db, new Date(NOW.getTime() + 1_000))).toBe(true);
-    expect(await usedOf("qloo:day")).toBe(5);
-    expect(await usedOf("qloo:month")).toBe(5);
+    expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP + 1);
+    expect(await usedOf("qloo:month")).toBe(QLOO_PER_SECOND_CAP + 1);
   });
 
   it("returns false in a fresh second once the day bucket is full", async () => {
@@ -215,7 +218,7 @@ describe("waitForQlooSlot", () => {
   }
 
   async function fillSecond(at: Date): Promise<void> {
-    for (let i = 0; i < 4; i += 1) expect(await reserveQlooCall(db, at)).toBe(true);
+    for (let i = 0; i < QLOO_PER_SECOND_CAP; i += 1) expect(await reserveQlooCall(db, at)).toBe(true);
   }
 
   it("waits into the next second when only the per-second bucket is full", async () => {
@@ -225,7 +228,7 @@ describe("waitForQlooSlot", () => {
 
     expect(await waitForQlooSlot(db, { now: time.now, sleep: time.sleep })).toBe(true);
     expect(time.sleeps).toEqual([900]);
-    expect(await usedOf("qloo:day")).toBe(5);
+    expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP + 1);
   });
 
   it("returns false at once when the day bucket is full", async () => {
@@ -251,7 +254,7 @@ describe("waitForQlooSlot", () => {
 
     expect(ok).toBe(false);
     expect(sleeps).toEqual([900, 900, 900]);
-    expect(await usedOf("qloo:day")).toBe(4);
+    expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP);
   });
 });
 
@@ -301,17 +304,11 @@ describe("offline Qloo share (dayKey)", () => {
     await openQlooBuckets(100, 1_000);
     await openOfflineShare(50);
 
-    const results = [
-      await reserveQlooCall(db, NOW),
-      await reserveQlooCall(db, NOW, OFFLINE),
-      await reserveQlooCall(db, NOW),
-      await reserveQlooCall(db, NOW, OFFLINE),
-      await reserveQlooCall(db, NOW, OFFLINE),
-      await reserveQlooCall(db, NOW),
-    ];
+    const results: boolean[] = [];
+    for (let k = 0; k < QLOO_PER_SECOND_CAP + 2; k += 1) results.push(await reserveQlooCall(db, NOW, ...(k % 2 === 1 ? [OFFLINE] : [])));
 
-    expect(results).toEqual([true, true, true, true, false, false]);
-    expect(await usedOf("qloo:month")).toBe(4);
+    expect(results).toEqual([...Array<boolean>(QLOO_PER_SECOND_CAP).fill(true), false, false]);
+    expect(await usedOf("qloo:month")).toBe(QLOO_PER_SECOND_CAP);
   });
 
   it("waitForQlooSlot draws on the share it is given and gives up at once when that share is full", async () => {

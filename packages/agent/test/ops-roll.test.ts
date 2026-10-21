@@ -81,13 +81,13 @@ describe("rollBuckets", () => {
 
     const day = at("2026-10-20T00:00:00.000Z");
     const month = at("2026-11-01T00:00:00.000Z");
-    expect(await usage(db, "qloo:month")).toEqual({ cap: 9_000, used: 0, windowEnd: month });
-    expect(await usage(db, "qloo:day")).toEqual({ cap: 300, used: 0, windowEnd: day });
-    expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 4_000, used: 0, windowEnd: day });
+    expect(await usage(db, "qloo:month")).toEqual({ cap: 12_000, used: 0, windowEnd: month });
+    expect(await usage(db, "qloo:day")).toEqual({ cap: 1_000, used: 0, windowEnd: day });
+    expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 6_000, used: 0, windowEnd: day });
     expect(await usage(db, "anthropic:day")).toEqual({ cap: 2_000_000, used: 0, windowEnd: day });
     expect(await usage(db, "youtube:day")).toEqual({ cap: 9_000, used: 0, windowEnd: day });
-    expect(await usage(db, "qloo:day:mcp")).toEqual({ cap: 150, used: 0, windowEnd: day });
-    expect(await usage(db, "qloo:month:mcp")).toEqual({ cap: 1_500, used: 0, windowEnd: month });
+    expect(await usage(db, "qloo:day:mcp")).toEqual({ cap: 300, used: 0, windowEnd: day });
+    expect(await usage(db, "qloo:month:mcp")).toEqual({ cap: 2_000, used: 0, windowEnd: month });
     expect(await usage(db, "anthropic:day:mcp")).toEqual({ cap: 500_000, used: 0, windowEnd: day });
     expect(await usage(db, "mcp:keys:day")).toEqual({ cap: 50, used: 0, windowEnd: day });
   });
@@ -116,9 +116,9 @@ describe("rollBuckets", () => {
     const next = rolled(await rollAt("2026-10-20T00:00:00.000Z"));
 
     expect(next["qloo:day"]?.changed).toEqual(["window"]);
-    expect(await usage(db, "qloo:day")).toEqual({ cap: 300, used: 0, windowEnd: at("2026-10-21T00:00:00.000Z") });
+    expect(await usage(db, "qloo:day")).toEqual({ cap: 1_000, used: 0, windowEnd: at("2026-10-21T00:00:00.000Z") });
     expect(next["qloo:month"]?.changed).toEqual([]);
-    expect(await usage(db, "qloo:month")).toEqual({ cap: 9_000, used: 7, windowEnd: at("2026-11-01T00:00:00.000Z") });
+    expect(await usage(db, "qloo:month")).toEqual({ cap: 12_000, used: 7, windowEnd: at("2026-11-01T00:00:00.000Z") });
   });
 
   it("moves to the next profile's caps and a fresh month on the first of the month", async () => {
@@ -130,9 +130,9 @@ describe("rollBuckets", () => {
 
     expect(outcome.covered && outcome.profile).toEqual({ from: "2026-11-01", to: "2026-12-01" });
     expect(next["qloo:month"]?.changed).toEqual(["cap", "window"]);
-    expect(await usage(db, "qloo:month")).toEqual({ cap: 9_500, used: 0, windowEnd: at("2026-12-01T00:00:00.000Z") });
-    expect(await usage(db, "qloo:day")).toEqual({ cap: 600, used: 0, windowEnd: at("2026-11-02T00:00:00.000Z") });
-    expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 500, used: 0, windowEnd: at("2026-11-02T00:00:00.000Z") });
+    expect(await usage(db, "qloo:month")).toEqual({ cap: 32_000, used: 0, windowEnd: at("2026-12-01T00:00:00.000Z") });
+    expect(await usage(db, "qloo:day")).toEqual({ cap: 1_400, used: 0, windowEnd: at("2026-11-02T00:00:00.000Z") });
+    expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 300, used: 0, windowEnd: at("2026-11-02T00:00:00.000Z") });
   });
 
   it("applies a retuned cap at once inside a live window without touching used", async () => {
@@ -151,7 +151,7 @@ describe("rollBuckets", () => {
   it("reports a live window set some other way, and leaves it until it ends", async () => {
     const devWindow = at("2026-11-18T00:00:00.000Z");
     vi.setSystemTime(at("2026-10-19T09:00:00.000Z"));
-    await setBucket(db, { key: "qloo:day", cap: 300, windowEnd: devWindow });
+    await setBucket(db, { key: "qloo:day", cap: 1_000, windowEnd: devWindow });
 
     const next = rolled(await rollAt("2026-10-19T10:00:00.000Z"));
 

@@ -35,7 +35,7 @@ A2. Attacks on the XML parser, in F3. A feed is untrusted XML. External entities
 
 A3. Indirect prompt injection and too much agency, in F4. Episode titles and show notes, YouTube titles and descriptions, directory metadata and Qloo entity names all go back into the model, which then picks the next tool, its arguments, and the prose. Text in any of them can steer it: loop on tools, fetch an internal URL, spend hundreds of Qloo calls, plant a phishing link or false claims in the pitch. The visitor's show-name field is a direct injection channel too. Applies strongly. The design's strength is that ranking and numbers are computed in code, which limits what injection can fake, but only if the code enforces it.
 
-A4. Burning the operator's money and quota, in F1, F4 and F7. Anyone can start a run. Each run spends Qloo calls from a shared pool of about 10,000 a month at about 5 a second, plus Anthropic credit and YouTube quota. At 5 calls a second the month's Qloo pool is gone in about 33 minutes, and a day's share in about a minute. Things that multiply this:
+A4. Burning the operator's money and quota, in F1, F4 and F7. Anyone can start a run. Each run spends Qloo calls from a shared pool of 50,000 a month at 10 a second (Qloo's own rate-limit headers, read on key day, 21 Oct 2026), plus Anthropic credit and YouTube quota. At 10 calls a second the month's Qloo pool is gone in about 83 minutes, and a day's public share in under three minutes. Things that multiply this:
 - model loops (A3)
 - crawlers or link prefetching hitting anything that starts work on a GET
 - other websites making their visitors' browsers POST to the start endpoint, which spreads one attacker across thousands of IP addresses
@@ -124,7 +124,7 @@ Indirect:
 
 ### Privileged position and assets
 - The secrets: the Qloo key, the Anthropic key, the YouTube key and the database URL. The database URL means write access to everything.
-- Spending power no visitor has directly: the shared Qloo quota (about 10,000 calls a month at about 5 a second, also used by the operator's scripts), the operator's Anthropic credit, and the YouTube quota (the default daily units are to be checked against Google's current table).
+- Spending power no visitor has directly: the shared Qloo quota (50,000 calls a month at 10 a second, also used by the operator's scripts), the operator's Anthropic credit, and the YouTube quota (the default daily units are to be checked against Google's current table).
 - Network position: the outbound connection of a Vercel function or a container. On Railway or Fly that includes a private network with the operator's other services, and on every host it includes loopback-only services.
 - Write access to the shared database: cache, runs, counters. Read access to the kill switch.
 - The product's domain and reputation: content at product URLs, the showcase on the home page, and pitch drafts a host may send under their own name.

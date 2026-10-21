@@ -26,7 +26,7 @@ function issuesOf(raw: unknown): string[] {
 }
 
 describe("the shipped policy", () => {
-  it("loads and holds the starting numbers for October and November", async () => {
+  it("loads and holds the key-day numbers for October and November", async () => {
     const policy = await loadPolicy(SHIPPED);
     const caps = policy.profiles.map((p) => ({
       range: `${p.from}..${p.to}`,
@@ -37,14 +37,14 @@ describe("the shipped policy", () => {
       {
         range: "2026-10-01..2026-11-01",
         caps: {
-          "qloo:month": ["month", 9_000],
-          "qloo:day": ["day", 300],
-          "qloo:day:offline": ["day", 4_000],
+          "qloo:month": ["month", 12_000],
+          "qloo:day": ["day", 1_000],
+          "qloo:day:offline": ["day", 6_000],
           "anthropic:day": ["day", 2_000_000],
           "anthropic:day:offline": ["day", 1_500_000],
           "youtube:day": ["day", 9_000],
-          "qloo:day:mcp": ["day", 150],
-          "qloo:month:mcp": ["month", 1_500],
+          "qloo:day:mcp": ["day", 300],
+          "qloo:month:mcp": ["month", 2_000],
           "anthropic:day:mcp": ["day", 500_000],
           "mcp:keys:day": ["day", 50],
         },
@@ -52,14 +52,14 @@ describe("the shipped policy", () => {
       {
         range: "2026-11-01..2026-12-01",
         caps: {
-          "qloo:month": ["month", 9_500],
-          "qloo:day": ["day", 600],
-          "qloo:day:offline": ["day", 500],
+          "qloo:month": ["month", 32_000],
+          "qloo:day": ["day", 1_400],
+          "qloo:day:offline": ["day", 300],
           "anthropic:day": ["day", 3_000_000],
           "anthropic:day:offline": ["day", 500_000],
           "youtube:day": ["day", 9_000],
-          "qloo:day:mcp": ["day", 200],
-          "qloo:month:mcp": ["month", 2_500],
+          "qloo:day:mcp": ["day", 300],
+          "qloo:month:mcp": ["month", 4_500],
           "anthropic:day:mcp": ["day", 1_000_000],
           "mcp:keys:day": ["day", 100],
         },
@@ -67,6 +67,18 @@ describe("the shipped policy", () => {
     ]);
     expect(policy.notes?.join(" ")).toContain("judging");
     expect(policy.notes?.join(" ")).toContain("qloo:month:mcp");
+  });
+
+  it("fits both calendar months inside the one Qloo month that runs from key day to 20 Nov, and the judging days inside November", async () => {
+    const policy = await loadPolicy(SHIPPED);
+    const capOf = (p: (typeof policy.profiles)[number], key: string) => p.buckets.find((b) => b.key === key)?.cap ?? Number.NaN;
+    const [october, november] = policy.profiles as [(typeof policy.profiles)[number], (typeof policy.profiles)[number]];
+    // 49,498 were left after the key-day probes; about 5,000 stays free for
+    // local runs, which the production meter never sees.
+    expect(capOf(october, "qloo:month") + capOf(november, "qloo:month")).toBeLessThanOrEqual(44_500);
+    const judgingDays = 15;
+    const perDay = capOf(november, "qloo:day") + capOf(november, "qloo:day:mcp") + capOf(november, "qloo:day:offline");
+    expect(perDay * judgingDays).toBeLessThanOrEqual(capOf(november, "qloo:month"));
   });
 
   it("keeps MCP's own month well under the shared ceiling and its day share under the website's, in every profile (D3.3)", async () => {

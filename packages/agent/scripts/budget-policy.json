@@ -1,10 +1,10 @@
 {
   "notes": [
     "Caps for every metered budget, by date. scripts/ops.ts budgets reads this file and sets the profile that covers today. Run it every day, because a day bucket whose window has ended refuses every call until it is rolled.",
-    "These are starting numbers. Retune them on key day once Qloo's real quota is known, then run budgets again: a new cap takes effect at once, while used and the window end stay as they are until the window ends.",
+    "Tuned on key day, 21 Oct 2026, to the quota Qloo's own headers report: 50,000 calls a month and 10 a second. Qloo's month started at the key's first call (21 Oct, 05:50 UTC) and runs 30 days, to about 20 Nov, while these month buckets follow calendar months. So the October and November qloo:month caps together must fit inside that one Qloo month: 12,000 plus 32,000 leaves about 5,000 of the 49,500 left on key day for local runs and probes, which this meter never sees.",
     "A profile covers its from date up to, but not including, its to date, in UTC. Profiles may touch but must not overlap.",
     "qloo:month is the hard ceiling for every Qloo call, from the site, the agent and the offline scripts alike. The day buckets only spread that month out. qloo:day is the share for live runs on the site. qloo:day:offline is the share for the backtest and the seed script, which still count against the same month and the same per-second limit.",
-    "The judging reserve comes from the split across the two profiles. October keeps the public share low (300 a day) because few visitors come before judging, and gives the offline share room (4,000 a day) so the backtest can be pulled in a day or two. November spreads its month over the judging days (2 to 16 Nov): 600 a day for the public, 500 a day offline for reruns and seeding.",
+    "The judging reserve comes from the split across the two profiles. October keeps the public share small and gives the offline share room for the backtest pull. November's day shares (1,400 public, 300 MCP, 300 offline) add up to 2,000 a day, so the 15 judging days (2 to 16 Nov) fit inside its 32,000 even if every day runs at its cap.",
     "anthropic:day:offline is the model-token share for the backtest title reads (about 500 tokens a title), kept apart from anthropic:day so a data pull never uses up the tokens live runs need.",
     "anthropic:day counts model tokens and youtube:day counts YouTube Data API units. Google's free daily quota is 10,000 units, so 9,000 leaves a margin for calls made outside this meter.",
     "The MCP door has its own shares, so agents can never spend what the website needs. qloo:day:mcp is MCP's daily Qloo share and qloo:month:mcp its own month, well under qloo:month; every MCP call also counts against qloo:month and the per-second limit. anthropic:day:mcp is MCP's model-token share. mcp:keys:day caps how many agent keys are issued in a day across all visitors. October keeps MCP small while it is new; November raises it for judging."
@@ -13,22 +13,22 @@
     {
       "from": "2026-10-01",
       "to": "2026-11-01",
-      "notes": "Build and backtest month. Low public share, large offline share for the data pull.",
+      "notes": "Build and backtest month, from key day on. Small public share, large offline share for the data pull.",
       "buckets": [
         {
           "key": "qloo:month",
           "window": "month",
-          "cap": 9000
+          "cap": 12000
         },
         {
           "key": "qloo:day",
           "window": "day",
-          "cap": 300
+          "cap": 1000
         },
         {
           "key": "qloo:day:offline",
           "window": "day",
-          "cap": 4000
+          "cap": 6000
         },
         {
           "key": "anthropic:day",
@@ -48,12 +48,12 @@
         {
           "key": "qloo:day:mcp",
           "window": "day",
-          "cap": 150
+          "cap": 300
         },
         {
           "key": "qloo:month:mcp",
           "window": "month",
-          "cap": 1500
+          "cap": 2000
         },
         {
           "key": "anthropic:day:mcp",
@@ -70,22 +70,22 @@
     {
       "from": "2026-11-01",
       "to": "2026-12-01",
-      "notes": "Judging month. The public share doubles and the offline share shrinks to reruns and seeding.",
+      "notes": "Judging month. The day shares add up to 2,000, so the 15 judging days fit inside the month cap.",
       "buckets": [
         {
           "key": "qloo:month",
           "window": "month",
-          "cap": 9500
+          "cap": 32000
         },
         {
           "key": "qloo:day",
           "window": "day",
-          "cap": 600
+          "cap": 1400
         },
         {
           "key": "qloo:day:offline",
           "window": "day",
-          "cap": 500
+          "cap": 300
         },
         {
           "key": "anthropic:day",
@@ -105,12 +105,12 @@
         {
           "key": "qloo:day:mcp",
           "window": "day",
-          "cap": 200
+          "cap": 300
         },
         {
           "key": "qloo:month:mcp",
           "window": "month",
-          "cap": 2500
+          "cap": 4500
         },
         {
           "key": "anthropic:day:mcp",
