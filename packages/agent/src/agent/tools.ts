@@ -33,6 +33,9 @@ export const TOOL_LIMITS: Record<ToolName, number> = Object.freeze({
 
 export type ToolOutcome = { content: string; isError: boolean; finished?: Array<{ personId: string; angle: string }> };
 
+/** Run-wide tool settings. With trends false, trend_of is never offered or run, and angles may not call anyone rising. */
+export type ToolOptions = { trends: boolean };
+
 const MAX_CONTENT_CHARS = 4_000;
 const MAX_NAME_CHARS = 120;
 const MAX_TITLE_CHARS = 200;
@@ -101,7 +104,13 @@ const INPUTS = {
 } satisfies Record<ToolName, z.ZodType>;
 
 type Inputs = { [K in ToolName]: z.output<(typeof INPUTS)[K]> };
-type Handler<K extends ToolName> = (ctx: RunContext, qloo: MeteredQloo, input: Inputs[K], today: Date) => Promise<ToolOutcome>;
+type Handler<K extends ToolName> = (
+  ctx: RunContext,
+  qloo: MeteredQloo,
+  input: Inputs[K],
+  today: Date,
+  opts: ToolOptions,
+) => Promise<ToolOutcome>;
 
 const PERSON_ID_PROPERTY = {
   type: "string",
@@ -121,11 +130,12 @@ function toolDefinition(name: ToolName, description: string, properties: Record<
  * The fixed list of research tools the model is offered (C2.2). Each is
  * strict, rejects extra keys and requires every property. Length and count
  * limits are stated in the descriptions and enforced by runTool's own schemas,
- * because strict tool schemas do not accept those keywords. Returns new
- * objects on every call.
+ * because strict tool schemas do not accept those keywords. With trends
+ * false, trend_of is left out, so the model is never offered a call that
+ * would come back empty. Returns new objects on every call.
  */
-export function researchTools(): Anthropic.Tool[] {
-  return [
+export function researchTools(opts: ToolOptions): Anthropic.Tool[] {
+  const tools = [
     toolDefinition(
       "people_for_show",
       "List up to 20 people whose fans overlap most with this show's audience, best match first. " +
@@ -195,6 +205,7 @@ export function researchTools(): Anthropic.Tool[] {
       },
     ),
   ];
+  return opts.trends ? tools : tools.filter((tool) => tool.name !== "trend_of");
 }
 
 const isToolName = (name: string): name is ToolName => Object.hasOwn(TOOL_LIMITS, name);
@@ -478,7 +489,7 @@ const recentEpisodeTitles: Handler<"recent_episode_titles"> = async (ctx) => {
   return { content: listContent("titles", titles), isError: false };
 };
 
-const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input) => {
+const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input, _today, opts) => {
   const finished: Array<{ personId: string; angle: string }> = [];
   const rejected: Array<{ index: number; reason: string }> = [];
   const removed = { links: 0, emails: 0 };
@@ -497,7 +508,8 @@ const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input) => {
     // Cleaned before checkProse, so a link split by an invisible character is
     // found and removed whole instead of being joined back up by a later clean.
     const angle = cleanText(pick.angle, { maxChars: MAX_ANGLE_INPUT_CHARS });
-    const check = checkProse(angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [] });
+    // With no trend data behind the board, an angle may not call anyone rising.
+    const check = checkProse(angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [], noTrendClaims: !opts.trends });
     if (!check.ok) {
       rejected.push({ index, reason: check.reason ?? "empty" });
       continue;
@@ -533,10 +545,11 @@ async function dispatch<K extends ToolName>(
   qloo: MeteredQloo,
   input: unknown,
   today: Date,
+  opts: ToolOptions,
 ): Promise<ToolOutcome> {
   const parsed = INPUTS[name].safeParse(input);
   if (!parsed.success) return refusal(ctx, name, "BAD_INPUT", "refused: input did not match the tool");
-  return HANDLERS[name](ctx, qloo, parsed.data as Inputs[K], today);
+  return HANDLERS[name](ctx, qloo, parsed.data as Inputs[K], today, opts);
 }
 
 /**
@@ -544,7 +557,10 @@ async function dispatch<K extends ToolName>(
  * question to the model (C2.1). In order: an unknown tool name, a tool past
  * its TOOL_LIMITS count for this run, input that fails the tool's strict
  * schema, and a personId no tool returned in this run are each refused with
- * no Qloo call (C2.2). Every attempt at a known tool counts toward its limit.
+ * no Qloo call (C2.2). With opts.trends false, trend_of is refused as
+ * NO_TREND_DATA with no Qloo call, and finish_board refuses an angle that
+ * calls someone rising (reason "trend_claim"). Every attempt at a known tool
+ * counts toward its limit.
  * Qloo requests are built from checked fields only (C2.3). Content is JSON of
  * at most 4,000 characters, and every Qloo name, tag and title and every
  * episode title in it has been through cleanText (C2.8). Angles are cleaned
@@ -563,6 +579,7 @@ export async function runTool(
   name: string,
   input: unknown,
   today: Date,
+  opts: ToolOptions,
 ): Promise<ToolOutcome> {
   if (!Number.isFinite(today.getTime())) throw new RangeError("today must be a valid date.");
   if (!isToolName(name)) return refusal(ctx, "unknown", "UNKNOWN_TOOL", "refused: unknown tool");
@@ -570,9 +587,10 @@ export async function runTool(
   const used = ctx.toolCalls.get(name) ?? 0;
   if (used >= TOOL_LIMITS[name]) return refusal(ctx, name, "LIMIT_REACHED", "refused: call limit reached");
   ctx.toolCalls.set(name, used + 1);
+  if (name === "trend_of" && !opts.trends) return refusal(ctx, name, "NO_TREND_DATA", "refused: trend data is not available");
 
   try {
-    return await dispatch(name, ctx, qloo, input, today);
+    return await dispatch(name, ctx, qloo, input, today, opts);
   } catch (error) {
     if (error instanceof QlooError) return refusal(ctx, name, error.code, `failed: ${error.code}`);
     throw error;

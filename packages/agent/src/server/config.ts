@@ -18,17 +18,19 @@ export type ServerConfig = {
   model: string;
   effort: "low" | "medium" | "high";
   anthropicTokensPerDay: number;
+  trends: boolean;
 };
 
-type ModelVariable = "ANTHROPIC_API_KEY" | "VASAL_MODEL" | "VASAL_EFFORT" | "ANTHROPIC_TOKENS_PER_DAY";
+type AgentVariable = "ANTHROPIC_API_KEY" | "VASAL_MODEL" | "VASAL_EFFORT" | "ANTHROPIC_TOKENS_PER_DAY" | "VASAL_TRENDS";
 
 // errors.ts holds the messages for the other variables. Like those, each of
 // these names its variable and never contains the value.
-const MODEL_MESSAGES: Record<ModelVariable, string> = {
+const AGENT_MESSAGES: Record<AgentVariable, string> = {
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY has spaces or characters a key cannot contain. Copy the key into .env again.",
   VASAL_MODEL: "VASAL_MODEL must be a Claude model id such as claude-haiku-5-5.",
   VASAL_EFFORT: "VASAL_EFFORT must be low, medium or high.",
   ANTHROPIC_TOKENS_PER_DAY: "ANTHROPIC_TOKENS_PER_DAY must be a whole number from 1 to 100000000.",
+  VASAL_TRENDS: "VASAL_TRENDS must be on or off.",
 };
 
 // Cloudflare's published Turnstile test secrets, from
@@ -51,6 +53,9 @@ const MIN_SECRET_LENGTH = 32;
 const DEFAULT_MODEL = "claude-haiku-5-5";
 const DEFAULT_EFFORT = "medium";
 const DEFAULT_ANTHROPIC_TOKENS_PER_DAY = 2_000_000;
+// Off by default: Qloo's hackathon host answered every trend request with no
+// rows on 21 Oct 2026, and an empty answer still costs a call.
+const DEFAULT_TRENDS = "off";
 
 // One value for the life of the process, so every config load in it counts
 // visitors under the same key.
@@ -99,6 +104,7 @@ const headerNameSchema = z
 const apiKeySchema = z.string().max(500).regex(/^[\x21-\x7E]+$/);
 const modelSchema = z.string().regex(/^claude-[a-z0-9-]{3,60}$/);
 const effortSchema = z.enum(["low", "medium", "high"]);
+const trendsSchema = z.enum(["on", "off"]);
 
 function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -106,11 +112,11 @@ function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: 
   return result.data;
 }
 
-function modelSetting<T>(variable: ModelVariable, schema: z.ZodType<T>, value: unknown): T {
+function agentSetting<T>(variable: AgentVariable, schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) {
     const error = new ServerError("SRV_CONFIG");
-    error.message = MODEL_MESSAGES[variable];
+    error.message = AGENT_MESSAGES[variable];
     throw error;
   }
   return result.data;
@@ -128,7 +134,9 @@ function modelSetting<T>(variable: ModelVariable, schema: z.ZodType<T>, value: u
  * address. The model settings are the same in both: ANTHROPIC_API_KEY is
  * optional (null when unset), VASAL_MODEL defaults to claude-haiku-5-5 and
  * must look like a Claude model id, VASAL_EFFORT is low, medium or high
- * (default medium), and ANTHROPIC_TOKENS_PER_DAY defaults to 2,000,000.
+ * (default medium), ANTHROPIC_TOKENS_PER_DAY defaults to 2,000,000, and
+ * VASAL_TRENDS is on or off (default off), which decides whether the agent
+ * asks Qloo for trend data at all.
  * Throws ServerError("SRV_CONFIG") at the first bad or missing variable; the
  * message names the variable and never contains its value.
  */
@@ -197,16 +205,17 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const maxInflightRuns =
     inflightText === undefined ? DEFAULT_MAX_INFLIGHT_RUNS : parsed("MAX_INFLIGHT_RUNS", wholeNumber(1, 20), inflightText);
 
-  const modelText = (variable: ModelVariable): string | undefined => modelSetting(variable, optionalText, env[variable]);
-  const keyText = modelText("ANTHROPIC_API_KEY");
-  const anthropicApiKey = keyText === undefined ? null : modelSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
-  const model = modelSetting("VASAL_MODEL", modelSchema, modelText("VASAL_MODEL") ?? DEFAULT_MODEL);
-  const effort = modelSetting("VASAL_EFFORT", effortSchema, modelText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
-  const tokensText = modelText("ANTHROPIC_TOKENS_PER_DAY");
+  const agentText = (variable: AgentVariable): string | undefined => agentSetting(variable, optionalText, env[variable]);
+  const keyText = agentText("ANTHROPIC_API_KEY");
+  const anthropicApiKey = keyText === undefined ? null : agentSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
+  const model = agentSetting("VASAL_MODEL", modelSchema, agentText("VASAL_MODEL") ?? DEFAULT_MODEL);
+  const effort = agentSetting("VASAL_EFFORT", effortSchema, agentText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
+  const tokensText = agentText("ANTHROPIC_TOKENS_PER_DAY");
   const anthropicTokensPerDay =
     tokensText === undefined
       ? DEFAULT_ANTHROPIC_TOKENS_PER_DAY
-      : modelSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
+      : agentSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
+  const trends = agentSetting("VASAL_TRENDS", trendsSchema, agentText("VASAL_TRENDS") ?? DEFAULT_TRENDS) === "on";
 
   return {
     production,
@@ -222,5 +231,6 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     model,
     effort,
     anthropicTokensPerDay,
+    trends,
   };
 }

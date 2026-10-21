@@ -42,6 +42,7 @@ const CONFIG: ServerConfig = {
   model: "claude-haiku-5-5",
   effort: "medium",
   anthropicTokensPerDay: 2_000_000,
+  trends: false,
 };
 const PING = { jsonrpc: "2.0", id: 1, method: "ping" };
 

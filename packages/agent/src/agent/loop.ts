@@ -4,7 +4,7 @@ import { cleanText } from "../text/normalize.js";
 import type { RunContext } from "./context.js";
 import { AgentError } from "./errors.js";
 import type { ModelClient } from "./model.js";
-import { RESEARCH_NUDGE, RESEARCH_SYSTEM } from "./prompts.js";
+import { RESEARCH_NUDGE, researchSystem } from "./prompts.js";
 import { researchTools, runTool, TOOL_LIMITS, type ToolName, type ToolOutcome } from "./tools.js";
 
 export type LoopLimits = { maxTurns: number; maxToolCalls: number; maxRunTokens: number; maxWallMs: number; turnMaxTokens: number };
@@ -117,13 +117,16 @@ function checkedLimits(overrides: Partial<LoopLimits>): LoopLimits {
  * Runs the research conversation for one confirmed show and returns the
  * model's checked picks from finish_board.
  *
- * The model sees only the fixed system prompt, `Show to research: ` plus the
- * JSON of ctx.show.name, and tool results. It never sees the exclusion list
+ * The model sees only the fixed system prompt (researchSystem for
+ * deps.trends), `Show to research: ` plus the JSON of ctx.show.name, and
+ * tool results. It never sees the exclusion list
  * or anything the visitor typed (C2.7, C2.5). Each response is kept in full.
  * Every tool_use block in a response runs through runTool in order, and all
  * of their tool_result blocks, with is_error set from each outcome, go back
  * in one user message (C2.8). After each tool `onStep` gets a label written
  * by code (stepFor). A response with no tool call gets RESEARCH_NUDGE once.
+ * deps.trends also goes to researchTools and runTool, so with it false
+ * trend_of is neither named, offered nor run.
  *
  * Every cap is enforced here in code, never by asking the model (C2.1,
  * C2.4): before each model call the turn count, tool calls, the summed
@@ -143,13 +146,22 @@ function checkedLimits(overrides: Partial<LoopLimits>): LoopLimits {
  */
 export async function runResearch(
   ctx: RunContext,
-  deps: { model: ModelClient; qloo: MeteredQloo; today: Date; onStep: (s: StepEvent) => Promise<void>; nowMs?: () => number },
+  deps: {
+    model: ModelClient;
+    qloo: MeteredQloo;
+    today: Date;
+    trends: boolean;
+    onStep: (s: StepEvent) => Promise<void>;
+    nowMs?: () => number;
+  },
   limits?: Partial<LoopLimits>,
 ): Promise<Array<{ personId: string; angle: string }>> {
   const caps = checkedLimits(limits ?? {});
   const clock = deps.nowMs ?? Date.now;
   const startedAt = clock();
-  const tools = researchTools();
+  const toolOptions = { trends: deps.trends };
+  const tools = researchTools(toolOptions);
+  const system = researchSystem(toolOptions);
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: `Show to research: ${JSON.stringify(ctx.show.name)}` }];
   let turns = 0;
   let toolCalls = 0;
@@ -166,7 +178,7 @@ export async function runResearch(
     for (;;) {
       if (turns >= caps.maxTurns || toolCalls >= caps.maxToolCalls || tokens >= caps.maxRunTokens || overTime()) throw limitHit();
       const response = await deps.model.turn(
-        { system: RESEARCH_SYSTEM, messages, tools, maxTokens: caps.turnMaxTokens },
+        { system, messages, tools, maxTokens: caps.turnMaxTokens },
         { signal: wallClock.signal, timeoutMs: timeLeft() },
       );
       turns += 1;
@@ -190,7 +202,7 @@ export async function runResearch(
       for (const block of toolUses) {
         if (toolCalls >= caps.maxToolCalls) throw limitHit();
         toolCalls += 1;
-        const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today);
+        const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today, toolOptions);
         await deps.onStep(stepFor(ctx, block.name, block.input, outcome));
         if (tokens >= caps.maxRunTokens || overTime()) throw limitHit();
         if (outcome.finished !== undefined) return outcome.finished;

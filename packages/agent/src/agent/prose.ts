@@ -5,7 +5,7 @@ export type ProseCheck = {
   ok: boolean;
   text: string;
   removed: { links: number; emails: number };
-  reason?: "digits" | "too_long" | "empty";
+  reason?: "digits" | "too_long" | "empty" | "trend_claim";
 };
 
 // By default linkify-it treats a bare domain as a link only when its last
@@ -32,6 +32,13 @@ const PLACEHOLDER = /\{\{([A-Za-z_][A-Za-z0-9_]{0,39})\}\}/g;
 // number needs digits, so this also keeps phone numbers out (C3.5).
 const NUMBER_CHARACTER = /\p{N}/u;
 const SPACE_RUN = /[^\S\r\n]{2,}/g;
+// Words that say someone is gaining popularity, matched case-insensitively on
+// word boundaries, so "surprising", "uprising", "arising" and "risings" pass.
+// Each gap takes any run of spaces or Unicode dashes, so "up and coming",
+// "up-and-coming" and a non-breaking hyphen all match. It does not catch
+// every synonym, such as "hot right now"; the prompts forbid those too.
+const TREND_CLAIM =
+  /\b(?:rising(?:\s+star)?|on\s+the\s+rise|trending|up[\s\p{Pd}]+and[\s\p{Pd}]+coming|breakout|buzzy|surging|growing\s+in\s+popularity)\b/iu;
 
 const refuse = (reason: NonNullable<ProseCheck["reason"]>, removed: ProseCheck["removed"]): ProseCheck => ({
   ok: false,
@@ -79,13 +86,20 @@ export function withoutLinks(text: string): { text: string; removed: ProseCheck[
  * email address linkify-it finds and counts them (C3.5); refuses with reason
  * "digits" if any number character is left outside a `{{name}}` placeholder
  * whose name is in `placeholders` (C3.4). A placeholder not on that list is
- * plain text, so any digit inside it fails. Text left empty by removals is
- * refused as "empty". On refusal `text` is "", so failed prose cannot be shown
- * by mistake.
+ * plain text, so any digit inside it fails. With `noTrendClaims`, the same
+ * text outside the listed placeholders is refused with reason "trend_claim"
+ * if it calls someone rising, on the rise, trending, up and coming, a
+ * breakout, buzzy, surging or growing in popularity. The check runs before placeholders are filled, so a
+ * filled-in value never trips it. Text left empty by removals is refused as
+ * "empty". On refusal `text` is "", so failed prose cannot be shown by
+ * mistake.
  *
  * Throws RangeError when maxChars is not a positive integer.
  */
-export function checkProse(raw: string, opts: { maxChars: number; placeholders: readonly string[] }): ProseCheck {
+export function checkProse(
+  raw: string,
+  opts: { maxChars: number; placeholders: readonly string[]; noTrendClaims?: boolean },
+): ProseCheck {
   if (!Number.isSafeInteger(opts.maxChars) || opts.maxChars < 1) throw new RangeError("maxChars must be a positive integer.");
   const noneRemoved = { links: 0, emails: 0 };
   if (typeof raw !== "string") return refuse("empty", noneRemoved);
@@ -102,6 +116,7 @@ export function checkProse(raw: string, opts: { maxChars: number; placeholders: 
   const allowed = new Set(opts.placeholders);
   const outsidePlaceholders = text.replace(PLACEHOLDER, (token, name: string) => (allowed.has(name) ? "" : token));
   if (NUMBER_CHARACTER.test(outsidePlaceholders)) return refuse("digits", removed);
+  if (opts.noTrendClaims === true && TREND_CLAIM.test(outsidePlaceholders)) return refuse("trend_claim", removed);
 
   return { ok: true, text, removed };
 }

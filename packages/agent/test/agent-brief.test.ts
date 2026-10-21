@@ -1,6 +1,7 @@
 // Covers writing a brief with a scripted fake model: the facts the model is
 // given, each draft's fixed time limit, the one rewrite after failed prose,
-// removal of links and emails, and placeholders filled with code values. It
+// removal of links and emails, placeholders filled with code values, the
+// reach phrase, and the trend-claim refusal for a guest with no trend data. It
 // does not cover checkProse's own rules (agent-prose), how the client
 // enforces the limit (agent-model), the real model's writing, or storing the
 // brief (agent-runner). All data is synthetic.
@@ -34,7 +35,12 @@ const GOOD = {
   pitch_body: "Hi team, we would love {{guest}} on {{show}}. Could we find a date that works?",
 };
 
+const UNKNOWN_RISING: BoardEntry = { ...GUEST, rising: { state: "unknown", points: null } };
+
 type StructuredParams = Parameters<ModelClient["structured"]>[0];
+type Fact = { placeholder: string; meaning: string; value?: string };
+
+const factsOf = (user: string) => JSON.parse(user.slice(user.indexOf("\n") + 1)) as Record<string, Fact>;
 
 // Mirrors the real client's contract: a reply that fails the schema is AGENT_BAD_PROSE.
 function fakeModel(drafts: unknown[]) {
@@ -167,5 +173,105 @@ describe("writeBrief", () => {
     const budget = fakeModel([new AgentError("MODEL_BUDGET")]);
     expect(await codeOf(writeBrief(budget.model, { guest: GUEST, showName: SHOW_NAME }))).toBe("MODEL_BUDGET");
     expect(budget.calls).toHaveLength(1);
+  });
+});
+
+describe("writeBrief wording", () => {
+  it("fills {{reach}} with a whole sentence naming the guest, and shows the model the same sentence", async () => {
+    const sentences: Array<[BoardEntry["reach"], string]> = [
+      ["bookable", "is within reach, so booking is realistic"],
+      ["well known", "is well known, so booking will take some work"],
+      ["household name", "is a household name, so booking will be a long shot"],
+    ];
+    for (const [reach, rest] of sentences) {
+      const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." }]);
+
+      const { brief } = await writeBrief(model, { guest: { ...GUEST, reach }, showName: SHOW_NAME });
+
+      expect(brief.why).toBe(`Blink-182 suits Synthetic Show. Blink-182 ${rest}.`);
+      expect(factsOf(calls[0]!.user)["reach"]).toMatchObject({ placeholder: "{{reach}}", value: `{{guest}} ${rest}` });
+    }
+  });
+
+  it("keeps the host's notes out of the pitch: {{reach}} or {{brings}} in the subject or email fails, while why may use both", async () => {
+    for (const field of ["pitch_subject", "pitch_body"] as const) {
+      for (const note of ["{{reach}}.", "{{brings}}"]) {
+        const draft = { ...GOOD, [field]: `Hi team. ${note}` };
+        const { model, calls } = fakeModel([draft, draft]);
+        expect(await codeOf(writeBrief(model, { guest: GUEST, showName: SHOW_NAME })), `${field} ${note}`).toBe("AGENT_BAD_PROSE");
+        expect(calls).toHaveLength(2);
+      }
+    }
+    const { model } = fakeModel([{ ...GOOD, why: "{{reach}}. It would also bring {{brings}}." }]);
+    expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toContain("so booking will take some work.");
+  });
+
+  it("describes a shared tag to the model as a word for both audiences, not a thing", async () => {
+    const { model, calls } = fakeModel([GOOD]);
+    await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });
+    const tastes = factsOf(calls[0]!.user)["sharedTastes"] as unknown as Array<{ meaning: string }>;
+    expect(tastes[0]!.meaning).toContain("a word Qloo uses to describe both audiences");
+  });
+
+  it("refuses a draft that wraps {{reach}} in other words, so the clumsy wording from the first real run cannot come back", async () => {
+    for (const why of ["Booking {{guest}} is {{reach}}.", "{{guest}} is {{reach}}.", "{{reach}} and worth it.", "Good news, {{reach}}."]) {
+      const { model, calls } = fakeModel([{ ...GOOD, why }, { ...GOOD, why }]);
+      expect(await codeOf(writeBrief(model, { guest: GUEST, showName: SHOW_NAME })), why).toBe("AGENT_BAD_PROSE");
+      expect(calls).toHaveLength(2);
+    }
+    const { model } = fakeModel([{ ...GOOD, why: "{{reach}}.\nIt is a good match." }]);
+    expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toBe(
+      "Blink-182 is well known, so booking will take some work.\nIt is a good match.",
+    );
+  });
+
+  it("gives an unknown-rising guest's rising fact no value, and tells the model not to call a guest rising without one", async () => {
+    const { model, calls } = fakeModel([GOOD]);
+
+    await writeBrief(model, { guest: UNKNOWN_RISING, showName: SHOW_NAME });
+
+    expect(factsOf(calls[0]!.user)["rising"]).toEqual({ placeholder: "{{rising}}", meaning: "no trend data exists for this guest, so do not use it" });
+    expect(BRIEF_SYSTEM).toContain("Never describe the guest as rising, trending or growing unless the rising fact has a value.");
+  });
+
+  it("refuses a draft calling an unknown-rising guest rising, and keeps a clean rewrite", async () => {
+    const rising = { ...GOOD, why: "{{guest}} is a rising voice {{show}} listeners will love." };
+
+    const refused = fakeModel([rising, rising]);
+    expect(await codeOf(writeBrief(refused.model, { guest: UNKNOWN_RISING, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
+    expect(refused.calls).toHaveLength(2);
+
+    const rewritten = fakeModel([{ ...GOOD, pitch_body: "We think {{guest}} is on the rise. Could we find a date?" }, GOOD]);
+    const { brief } = await writeBrief(rewritten.model, { guest: UNKNOWN_RISING, showName: SHOW_NAME });
+    expect(rewritten.calls).toHaveLength(2);
+    expect(brief.why).toBe("Blink-182 has 86% fit with Synthetic Show listeners, and interest is not yet tracked.");
+  });
+
+  it("checks before filling, so a shared tag named like a trend never trips the refusal", async () => {
+    const { model } = fakeModel([GOOD]);
+
+    const { brief } = await writeBrief(model, { guest: { ...UNKNOWN_RISING, sharedTags: ["Rising Stars", "skate culture"] }, showName: SHOW_NAME });
+
+    expect(brief.angle).toBe("Growing up loud with Rising Stars.");
+  });
+
+  it("refuses calling a steady or falling guest rising, since their trend says otherwise", async () => {
+    const rising = { ...GOOD, why: "{{guest}} is a rising voice {{show}} listeners will love." };
+    for (const state of ["steady", "falling"] as const) {
+      const { model, calls } = fakeModel([rising, rising]);
+      expect(await codeOf(writeBrief(model, { guest: { ...GUEST, rising: { state, points: 0.1 } }, showName: SHOW_NAME })), state).toBe(
+        "AGENT_BAD_PROSE",
+      );
+      expect(calls).toHaveLength(2);
+    }
+  });
+
+  it("still lets a guest whose trend is rising be called rising", async () => {
+    const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} is a rising voice {{show}} listeners will love." }]);
+
+    const { brief } = await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });
+
+    expect(calls).toHaveLength(1);
+    expect(brief.why).toBe("Blink-182 is a rising voice Synthetic Show listeners will love.");
   });
 });

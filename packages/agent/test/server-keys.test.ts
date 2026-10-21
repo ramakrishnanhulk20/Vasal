@@ -38,6 +38,7 @@ const CONFIG: ServerConfig = {
   model: "claude-haiku-5-5",
   effort: "medium",
   anthropicTokensPerDay: 2_000_000,
+  trends: false,
 };
 
 let db: Db;

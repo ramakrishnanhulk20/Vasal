@@ -5,7 +5,8 @@
 // GET /runs/:id once to show a pasted feed's URL stays private, and reads a
 // stored board back through listShowcase so the two schemas agree. It also
 // covers which surface's buckets a run spends from, through the real meter
-// functions main.ts wires in. It does not cover the other HTTP routes
+// functions main.ts wires in, and that a run with trends off spends no trend
+// call. It does not cover the other HTTP routes
 // (server-app), the real network, the real model, main.ts itself (the live
 // dev smoke starts it), or races between database connections (PGlite has
 // one).
@@ -202,14 +203,16 @@ function trackingDb(inner: Db) {
   return { db: wrap(inner, null), log };
 }
 
-async function setup(opts: { input?: RunInput; feed?: string | Error; fail?: (op: QlooOperation) => QlooError | null; database?: Db } = {}) {
+async function setup(
+  opts: { input?: RunInput; feed?: string | Error; fail?: (op: QlooOperation) => QlooError | null; database?: Db; trends?: boolean } = {},
+) {
   const input = opts.input ?? { show: "Synthetic Show", exclude: [] };
   const target = opts.database ?? db;
   const runId = await createRun(db, input, NOW);
   const { feeds, fetched } = fakeFeeds(opts.feed === undefined ? {} : { feed: opts.feed });
   const { qloo, ops } = fakeQloo(opts.fail);
   const { model, turns } = fakeModel(BRIEF);
-  const agent = createAgentRunner({ db: target, ...sameForBoth(model, qloo), feeds, now: () => NOW });
+  const agent = createAgentRunner({ db: target, ...sameForBoth(model, qloo), feeds, trends: opts.trends ?? true, now: () => NOW });
   return { runId, input, agent, fetched, ops, turns };
 }
 
@@ -290,6 +293,7 @@ describe("startRun (C6.2)", () => {
       model: "claude-haiku-5-5",
       effort: "medium",
       anthropicTokensPerDay: 2_000_000,
+      trends: false,
     };
     const app = createApp({ db, config, verifyTurnstile: async () => true, agent, socketAddress: () => null });
     const page = await (await app.request(`/runs/${runId}`)).text();
@@ -308,7 +312,7 @@ describe("startRun (C6.2)", () => {
   it("fails the run with only the code when no show is found", async () => {
     const runId = await createRun(db, { show: "Nothing", exclude: [] }, NOW);
     const { feeds } = fakeFeeds({ shows: [] });
-    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel().model, fakeQloo().qloo), feeds, now: () => NOW });
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel().model, fakeQloo().qloo), feeds, trends: true, now: () => NOW });
 
     await agent.startRun(runId, { show: "Nothing", exclude: [] });
 
@@ -382,7 +386,7 @@ describe("continueRun (C1.5, C6.4)", () => {
       },
       stats: plain.stats,
     };
-    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, hostile), feeds: fakeFeeds().feeds, now: () => NOW });
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, hostile), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
 
     await agent.startRun(runId, input);
     await agent.continueRun(runId, await confirmFirst(runId));
@@ -395,6 +399,25 @@ describe("continueRun (C1.5, C6.4)", () => {
     const stored = [await listBoard(db, runId), await listCandidates(db, runId), await listEventsAfter(db, runId, 0)];
     expect(stringsIn(stored).some((text) => UNSAFE.test(text))).toBe(false);
     expect(JSON.stringify(stored)).not.toContain("\\u0007");
+  });
+
+  it("with trends off, offers no trend_of and fills no trend, making every other Qloo call it makes with trends on", async () => {
+    const on = await setup();
+    await on.agent.startRun(on.runId, on.input);
+    await on.agent.continueRun(on.runId, await confirmFirst(on.runId));
+    const off = await setup({ trends: false });
+    await off.agent.startRun(off.runId, off.input);
+
+    await off.agent.continueRun(off.runId, await confirmFirst(off.runId));
+
+    expect((await getRun(db, off.runId))?.status).toBe("done");
+    expect(on.ops.filter((op) => op.op === "trending")).toHaveLength(PICKS.length);
+    expect(off.ops.filter((op) => op.op === "trending")).toHaveLength(0);
+    expect(off.ops).toEqual(on.ops.filter((op) => op.op !== "trending"));
+    expect(on.turns[0]!.tools.map((tool) => tool.name)).toContain("trend_of");
+    expect(off.turns.flatMap((turn) => turn.tools.map((tool) => tool.name))).not.toContain("trend_of");
+    const board = (await listBoard(db, off.runId)).map((item) => item.data as { rising: { state: string } });
+    expect(board.map((entry) => entry.rising.state)).toEqual(PICKS.map(() => "unknown"));
   });
 
   it("still finishes when the feed cannot be fetched", async () => {
@@ -468,7 +491,7 @@ describe("continueRun (C1.5, C6.4)", () => {
         throw new AgentError("MODEL_TIMEOUT");
       },
     };
-    const slow = createAgentRunner({ db, ...sameForBoth(timingOut, fakeQloo().qloo), feeds: fakeFeeds().feeds, now: () => NOW });
+    const slow = createAgentRunner({ db, ...sameForBoth(timingOut, fakeQloo().qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
 
     await slow.continueRun(runId, await confirmFirst(runId));
 
@@ -483,7 +506,7 @@ describe("continueRun (C1.5, C6.4)", () => {
     const input: RunInput = { show: "Synthetic Show", exclude: [] };
     const runId = await createRun(db, input, NOW);
     const feeds = fakeFeeds({ shows: [{ ...show(1), name }] }).feeds;
-    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, fakeQloo().qloo), feeds, now: () => NOW });
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, fakeQloo().qloo), feeds, trends: true, now: () => NOW });
 
     await agent.startRun(runId, input);
     const [stored] = await listCandidates(db, runId);
@@ -564,7 +587,7 @@ describe("writeBrief", () => {
         throw new AgentError("MODEL_TIMEOUT");
       },
     };
-    const failing = createAgentRunner({ db, ...sameForBoth(timingOut, fakeQloo().qloo), feeds: fakeFeeds().feeds, now: () => NOW });
+    const failing = createAgentRunner({ db, ...sameForBoth(timingOut, fakeQloo().qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
     expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
 
     await failing.writeBrief(runId, first!.id);
@@ -598,7 +621,7 @@ describe("writeBrief", () => {
         showName: EMOJI.repeat(200),
       },
     ]);
-    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, fakeQloo().qloo), feeds: fakeFeeds().feeds, now: () => NOW });
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, fakeQloo().qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
     expect(await claimBrief(db, runId, guestId!, 5, NOW)).toBe("claimed");
 
     await agent.writeBrief(runId, guestId!);
@@ -622,7 +645,7 @@ describe("writeBrief", () => {
         throw new Error(MARKER);
       },
     };
-    const failing = createAgentRunner({ db, ...sameForBoth(broken, fakeQloo().qloo), feeds: fakeFeeds().feeds, now: () => NOW });
+    const failing = createAgentRunner({ db, ...sameForBoth(broken, fakeQloo().qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
     expect(await claimBrief(db, runId, first!.id, 5, NOW)).toBe("claimed");
     const eventsBefore = await listEventsAfter(db, runId, 0);
 
@@ -686,6 +709,7 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
       qlooFor: (surface) => qloos[surface],
       modelFor: (surface) => models[surface],
       feeds: fakeFeeds({ shows: [show(1)] }).feeds,
+      trends: true,
       now: () => NOW,
     });
     return { agent, qlooCalls, modelCalls };
@@ -801,6 +825,7 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
         return fakeModel().model;
       },
       feeds: fakeFeeds().feeds,
+      trends: true,
       now: () => NOW,
     });
 

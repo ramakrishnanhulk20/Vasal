@@ -92,6 +92,13 @@ describe("loadServerConfig in development", () => {
     expect(TURNSTILE_TEST_SECRET_ALWAYS_FAILS).toBe("2x0000000000000000000000000000000AA");
   });
 
+  it("reads VASAL_TRENDS as on or off, and treats unset or blank as off", () => {
+    expect(loadServerConfig({ VASAL_TRENDS: "on" }).trends).toBe(true);
+    expect(loadServerConfig({ VASAL_TRENDS: "off" }).trends).toBe(false);
+    expect(loadServerConfig({}).trends).toBe(false);
+    expect(loadServerConfig({ VASAL_TRENDS: "  " }).trends).toBe(false);
+  });
+
   it("does not load the .env file for a custom env", () => {
     const load = vi.spyOn(process, "loadEnvFile");
     loadServerConfig({});
@@ -116,6 +123,7 @@ describe("loadServerConfig in production", () => {
       model: "claude-haiku-5-5",
       effort: "medium",
       anthropicTokensPerDay: 2_000_000,
+      trends: false,
     });
     expect(warn).not.toHaveBeenCalled();
   });
@@ -170,6 +178,9 @@ describe("loadServerConfig with bad values", () => {
       ["VASAL_EFFORT", `max${MARKER}`],
       ["ANTHROPIC_TOKENS_PER_DAY", "0"],
       ["ANTHROPIC_TOKENS_PER_DAY", `2e6${MARKER}`],
+      ["VASAL_TRENDS", `on${MARKER}`],
+      ["VASAL_TRENDS", "true"],
+      ["VASAL_TRENDS", "ON"],
     ];
     for (const [variable, value] of cases) {
       expectRefusal({ ...PRODUCTION, [variable]: value }, variable);

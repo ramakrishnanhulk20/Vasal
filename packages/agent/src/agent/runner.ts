@@ -146,7 +146,9 @@ function knownCode(error: unknown): string | null {
  * trend and shared-taste data for the picks left after exclusions through
  * runTool (so the per-tool caps hold), builds the board in code, and stores
  * it with a "board" event and a done event. Fewer than 3 guests fails with
- * AGENT_BOARD_TOO_SMALL; nothing is padded.
+ * AGENT_BOARD_TOO_SMALL; nothing is padded. With `trends` false the research
+ * loop is never offered trend_of and the fill skips it, so no trend call is
+ * spent and every guest's rising state is "unknown".
  *
  * writeBrief reads the guest from the stored board (C6.2), writes the brief,
  * logs any removed links in a step, stores the brief, marks the guest's
@@ -175,10 +177,13 @@ export function createAgentRunner(deps: {
   qlooFor: (surface: RunSurface) => MeteredQloo;
   modelFor: (surface: RunSurface) => ModelClient;
   feeds: AgentFeeds;
+  trends: boolean;
   now?: () => Date;
 }): AgentPort {
-  const { db, qlooFor, modelFor, feeds } = deps;
+  const { db, qlooFor, modelFor, feeds, trends } = deps;
   const clock = deps.now ?? (() => new Date());
+  const toolOptions = { trends };
+  const fillTools = trends ? FILL_TOOLS : FILL_TOOLS.filter((tool) => tool !== "trend_of");
 
   const storedRun = async (runId: string) => {
     const run = await getRun(db, runId);
@@ -267,13 +272,13 @@ export function createAgentRunner(deps: {
   ): Promise<void> => {
     const today = clock();
     for (const personId of personIds) {
-      for (const tool of FILL_TOOLS) {
+      for (const tool of fillTools) {
         const present =
           tool === "audience_of" ? ctx.personDemographics.has(personId) : tool === "trend_of" ? ctx.trends.has(personId) : ctx.compares.has(personId);
         if (present) continue;
         if (overTime()) throw new AgentError("AGENT_LIMIT");
         const input = { personId };
-        const outcome = await runTool(ctx, qloo, tool, input, today);
+        const outcome = await runTool(ctx, qloo, tool, input, today, toolOptions);
         await step(runId, stepFor(ctx, tool, input, outcome));
       }
     }
@@ -328,6 +333,7 @@ export function createAgentRunner(deps: {
           model,
           qloo,
           today: clock(),
+          trends,
           onStep: (event) => step(runId, event),
           nowMs: () => clock().getTime(),
         });

@@ -1,8 +1,9 @@
 // Covers the research tools against a fake metered Qloo: the fixed tool list,
 // every refusal that must happen before any Qloo call, the request each tool
-// builds, size caps on what goes back to the model, and step summaries that
-// carry no ids or upstream text. It does not cover the model loop or the
-// Anthropic client (next work order), the real cache and meter (see
+// builds, size caps on what goes back to the model, step summaries that
+// carry no ids or upstream text, and the trends switch. It does not cover
+// the model loop or the Anthropic client (next work order), the real cache
+// and meter (see
 // qloo-metered.test.ts), or real Qloo response shapes. All data is synthetic.
 import { describe, expect, it } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
@@ -88,6 +89,8 @@ const newContext = (episodeTitles: string[] = []): RunContext =>
   createRunContext({ show: SHOW, episodeTitles, exclusions: [] });
 
 const errorOf = (content: string) => JSON.parse(content) as { error: string };
+const ON = { trends: true };
+const OFF = { trends: false };
 
 const VALID_PICKS = [1, 2, 3].map((n) => ({ personId: personId(n), angle: "Their fans already love this show." }));
 
@@ -105,13 +108,13 @@ const VALID_INPUT: Record<ToolName, Record<string, unknown>> = {
 async function withPeople(): Promise<{ ctx: RunContext; qloo: MeteredQloo; ops: QlooOperation[] }> {
   const ctx = newContext();
   const { qloo, ops } = fakeQloo();
-  await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+  await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
   return { ctx, qloo, ops };
 }
 
 describe("researchTools", () => {
   it("offers exactly the 8 tools, each strict with no extra keys and every property required", () => {
-    const tools = researchTools();
+    const tools = researchTools(ON);
 
     expect(tools.map((tool) => tool.name).sort()).toEqual(Object.keys(TOOL_LIMITS).sort());
     for (const tool of tools) {
@@ -126,11 +129,54 @@ describe("researchTools", () => {
   });
 
   it("returns fresh objects, so a caller cannot change the next run's list", () => {
-    const first = researchTools();
+    const first = researchTools(ON);
     const tool = first[0];
     if (tool) tool.description = "changed";
 
-    expect(researchTools()[0]?.description).not.toBe("changed");
+    expect(researchTools(ON)[0]?.description).not.toBe("changed");
+  });
+
+  it("leaves trend_of out when trends are off, and offers every other tool unchanged", () => {
+    const off = researchTools(OFF);
+
+    expect(off.map((tool) => tool.name)).not.toContain("trend_of");
+    expect(off).toEqual(researchTools(ON).filter((tool) => tool.name !== "trend_of"));
+  });
+});
+
+describe("runTool with trends off", () => {
+  it("refuses trend_of as NO_TREND_DATA with no Qloo call, and counts it toward the limit", async () => {
+    const { ctx, qloo, ops } = await withPeople();
+    const before = ops.length;
+
+    for (let call = 0; call < TOOL_LIMITS.trend_of; call += 1) {
+      const outcome = await runTool(ctx, qloo, "trend_of", { personId: personId(1) }, TODAY, OFF);
+      expect(outcome).toEqual({ content: JSON.stringify({ error: "NO_TREND_DATA" }), isError: true });
+    }
+    const past = await runTool(ctx, qloo, "trend_of", { personId: personId(1) }, TODAY, OFF);
+
+    expect(errorOf(past.content)).toEqual({ error: "LIMIT_REACHED" });
+    expect(ops).toHaveLength(before);
+    expect(ctx.trends.size).toBe(0);
+    expect(ctx.steps.at(-2)).toEqual({ tool: "trend_of", ok: false, summary: "refused: trend data is not available" });
+  });
+
+  it("runs every other tool as it does with trends on", async () => {
+    const on = await withPeople();
+    const off = await withPeople();
+    const calls: Array<[ToolName, unknown]> = [
+      ["audience_of", { personId: personId(1) }],
+      ["shared_taste", { personId: personId(1) }],
+      ["upcoming_releases", { kind: "book" }],
+      ["find_person", { name: "Synthetic Name" }],
+      ["recent_episode_titles", {}],
+      ["finish_board", VALID_INPUT.finish_board],
+    ];
+
+    for (const [name, input] of calls) {
+      expect(await runTool(off.ctx, off.qloo, name, input, TODAY, OFF)).toEqual(await runTool(on.ctx, on.qloo, name, input, TODAY, ON));
+    }
+    expect(off.ops).toEqual(on.ops);
   });
 });
 
@@ -140,7 +186,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
     const { qloo, ops } = fakeQloo();
 
     for (const name of ["fetch_url", "__proto__", "toString", ""]) {
-      const outcome = await runTool(ctx, qloo, name, {}, TODAY);
+      const outcome = await runTool(ctx, qloo, name, {}, TODAY, ON);
       expect(outcome.isError).toBe(true);
       expect(errorOf(outcome.content)).toEqual({ error: "UNKNOWN_TOOL" });
     }
@@ -153,7 +199,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
     const before = ops.length;
 
     for (const name of Object.keys(TOOL_LIMITS) as ToolName[]) {
-      const outcome = await runTool(ctx, qloo, name, { ...VALID_INPUT[name], extra: 1 }, TODAY);
+      const outcome = await runTool(ctx, qloo, name, { ...VALID_INPUT[name], extra: 1 }, TODAY, ON);
       expect(errorOf(outcome.content)).toEqual({ error: "BAD_INPUT" });
     }
     expect(ops).toHaveLength(before);
@@ -172,7 +218,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
     ];
 
     for (const [name, input] of bad) {
-      expect(errorOf((await runTool(ctx, qloo, name, input, TODAY)).content)).toEqual({ error: "BAD_INPUT" });
+      expect(errorOf((await runTool(ctx, qloo, name, input, TODAY, ON)).content)).toEqual({ error: "BAD_INPUT" });
     }
     expect(ops).toHaveLength(before);
   });
@@ -182,7 +228,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
     const before = ops.length;
 
     for (const name of ["audience_of", "trend_of", "shared_taste"] as const) {
-      const outcome = await runTool(ctx, qloo, name, { personId: NEVER_RETURNED }, TODAY);
+      const outcome = await runTool(ctx, qloo, name, { personId: NEVER_RETURNED }, TODAY, ON);
       expect(errorOf(outcome.content)).toEqual({ error: "UNKNOWN_PERSON" });
     }
     expect(ops).toHaveLength(before);
@@ -191,11 +237,11 @@ describe("runTool refusals (C2.1, C2.2)", () => {
   it("refuses the 11th audience_of call with no Qloo call", async () => {
     const { ctx, qloo, ops } = await withPeople();
     for (let call = 0; call < 10; call += 1) {
-      expect((await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY)).isError).toBe(false);
+      expect((await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON)).isError).toBe(false);
     }
     const before = ops.length;
 
-    const outcome = await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY);
+    const outcome = await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON);
 
     expect(errorOf(outcome.content)).toEqual({ error: "LIMIT_REACHED" });
     expect(ops).toHaveLength(before);
@@ -207,7 +253,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
       throw new QlooError("QLOO_RATE_LIMIT", 429);
     });
 
-    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
 
     expect(outcome).toEqual({ content: JSON.stringify({ error: "QLOO_RATE_LIMIT" }), isError: true });
     expect(ctx.steps).toEqual([{ tool: "people_for_show", ok: false, summary: "failed: QLOO_RATE_LIMIT" }]);
@@ -219,7 +265,7 @@ describe("runTool refusals (C2.1, C2.2)", () => {
       throw new TypeError("database down");
     });
 
-    await expect(runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY)).rejects.toThrow(TypeError);
+    await expect(runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON)).rejects.toThrow(TypeError);
   });
 });
 
@@ -228,9 +274,9 @@ describe("tool requests and results", () => {
     const ctx = newContext();
     const { qloo, ops } = fakeQloo();
 
-    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "bookable" }, TODAY);
-    await runTool(ctx, qloo, "people_for_show", { reach: "emerging" }, TODAY);
-    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "bookable" }, TODAY, ON);
+    await runTool(ctx, qloo, "people_for_show", { reach: "emerging" }, TODAY, ON);
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
 
     expect(ops[0]).toEqual({
       op: "insights",
@@ -258,8 +304,8 @@ describe("tool requests and results", () => {
     );
     const { qloo } = fakeQloo((op) => (op.op === "search" ? [{ ...people[1]!, entity_id: personId(51) }] : people));
 
-    const listed = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
-    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Person 2" }, TODAY);
+    const listed = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Person 2" }, TODAY, ON);
 
     expect((JSON.parse(listed.content) as { people: Array<{ personId: string }> }).people.map((person) => person.personId)).toEqual([
       personId(1),
@@ -277,9 +323,9 @@ describe("tool requests and results", () => {
     let calls = 0;
     const { qloo } = fakeQloo(() => (calls++ === 0 ? alive : later));
 
-    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
     expect([...ctx.people.keys()]).toEqual([personId(1), personId(2)]);
-    await runTool(ctx, qloo, "people_for_show", { reach: "bookable" }, TODAY);
+    await runTool(ctx, qloo, "people_for_show", { reach: "bookable" }, TODAY, ON);
 
     expect([...ctx.people.keys()]).toEqual([personId(2)]);
   });
@@ -287,8 +333,8 @@ describe("tool requests and results", () => {
   it("fetches the show's audience once and returns a person's strongest segments as words", async () => {
     const { ctx, qloo, ops } = await withPeople();
 
-    const first = await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY);
-    await runTool(ctx, qloo, "audience_of", { personId: personId(2) }, TODAY);
+    const first = await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON);
+    await runTool(ctx, qloo, "audience_of", { personId: personId(2) }, TODAY, ON);
 
     expect(JSON.parse(first.content)).toEqual({ strongestWith: ["listeners 25 to 29", "women", "listeners 55 and older"] });
     expect(ops.flatMap((op) => (op.op === "demographics" ? [op.signalEntities] : []))).toEqual([
@@ -303,7 +349,7 @@ describe("tool requests and results", () => {
   it("asks for the 12 full Monday to Sunday weeks before today and returns the trend state", async () => {
     const { ctx, qloo, ops } = await withPeople();
 
-    const outcome = await runTool(ctx, qloo, "trend_of", { personId: personId(1) }, TODAY);
+    const outcome = await runTool(ctx, qloo, "trend_of", { personId: personId(1) }, TODAY, ON);
 
     expect(ops.at(-1)).toEqual({
       op: "trending",
@@ -319,7 +365,7 @@ describe("tool requests and results", () => {
   it("compares the show with the person and returns the top shared tastes", async () => {
     const { ctx, qloo, ops } = await withPeople();
 
-    const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY);
+    const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY, ON);
 
     expect(ops.at(-1)).toEqual({ op: "compare", a: [SHOW.qlooId], b: [personId(1)], take: 10 });
     expect(JSON.parse(outcome.content)).toEqual({
@@ -331,9 +377,9 @@ describe("tool requests and results", () => {
     const ctx = newContext();
     const { qloo, ops } = fakeQloo();
 
-    const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY);
-    await runTool(ctx, qloo, "upcoming_releases", { kind: "tv_show" }, TODAY);
-    await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY);
+    const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY, ON);
+    await runTool(ctx, qloo, "upcoming_releases", { kind: "tv_show" }, TODAY, ON);
+    await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY, ON);
 
     const base = { op: "insights", signalEntities: [SHOW.qlooId], take: 20 };
     expect(ops).toEqual([
@@ -370,8 +416,8 @@ describe("tool requests and results", () => {
     const books = [title(1, { publication_date: "2400-01-01", publication_year: 2400 }), title(2, { publication_date: "2027-01-05" })];
     const { qloo } = fakeQloo((op) => (op.op === "insights" && op.filterType === "urn:entity:book" ? books : films));
 
-    const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY);
-    const reading = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY);
+    const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY, ON);
+    const reading = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY, ON);
 
     expect(JSON.parse(movies.content)).toEqual({ titles: [1, 6, 8].map((n) => `Synthetic Release ${n}`) });
     expect(JSON.parse(reading.content)).toEqual({ titles: ["Synthetic Release 2"] });
@@ -382,7 +428,7 @@ describe("tool requests and results", () => {
     const ctx = newContext();
     const { qloo, ops } = fakeQloo();
 
-    const outcome = await runTool(ctx, qloo, "find_person", { name: "  x&take=500#y  " }, TODAY);
+    const outcome = await runTool(ctx, qloo, "find_person", { name: "  x&take=500#y  " }, TODAY, ON);
 
     expect(ops[0]).toEqual({ op: "search", query: "x&take=500#y", types: ["urn:entity:person"], take: 3 });
     expect(JSON.parse(outcome.content)).toEqual({ people: [{ personId: personId(50), name: `Synthetic Found ${MARKER}` }] });
@@ -394,8 +440,8 @@ describe("tool requests and results", () => {
     const ctx = newContext(titles);
     const { qloo, ops } = fakeQloo();
 
-    const outcome = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY);
-    const again = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY);
+    const outcome = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY, ON);
+    const again = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY, ON);
     const body = JSON.parse(outcome.content) as { titles: string[]; omitted: number };
 
     expect(outcome.content.length).toBeLessThanOrEqual(4_000);
@@ -420,11 +466,11 @@ describe("tool requests and results", () => {
       return { tags: hide(tags), a: hide(a), b: hide(b) };
     });
 
-    const people = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
-    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY);
-    const tastes = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY);
-    const releases = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY);
-    const episodes = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY);
+    const people = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+    const tastes = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY, ON);
+    const releases = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY, ON);
+    const episodes = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY, ON);
 
     expect((JSON.parse(people.content) as { people: Array<{ name: string }> }).people.map((person) => person.name)).toEqual(
       [1, 2, 3].map((n) => `Synthetic Person ${n} ${MARKER}`),
@@ -451,7 +497,7 @@ describe("tool requests and results", () => {
       synthPeople(20).map((person) => ({ ...person, name: `${person.name} ${"n".repeat(300)}` })),
     );
 
-    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
     const body = JSON.parse(outcome.content) as { people: Array<{ name: string }>; omitted: number };
 
     expect(outcome.content.length).toBeLessThanOrEqual(4_000);
@@ -472,8 +518,8 @@ describe("shared_taste matching", () => {
   async function tastesFor(compare: { tags: unknown[]; a: unknown[]; b: unknown[] }) {
     const ctx = newContext();
     const { qloo } = fakeQloo((op) => (op.op === "compare" ? compare : synthResponse(op)));
-    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
-    const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY);
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY, ON);
     return {
       stored: ctx.compares.get(personId(1)),
       shown: (JSON.parse(outcome.content) as { sharedTastes: string[] }).sharedTastes,
@@ -541,7 +587,7 @@ describe("finish_board", () => {
       { personId: personId(3), angle: "Brings a younger crowd the show is missing." },
     ];
 
-    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY);
+    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY, ON);
 
     expect(outcome.isError).toBe(false);
     expect(JSON.parse(outcome.content)).toEqual({ accepted: 3 });
@@ -561,7 +607,7 @@ describe("finish_board", () => {
       { personId: personId(3), angle: "Brings a younger crowd the show is missing." },
     ];
 
-    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY);
+    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY, ON);
 
     expect(outcome.finished?.map((pick) => pick.angle)).toEqual([
       "A warm storyteller, see now.",
@@ -581,7 +627,7 @@ describe("finish_board", () => {
       { personId: personId(1), angle: "Same guest twice." },
     ];
 
-    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY);
+    const outcome = await runTool(ctx, qloo, "finish_board", { picks }, TODAY, ON);
 
     expect(outcome.isError).toBe(true);
     expect(outcome.finished).toBeUndefined();
@@ -595,13 +641,28 @@ describe("finish_board", () => {
     });
   });
 
+  it("rejects an angle calling a guest rising with reason trend_claim when trends are off, and accepts it when on", async () => {
+    const picks = VALID_PICKS.map((pick, n) => (n === 1 ? { ...pick, angle: "A rising voice in sketch comedy." } : pick));
+
+    const off = await withPeople();
+    const refused = await runTool(off.ctx, off.qloo, "finish_board", { picks }, TODAY, OFF);
+    expect(refused.isError).toBe(true);
+    expect(refused.finished).toBeUndefined();
+    expect(JSON.parse(refused.content)).toEqual({ error: "PICKS_REJECTED", rejected: [{ index: 1, reason: "trend_claim" }] });
+
+    const on = await withPeople();
+    const accepted = await runTool(on.ctx, on.qloo, "finish_board", { picks }, TODAY, ON);
+    expect(accepted.isError).toBe(false);
+    expect(accepted.finished?.[1]?.angle).toBe("A rising voice in sketch comedy.");
+  });
+
   it("allows one retry and then refuses further calls", async () => {
     const { ctx, qloo } = await withPeople();
     const bad = { picks: VALID_PICKS.map((pick) => ({ ...pick, angle: "fit 9" })) };
 
-    await runTool(ctx, qloo, "finish_board", bad, TODAY);
-    await runTool(ctx, qloo, "finish_board", bad, TODAY);
-    const third = await runTool(ctx, qloo, "finish_board", VALID_INPUT.finish_board, TODAY);
+    await runTool(ctx, qloo, "finish_board", bad, TODAY, ON);
+    await runTool(ctx, qloo, "finish_board", bad, TODAY, ON);
+    const third = await runTool(ctx, qloo, "finish_board", VALID_INPUT.finish_board, TODAY, ON);
 
     expect(errorOf(third.content)).toEqual({ error: "LIMIT_REACHED" });
   });
@@ -623,7 +684,7 @@ describe("step summaries", () => {
       ["finish_board", VALID_INPUT.finish_board],
     ];
 
-    for (const [name, input] of calls) await runTool(ctx, qloo, name, input, TODAY);
+    for (const [name, input] of calls) await runTool(ctx, qloo, name, input, TODAY, ON);
     const streamed = JSON.stringify(ctx.steps);
 
     expect(ctx.steps).toHaveLength(calls.length);

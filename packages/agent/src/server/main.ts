@@ -122,6 +122,7 @@ function createAgent(db: Db, config: ServerConfig, qloo: QlooConfig): AgentPort 
     qlooFor: (surface) => qloos[surface],
     modelFor: (surface) => models[surface],
     feeds: { searchShows, lookupShow, safeFetch, parseFeed },
+    trends: config.trends,
   });
 }
 

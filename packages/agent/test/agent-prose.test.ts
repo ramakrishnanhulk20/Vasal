@@ -1,8 +1,10 @@
 // Covers the prose guard on model-written text: digits only through allowed
 // placeholders (C3.4), links and emails removed and counted (C3.5), direction
-// controls stripped (C3.7), and the length and empty refusals. It does not
-// cover spelled-out numbers or disguised links such as "evil dot com", which
-// are named non-goals, or the rendering of the result in the browser.
+// controls stripped (C3.7), the length and empty refusals, and the optional
+// trend-claim refusal. It does not cover spelled-out numbers or disguised
+// links such as "evil dot com", which are named non-goals, synonyms for
+// rising that the trend pattern does not list, or the rendering of the result
+// in the browser.
 import { describe, expect, it } from "vitest";
 import { checkProse, fillPlaceholders } from "../src/agent/prose.js";
 
@@ -76,6 +78,44 @@ describe("checkProse", () => {
   it("throws on a maxChars that is not a positive integer", () => {
     expect(() => checkProse("fine", { maxChars: 0, placeholders: [] })).toThrow(RangeError);
     expect(() => checkProse("fine", { maxChars: 1.5, placeholders: [] })).toThrow(RangeError);
+  });
+});
+
+describe("checkProse with noTrendClaims", () => {
+  const NO_TRENDS = { ...ANGLE, noTrendClaims: true };
+
+  it("refuses each trend claim, in any case and with spaces or dashes", () => {
+    for (const text of [
+      "Rising comedy voice",
+      "A comic on the rise",
+      "An up and coming host",
+      "An up-and-coming host",
+      "An up‑and‑coming host",
+      "Their breakout year",
+      "Trending with younger fans",
+      "A buzzy new voice",
+      "A RISING STAR of sketch",
+      "A surging comic",
+      "Growing in popularity with younger fans",
+    ]) {
+      expect(checkProse(text, NO_TRENDS), text).toEqual({ ok: false, text: "", removed: { links: 0, emails: 0 }, reason: "trend_claim" });
+    }
+  });
+
+  it("lets words that only contain rising pass, because the match is on word boundaries", () => {
+    for (const text of ["A surprising guest", "A film about an uprising", "Questions arising from the show", "Two risings in one story"]) {
+      expect(checkProse(text, NO_TRENDS), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });
+    }
+  });
+
+  it("allows trend words when the option is off or unset", () => {
+    expect(checkProse("A rising comedy voice", ANGLE).ok).toBe(true);
+    expect(checkProse("A rising comedy voice", { ...ANGLE, noTrendClaims: false }).ok).toBe(true);
+  });
+
+  it("checks the text outside listed placeholders, so a placeholder's name never trips it", () => {
+    expect(checkProse("Interest is {{rising}}", { maxChars: 200, placeholders: ["rising"], noTrendClaims: true }).ok).toBe(true);
+    expect(checkProse("Interest is {{rising}}", { maxChars: 200, placeholders: [], noTrendClaims: true }).reason).toBe("trend_claim");
   });
 });
 

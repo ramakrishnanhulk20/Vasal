@@ -75,6 +75,7 @@ const CONFIG: ServerConfig = {
   model: "claude-haiku-5-5",
   effort: "medium",
   anthropicTokensPerDay: 2_000_000,
+  trends: false,
 };
 const QUICK = { book: 3_000, brief: 3_000 };
 
@@ -342,7 +343,7 @@ describe("find_show (F11)", () => {
       },
       parseFeed,
     };
-    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds });
+    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds, trends: true });
     const client = await connect({ agent });
 
     const byName = await call(client, "find_show", { query: "Synthetic Show" });
@@ -776,7 +777,7 @@ describe("ownership (D4.1, D4.2)", () => {
       },
       parseFeed,
     };
-    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds });
+    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds, trends: true });
     const client = await connect({ agent });
     const crafted = Buffer.from("http://10.0.0.1/").toString("base64");
 
@@ -800,6 +801,7 @@ describe("which share MCP spends from (D3.1, D3.2)", () => {
       qlooFor: (surface) => syntheticQloo(surface, surfaces),
       modelFor: (surface) => syntheticModel(surface, surfaces),
       feeds: { searchShows: async () => [directoryShow(1)], lookupShow: async () => null, safeFetch: async () => ({ body: RSS }), parseFeed },
+      trends: true,
     });
     const client = await connect({ agent, waitMs: { book: 20_000, brief: 20_000 } });
 
