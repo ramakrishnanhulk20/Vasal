@@ -127,7 +127,7 @@ function synthResponse(op: QlooOperation): unknown {
         population_percentile: week < 4 ? 70 : 60,
       }));
     case "compare":
-      return [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }];
+      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
     default:
       return [];
   }
@@ -372,10 +372,12 @@ describe("continueRun (C1.5, C6.4)", () => {
     const input: RunInput = { show: "Synthetic Show", exclude: [] };
     const runId = await createRun(db, input, NOW);
     const { qloo: plain } = fakeQloo();
+    const mark = (items: Array<Record<string, unknown>>) =>
+      items.map((item) => (typeof item["name"] === "string" ? { ...item, name: `${item["name"]}${HIDDEN}` } : item));
     const hostile: MeteredQloo = {
       async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
-        const { data } = await plain.call<Array<Record<string, unknown>>>(op);
-        const marked = data.map((item) => (typeof item["name"] === "string" ? { ...item, name: `${item["name"]}${HIDDEN}` } : item));
+        const { data } = await plain.call<unknown>(op);
+        const marked = Array.isArray(data) ? mark(data) : { ...(data as object), tags: mark((data as { tags: Array<Record<string, unknown>> }).tags) };
         return { data: marked as T, fromCache: false };
       },
       stats: plain.stats,

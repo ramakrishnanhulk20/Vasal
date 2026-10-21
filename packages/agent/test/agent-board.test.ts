@@ -134,8 +134,8 @@ describe("buildBoard", () => {
 
   it("ranks by fit, then by lower popularity, with no affinity last at fit 0", () => {
     const ctx = contextWith([
-      [1, "Synthetic A", 0.801, 0.9],
-      [2, "Synthetic B", 0.799, 0.3],
+      [1, "Synthetic A", 0.8, 0.9],
+      [2, "Synthetic B", 0.8, 0.3],
       [3, "Synthetic C", 0.95, 0.99],
       [4, "Synthetic D", null, 0.1],
       [5, "Synthetic E", 0.7, null],
@@ -153,6 +153,41 @@ describe("buildBoard", () => {
       ["Synthetic E", 0.7, true, 4, "bookable"],
       ["Synthetic D", 0, false, 5, "bookable"],
     ]);
+  });
+
+  it("ranks by the unrounded affinity, so 0.9549 beats 0.9512 though both show 0.95", () => {
+    const ctx = contextWith([
+      [1, "Synthetic Lower", 0.9512, 0.1],
+      [2, "Synthetic Higher", 0.9549, 0.9],
+    ]);
+
+    const board = buildBoard(
+      ctx,
+      [1, 2].map((n) => ({ personId: id(n), angle: `pick ${n}` })),
+    );
+
+    expect(board.map((entry) => [entry.name, entry.fit, entry.fitRank])).toEqual([
+      ["Synthetic Higher", 0.95, 1],
+      ["Synthetic Lower", 0.95, 2],
+    ]);
+  });
+
+  it("collapses shared tags that are the same name before keeping the top 5", () => {
+    const ctx = contextWith([[1, "Synthetic Guest", 0.9, 0.5]]);
+    ctx.compares.set(id(1), [
+      { name: "Comedy", score: 0.9 },
+      { name: "comedy", score: 0.85 },
+      { name: "Synthetic Beta", score: 0.8 },
+      { name: " COMEDY ", score: 0.7 },
+      { name: "Synthetic Gamma", score: null },
+      { name: "Synthetic Delta", score: null },
+      { name: "Synthetic Epsilon", score: null },
+      { name: "Synthetic Zeta", score: null },
+    ]);
+
+    const [entry] = buildBoard(ctx, [{ personId: id(1), angle: "angle" }]);
+
+    expect(entry?.sharedTags).toEqual(["Comedy", "Synthetic Beta", "Synthetic Gamma", "Synthetic Delta", "Synthetic Epsilon"]);
   });
 
   it("fills trend, new audience and the top 5 shared tags from the context", () => {

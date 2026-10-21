@@ -9,10 +9,11 @@ import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
-import type { QlooOperation } from "../src/qloo/request.js";
+import { buildQlooRequest, type QlooOperation } from "../src/qloo/request.js";
 
 const MARKER = "MARKER-5d1c";
 const TODAY = new Date("2026-10-19T09:30:00.000Z");
+const IN_30_DAYS = "2026-11-18";
 // A bell, a hidden instruction in invisible Unicode tag characters, a
 // zero-width space and a direction override.
 const asTags = (text: string) => [...text].map((letter) => String.fromCodePoint(0xe0000 + letter.charCodeAt(0))).join("");
@@ -41,7 +42,11 @@ function synthResponse(op: QlooOperation): unknown {
     case "insights":
       return op.filterType === "urn:entity:person"
         ? synthPeople(3)
-        : [1, 2].map((n) => ({ entity_id: `00000000-0000-4000-8000-00000000030${n}`, name: `Synthetic Title ${n} ${MARKER}` }));
+        : [1, 2].map((n) => ({
+            entity_id: `00000000-0000-4000-8000-00000000030${n}`,
+            name: `Synthetic Title ${n} ${MARKER}`,
+            properties: { release_date: IN_30_DAYS, publication_date: IN_30_DAYS },
+          }));
     case "demographics":
       return [
         {
@@ -55,7 +60,11 @@ function synthResponse(op: QlooOperation): unknown {
         population_percentile: week < 4 ? 70 : 60,
       }));
     case "compare":
-      return [0.9, 0.2, 0.7].map((score, n) => ({ tag_id: `urn:tag:synthetic:${n}`, name: `taste ${n} ${MARKER}`, query: { score } }));
+      return {
+        tags: [0.9, 0.2, 0.7].map((score, n) => ({ tag_id: `urn:tag:synthetic:${n}`, name: `taste ${n} ${MARKER}`, query: { score } })),
+        a: [{ tag_id: "urn:tag:synthetic_show:side", name: `side taste ${MARKER}` }],
+        b: [{ tag_id: "urn:tag:synthetic_person:side", name: `Side Taste ${MARKER}` }],
+      };
     case "search":
       return [{ entity_id: personId(50), name: `Synthetic Found ${MARKER}`, popularity: 0.3, query: { affinity: 0.99 } }];
     case "tags":
@@ -242,6 +251,39 @@ describe("tool requests and results", () => {
     expect(ctx.people.get(personId(2))).toEqual({ name: `Synthetic Person 2 ${MARKER}`, affinity: 0.977, popularity: 0.51 });
   });
 
+  it("never records a person with a death date, from the people list or from a name search", async () => {
+    const ctx = newContext();
+    const people = synthPeople(3).map((person, n) =>
+      n === 1 ? { ...person, properties: { date_of_death: "1901-02-03", gender: "synthetic" } } : person,
+    );
+    const { qloo } = fakeQloo((op) => (op.op === "search" ? [{ ...people[1]!, entity_id: personId(51) }] : people));
+
+    const listed = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Person 2" }, TODAY);
+
+    expect((JSON.parse(listed.content) as { people: Array<{ personId: string }> }).people.map((person) => person.personId)).toEqual([
+      personId(1),
+      personId(3),
+    ]);
+    expect(JSON.parse(found.content)).toEqual({ people: [] });
+    expect([...ctx.people.keys()]).toEqual([personId(1), personId(3)]);
+    expect(ctx.steps.map((entry) => entry.summary)).toEqual(["found 2 people", "found 0 matching people"]);
+  });
+
+  it("drops a person recorded alive once a later answer carries their death date", async () => {
+    const ctx = newContext();
+    const alive = synthPeople(2);
+    const later = alive.map((person, n) => (n === 0 ? { ...person, properties: { date_of_death: "1901-02-03" } } : person));
+    let calls = 0;
+    const { qloo } = fakeQloo(() => (calls++ === 0 ? alive : later));
+
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    expect([...ctx.people.keys()]).toEqual([personId(1), personId(2)]);
+    await runTool(ctx, qloo, "people_for_show", { reach: "bookable" }, TODAY);
+
+    expect([...ctx.people.keys()]).toEqual([personId(2)]);
+  });
+
   it("fetches the show's audience once and returns a person's strongest segments as words", async () => {
     const { ctx, qloo, ops } = await withPeople();
 
@@ -280,32 +322,60 @@ describe("tool requests and results", () => {
     const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY);
 
     expect(ops.at(-1)).toEqual({ op: "compare", a: [SHOW.qlooId], b: [personId(1)], take: 10 });
-    expect(JSON.parse(outcome.content)).toEqual({ sharedTastes: [`taste 0 ${MARKER}`, `taste 2 ${MARKER}`, `taste 1 ${MARKER}`] });
+    expect(JSON.parse(outcome.content)).toEqual({
+      sharedTastes: [`taste 0 ${MARKER}`, `taste 2 ${MARKER}`, `taste 1 ${MARKER}`, `side taste ${MARKER}`],
+    });
   });
 
-  it("filters releases from today, by year for books, and returns titles only", async () => {
+  it("asks for releases from this year on, by release year for films and TV and publication year for books", async () => {
     const ctx = newContext();
     const { qloo, ops } = fakeQloo();
 
     const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY);
+    await runTool(ctx, qloo, "upcoming_releases", { kind: "tv_show" }, TODAY);
     await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY);
 
-    expect(ops[0]).toEqual({
-      op: "insights",
-      filterType: "urn:entity:movie",
-      signalEntities: [SHOW.qlooId],
-      take: 10,
-      releaseDateMin: "2026-10-19",
-    });
-    expect(ops[1]).toEqual({
-      op: "insights",
-      filterType: "urn:entity:book",
-      signalEntities: [SHOW.qlooId],
-      take: 10,
-      publicationYearMin: 2026,
-    });
+    const base = { op: "insights", signalEntities: [SHOW.qlooId], take: 20 };
+    expect(ops).toEqual([
+      { ...base, filterType: "urn:entity:movie", releaseYearMin: 2026 },
+      { ...base, filterType: "urn:entity:tv_show", releaseYearMin: 2026 },
+      { ...base, filterType: "urn:entity:book", publicationYearMin: 2026 },
+    ]);
+    const sent = ops.map((op) => buildQlooRequest(new URL("https://synthetic.example"), op));
+    expect(sent.map((request) => request.url.searchParams.get("filter.release_year.min"))).toEqual(["2026", "2026", null]);
+    expect(sent[2]?.url.searchParams.get("filter.publication_year.min")).toBe("2026");
+    expect(sent.flatMap((request) => request.params.map(([key]) => key)).some((key) => key.includes("release_date"))).toBe(false);
     expect(JSON.parse(movies.content)).toEqual({ titles: [`Synthetic Title 1 ${MARKER}`, `Synthetic Title 2 ${MARKER}`] });
     expect(ctx.people.size).toBe(0);
+  });
+
+  it("keeps only releases whose own date falls from today to two years ahead, and counts only those", async () => {
+    const ctx = newContext();
+    const title = (n: number, properties?: Record<string, unknown>) => ({
+      entity_id: `00000000-0000-4000-8000-00000000031${n}`,
+      name: `Synthetic Release ${n}`,
+      ...(properties === undefined ? {} : { properties }),
+    });
+    const films = [
+      title(1, { release_date: IN_30_DAYS }),
+      title(2, { release_date: "2025-06-01" }),
+      title(3),
+      title(4, { release_date: null }),
+      title(5, { release_date: "2026" }),
+      title(6, { release_date: 2027 }),
+      title(7, { release_date: "2026-02-30" }),
+      title(8, { release_date: "2028-10-18" }),
+      title(9, { release_date: "2028-10-19" }),
+    ];
+    const books = [title(1, { publication_date: "2400-01-01", publication_year: 2400 }), title(2, { publication_date: "2027-01-05" })];
+    const { qloo } = fakeQloo((op) => (op.op === "insights" && op.filterType === "urn:entity:book" ? books : films));
+
+    const movies = await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY);
+    const reading = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY);
+
+    expect(JSON.parse(movies.content)).toEqual({ titles: [1, 6, 8].map((n) => `Synthetic Release ${n}`) });
+    expect(JSON.parse(reading.content)).toEqual({ titles: ["Synthetic Release 2"] });
+    expect(ctx.steps.map((entry) => entry.summary)).toEqual(["found 3 upcoming movies", "found 1 upcoming books"]);
   });
 
   it("records a found person without affinity, so a search score never becomes fit", async () => {
@@ -339,11 +409,16 @@ describe("tool requests and results", () => {
 
   it("cleans tag characters, a bell and invisible characters out of every Qloo and feed string before the model sees it (C2.8)", async () => {
     const ctx = newContext([`Episode with a past guest${HIDDEN}`]);
-    const { qloo } = fakeQloo((op) =>
-      (synthResponse(op) as Array<Record<string, unknown>>).map((item) =>
+    const hide = (items: unknown) =>
+      (items as Array<Record<string, unknown>>).map((item) =>
         typeof item["name"] === "string" ? { ...item, name: `${item["name"]}${HIDDEN}` } : item,
-      ),
-    );
+      );
+    const { qloo } = fakeQloo((op) => {
+      const data = synthResponse(op);
+      if (Array.isArray(data)) return hide(data);
+      const { tags, a, b } = data as Record<string, unknown>;
+      return { tags: hide(tags), a: hide(a), b: hide(b) };
+    });
 
     const people = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
     const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY);
@@ -355,7 +430,7 @@ describe("tool requests and results", () => {
       [1, 2, 3].map((n) => `Synthetic Person ${n} ${MARKER}`),
     );
     expect(JSON.parse(found.content)).toEqual({ people: [{ personId: personId(50), name: `Synthetic Found ${MARKER}` }] });
-    expect(JSON.parse(tastes.content)).toEqual({ sharedTastes: [0, 2, 1].map((n) => `taste ${n} ${MARKER}`) });
+    expect(JSON.parse(tastes.content)).toEqual({ sharedTastes: [...[0, 2, 1].map((n) => `taste ${n} ${MARKER}`), `side taste ${MARKER}`] });
     expect(JSON.parse(releases.content)).toEqual({ titles: [1, 2].map((n) => `Synthetic Title ${n} ${MARKER}`) });
     expect(JSON.parse(episodes.content)).toEqual({ titles: ["Episode with a past guest"] });
     for (const outcome of [people, found, tastes, releases, episodes]) {
@@ -383,6 +458,77 @@ describe("tool requests and results", () => {
     expect(body.omitted).toBeGreaterThan(0);
     expect(body.people.length + body.omitted).toBe(20);
     expect(body.people.every((person) => [...person.name].length === 120)).toBe(true);
+  });
+});
+
+describe("shared_taste matching", () => {
+  const idTag = (name: string, score: number, family = "synthetic_family") => ({
+    tag_id: `urn:tag:${family}:${name.toLowerCase().replace(/\W+/gu, "_")}`,
+    name,
+    query: { score },
+  });
+  const side = (...names: string[]) => names.map((name, n) => ({ tag_id: `urn:tag:synthetic_side:${n}`, name }));
+
+  async function tastesFor(compare: { tags: unknown[]; a: unknown[]; b: unknown[] }) {
+    const ctx = newContext();
+    const { qloo } = fakeQloo((op) => (op.op === "compare" ? compare : synthResponse(op)));
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY);
+    const outcome = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY);
+    return {
+      stored: ctx.compares.get(personId(1)),
+      shown: (JSON.parse(outcome.content) as { sharedTastes: string[] }).sharedTastes,
+      summary: ctx.steps.at(-1)?.summary,
+    };
+  }
+
+  it("counts a tag Qloo matched by id and a name both sides carry under different ids", async () => {
+    const { stored, shown } = await tastesFor({
+      tags: [idTag("Synthetic Alpha", 0.71)],
+      a: side("Synthetic Alpha", "Synthetic Beta", "Synthetic Gamma"),
+      b: side("Synthetic Delta", "Synthetic Beta", "Synthetic Alpha"),
+    });
+
+    expect(stored).toEqual([
+      { name: "Synthetic Alpha", score: 0.71 },
+      { name: "Synthetic Beta", score: null },
+    ]);
+    expect(shown).toEqual(["Synthetic Alpha", "Synthetic Beta"]);
+  });
+
+  it("gives one entry for a name found in two tag families", async () => {
+    const { stored } = await tastesFor({
+      tags: [idTag("Comedy", 0.7, "synthetic_genre"), idTag("Comedy", 0.69, "synthetic_style")],
+      a: side("Comedy", "Comedy"),
+      b: side("Comedy"),
+    });
+
+    expect(stored).toEqual([{ name: "Comedy", score: 0.7 }]);
+  });
+
+  it("folds curly and straight quotes and case together, keeping the first spelling seen", async () => {
+    const { stored } = await tastesFor({
+      tags: [idTag("Synthetic “Quoted” Taste", 0.7)],
+      a: side('SYNTHETIC "QUOTED" TASTE', "Synthetic Fan’s Pick"),
+      b: side('synthetic "quoted" taste', "synthetic fan's pick"),
+    });
+
+    expect(stored).toEqual([
+      { name: "Synthetic “Quoted” Taste", score: 0.7 },
+      { name: "Synthetic Fan’s Pick", score: null },
+    ]);
+  });
+
+  it("gives the id matches only when either side's list is empty", async () => {
+    const both = side("Synthetic Alpha", "Synthetic Beta");
+    for (const [a, b] of [
+      [[], both],
+      [both, []],
+    ]) {
+      const { stored, summary } = await tastesFor({ tags: [idTag("Synthetic Alpha", 0.7)], a: a ?? [], b: b ?? [] });
+
+      expect(stored).toEqual([{ name: "Synthetic Alpha", score: 0.7 }]);
+      expect(summary).toBe("found 1 shared tastes");
+    }
   });
 });
 
@@ -488,7 +634,7 @@ describe("step summaries", () => {
       "found 3 people",
       "read one audience, 3 strong segments",
       "read 12 weeks of trend data, rising",
-      "found 3 shared tastes",
+      "found 4 shared tastes",
       "found 2 upcoming TV shows",
       "found 1 matching people",
       "shared 1 episode titles",

@@ -31,7 +31,7 @@ export type QlooOperation =
       popularityMin?: number;
       explainability?: boolean;
       resultEntities?: string[];
-      releaseDateMin?: string;
+      releaseYearMin?: number;
       publicationYearMin?: number;
     }
   | { op: "demographics"; signalEntities: string[] }
@@ -87,7 +87,7 @@ const InsightsOperation = z
     popularityMin: Popularity.optional(),
     explainability: z.boolean().optional(),
     resultEntities: EntityIds.optional(),
-    releaseDateMin: IsoDate.optional(),
+    releaseYearMin: Year.optional(),
     publicationYearMin: Year.optional(),
   })
   .strict()
@@ -171,7 +171,7 @@ function pathAndFields(op: CheckedOperation): { path: string; fields: Field[] } 
           ["filter.popularity.min", optionalText(op.popularityMin)],
           ["feature.explainability", optionalText(op.explainability)],
           ["filter.results.entities", optionalSet(op.resultEntities)],
-          ["filter.release_date.min", op.releaseDateMin],
+          ["filter.release_year.min", optionalText(op.releaseYearMin)],
           ["filter.publication_year.min", optionalText(op.publicationYearMin)],
         ],
       };

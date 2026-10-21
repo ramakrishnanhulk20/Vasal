@@ -67,6 +67,18 @@ const byScoreDesc = (a: SharedTag, b: SharedTag) => {
   return b.score - a.score;
 };
 
+// Repeats are judged on the cleaned text the page shows, through the one
+// name normaliser, because Qloo often files one concept in two tag families.
+function uniqueNames(names: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return names.filter((name) => {
+    const key = normalizeName(name);
+    if (key === "" || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 // The board is what gets stored and shown, so it cleans every name, tag and
 // angle itself rather than trusting whatever filled the context (C3.7,
 // D5.2). Trimming comes between cleaning and the cap, so spaces hidden behind
@@ -175,15 +187,24 @@ export function reachFrom(popularity: number | null): BoardEntry["reach"] {
  * and both sides go through normalizeName, so case, spacing and invisible
  * characters do not matter (C2.7, C8.3). Every number
  * comes from the context: fit is the Qloo affinity rounded to 2 decimals,
- * ranked highest first, ties broken by lower popularity and then by pick
- * order. A person with no affinity gets fit 0, fitKnown false, and ranks
- * last. Precondition: each angle has already passed checkProse, which
- * finish_board does before it returns picks.
+ * ranked by the unrounded affinity highest first, so two guests who both show
+ * 0.95 still rank in their true order, ties broken by lower popularity and
+ * then by pick order. A person with no affinity gets fit 0, fitKnown false,
+ * and ranks last. Shared tags are deduplicated through normalizeName before
+ * the top 5 are kept. Precondition: each angle has already passed
+ * checkProse, which finish_board does before it returns picks.
  */
 export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: string; angle: string }>): BoardEntry[] {
   const excluded = new Set(ctx.exclusions.map(normalizeName).filter((name) => name !== ""));
   const seen = new Set<string>();
-  const kept: Array<{ personId: string; angle: string; name: string; fit: number; fitKnown: boolean; popularity: number | null }> = [];
+  const kept: Array<{
+    personId: string;
+    angle: string;
+    name: string;
+    affinity: number;
+    fitKnown: boolean;
+    popularity: number | null;
+  }> = [];
 
   for (const pick of picks) {
     const person = ctx.people.get(pick.personId);
@@ -196,7 +217,7 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
       personId: pick.personId,
       angle: cleanLine(pick.angle, MAX_ANGLE_CHARS),
       name,
-      fit: isFiniteNumber(affinity) ? round2(affinity) : 0,
+      affinity: isFiniteNumber(affinity) ? affinity : 0,
       fitKnown: isFiniteNumber(affinity),
       popularity: isFiniteNumber(person.popularity) ? person.popularity : null,
     });
@@ -204,7 +225,7 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
 
   kept.sort((a, b) => {
     if (a.fitKnown !== b.fitKnown) return a.fitKnown ? -1 : 1;
-    if (a.fit !== b.fit) return b.fit - a.fit;
+    if (a.affinity !== b.affinity) return b.affinity - a.affinity;
     if (a.popularity === b.popularity) return 0;
     if (a.popularity === null) return 1;
     if (b.popularity === null) return -1;
@@ -213,15 +234,13 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
 
   return kept.map((entry, index) => {
     const personDemographics = ctx.personDemographics.get(entry.personId);
-    const sharedTags = [...(ctx.compares.get(entry.personId) ?? [])]
-      .sort(byScoreDesc)
-      .map((tag) => cleanLine(tag.name, MAX_TAG_CHARS))
-      .filter((tag) => tag !== "")
-      .slice(0, SHARED_TAGS_SHOWN);
+    const sharedTags = uniqueNames(
+      [...(ctx.compares.get(entry.personId) ?? [])].sort(byScoreDesc).map((tag) => cleanLine(tag.name, MAX_TAG_CHARS)),
+    ).slice(0, SHARED_TAGS_SHOWN);
     return {
       personId: entry.personId,
       name: entry.name,
-      fit: entry.fit,
+      fit: round2(entry.affinity),
       fitKnown: entry.fitKnown,
       fitRank: index + 1,
       reach: reachFrom(entry.popularity),

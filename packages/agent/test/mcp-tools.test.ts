@@ -957,7 +957,7 @@ function synthResponse(op: QlooOperation): unknown {
         population_percentile: 60,
       }));
     case "compare":
-      return [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }];
+      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
     default:
       return [];
   }

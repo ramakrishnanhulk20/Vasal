@@ -35,7 +35,7 @@ function synthResponse(op: QlooOperation): unknown {
     case "trending":
       return [];
     case "compare":
-      return [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }];
+      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
     default:
       return [];
   }

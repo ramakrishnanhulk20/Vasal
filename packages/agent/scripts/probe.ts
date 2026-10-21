@@ -15,7 +15,7 @@ import { createQlooClient } from "../src/qloo/client.js";
 import { QlooError, type QlooErrorCode } from "../src/qloo/errors.js";
 import { startHarness, type QlooHarness } from "../src/qloo/harness.js";
 import { buildQlooRequest, type BuiltRequest, type EntityType, type QlooOperation } from "../src/qloo/request.js";
-import type { QlooCompareTag, QlooDemographic, QlooEntity, QlooTrendRow } from "../src/qloo/schemas.js";
+import type { QlooCompareResult, QlooDemographic, QlooEntity, QlooTrendRow } from "../src/qloo/schemas.js";
 
 const NO_KEY_MESSAGE = "QLOO_API_KEY is not set. Add it to .env (see .env.example).";
 const USAGE = "Usage: npm run probe -- [--dry-run] [--limit N] [--max-calls N]";
@@ -229,7 +229,6 @@ async function main(): Promise<number> {
   const baseUrl = config.baseUrl;
 
   const now = new Date();
-  const today = now.toISOString().slice(0, 10);
   const currentYear = now.getUTCFullYear();
   const trendWindow = lastFullWeeks(TREND_WEEKS, now);
 
@@ -426,7 +425,7 @@ async function main(): Promise<number> {
 
     const topPerson = topPeople[0];
     if (topPerson !== undefined) {
-      const compare = await run<QlooCompareTag[]>(`${tag} compare podcast vs top person`, {
+      const compare = await run<QlooCompareResult>(`${tag} compare podcast vs top person`, {
         op: "compare",
         a: [podcastId],
         b: [topPerson],
@@ -434,8 +433,8 @@ async function main(): Promise<number> {
       });
       if (compare.kind === "ok") {
         tally.compareTried += 1;
-        if (compare.data.length > 0) tally.compareOk += 1;
-        row.compare = compare.data.length > 0 ? "Y" : "0";
+        if (compare.data.tags.length > 0) tally.compareOk += 1;
+        row.compare = compare.data.tags.length > 0 ? "Y" : "0";
       } else if (isFailure(compare)) {
         tally.compareTried += 1;
         row.compare = failureCell(compare);
@@ -443,8 +442,8 @@ async function main(): Promise<number> {
     }
 
     const upcomingOps: Array<[string, QlooOperation]> = [
-      ["movies", { op: "insights", filterType: "urn:entity:movie", signalEntities: [podcastId], take: LIST_TAKE, releaseDateMin: today }],
-      ["tv shows", { op: "insights", filterType: "urn:entity:tv_show", signalEntities: [podcastId], take: LIST_TAKE, releaseDateMin: today }],
+      ["movies", { op: "insights", filterType: "urn:entity:movie", signalEntities: [podcastId], take: LIST_TAKE, releaseYearMin: currentYear }],
+      ["tv shows", { op: "insights", filterType: "urn:entity:tv_show", signalEntities: [podcastId], take: LIST_TAKE, releaseYearMin: currentYear }],
       ["books", { op: "insights", filterType: "urn:entity:book", signalEntities: [podcastId], take: LIST_TAKE, publicationYearMin: currentYear }],
     ];
     const upcomingCells: string[] = [];

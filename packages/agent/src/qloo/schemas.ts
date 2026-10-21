@@ -75,10 +75,28 @@ const CompareTagSchema = z
   })
   .passthrough();
 
+// `a` and `b` list every tag each side carries, shared or not. Only the name
+// is read from them, and a side Qloo leaves out reads as an empty list.
+const CompareSideTagSchema = z.object({ name: z.string() }).passthrough();
+
+const CompareResultSchema = z.object({
+  tags: z.array(CompareTagSchema),
+  a: z.array(CompareSideTagSchema),
+  b: z.array(CompareSideTagSchema),
+});
+
 const CompareResponse = z
-  .object({ results: z.object({ tags: z.array(CompareTagSchema) }).passthrough() })
+  .object({
+    results: z
+      .object({
+        tags: z.array(CompareTagSchema),
+        a: z.array(CompareSideTagSchema).nullish(),
+        b: z.array(CompareSideTagSchema).nullish(),
+      })
+      .passthrough(),
+  })
   .passthrough()
-  .transform((response) => response.results.tags);
+  .transform(({ results }) => ({ tags: results.tags, a: results.a ?? [], b: results.b ?? [] }));
 
 // The tag search page shows `id`; taste analysis shows `tag_id`. Qloo's own
 // harness reads either, so one of them must be present.
@@ -100,6 +118,7 @@ export type QlooEntity = z.infer<typeof EntitySchema>;
 export type QlooDemographic = z.infer<typeof DemographicSchema>;
 export type QlooTrendRow = z.infer<typeof TrendRowSchema>;
 export type QlooCompareTag = z.infer<typeof CompareTagSchema>;
+export type QlooCompareResult = z.infer<typeof CompareResultSchema>;
 export type QlooTag = z.infer<typeof TagSchema>;
 
 export type QlooResponseFor<Op extends QlooOperation["op"]> = {
@@ -107,21 +126,23 @@ export type QlooResponseFor<Op extends QlooOperation["op"]> = {
   insights: QlooEntity[];
   demographics: QlooDemographic[];
   trending: QlooTrendRow[];
-  compare: QlooCompareTag[];
+  compare: QlooCompareResult;
   tags: QlooTag[];
 }[Op];
 
 /**
- * Schemas for the normalised lists parseQlooResponse returns, one per
+ * Schemas for the normalised values parseQlooResponse returns, one per
  * operation. A cached value is checked against the one for its operation when
- * it is read back, so a row that no longer fits counts as missing (C6.5).
+ * it is read back, so a row that no longer fits counts as missing (C6.5). A
+ * compare cached as a bare tag list before `a` and `b` were kept no longer
+ * fits, so it is fetched again.
  */
 export const NORMALISED_SCHEMAS: { [Op in QlooOperation["op"]]: z.ZodType<QlooResponseFor<Op>> } = {
   search: z.array(EntitySchema),
   insights: z.array(EntitySchema),
   demographics: z.array(DemographicSchema),
   trending: z.array(TrendRowSchema),
-  compare: z.array(CompareTagSchema),
+  compare: CompareResultSchema,
   tags: z.array(TagSchema),
 };
 
@@ -136,7 +157,8 @@ const RESPONSE_SCHEMAS = {
 
 /**
  * Checks a decoded Qloo response body against the shape expected for `op` and
- * returns the normalised list Vasal reads.
+ * returns the normalised value Vasal reads: a list for most operations, and
+ * for compare the shared tags plus every tag name on each side.
  *
  * Throws QlooError("QLOO_SCHEMA") when the body does not match. The thrown
  * error never carries the body.

@@ -3,10 +3,10 @@ import { z } from "zod";
 import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo } from "../qloo/metered.js";
 import type { EntityType, QlooOperation } from "../qloo/request.js";
-import type { QlooCompareTag, QlooDemographic, QlooEntity, QlooTrendRow } from "../qloo/schemas.js";
-import { cleanText } from "../text/normalize.js";
+import type { QlooCompareResult, QlooDemographic, QlooEntity, QlooTrendRow } from "../qloo/schemas.js";
+import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
-import type { Demographics, RunContext, StepSummary } from "./context.js";
+import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
 import { checkProse } from "./prose.js";
 
 export type ToolName =
@@ -46,7 +46,9 @@ const MAX_FIND_NAME_CHARS = 100;
 const MIN_PICKS = 3;
 const MAX_PICKS = 10;
 const PEOPLE_TAKE = 20;
-const RELEASES_TAKE = 10;
+// Qloo returns past titles too and only those dated ahead are kept: in the
+// first live sample 12 of 20 films survived, so 20 leaves a usable list.
+const RELEASES_TAKE = 20;
 const FIND_TAKE = 3;
 const COMPARE_TAKE = 10;
 const SHARED_TASTES_SHOWN = 5;
@@ -69,6 +71,14 @@ const RELEASE_TYPE: Record<ReleaseKind, EntityType> = {
   book: "urn:entity:book",
 };
 const RELEASE_WORDS: Record<ReleaseKind, string> = { movie: "movies", tv_show: "TV shows", book: "books" };
+const RELEASE_DATE_PROPERTY: Record<ReleaseKind, "release_date" | "publication_date"> = {
+  movie: "release_date",
+  tv_show: "release_date",
+  book: "publication_date",
+};
+const UPCOMING_DAYS = 730;
+const RELEASE_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+const RELEASE_YEAR = /^[1-9]\d{3}$/;
 
 const PersonId = z.string().min(1).max(64);
 
@@ -226,8 +236,53 @@ function listOf<T>(data: unknown): T[] {
   return data as T[];
 }
 
+function compareOf(data: unknown): QlooCompareResult {
+  if (typeof data !== "object" || data === null) throw new QlooError("QLOO_SCHEMA");
+  const { tags, a, b } = data as Partial<QlooCompareResult>;
+  if (!Array.isArray(tags) || !Array.isArray(a) || !Array.isArray(b)) throw new QlooError("QLOO_SCHEMA");
+  return { tags, a, b };
+}
+
+// compare.tags matches tag ids only, and the same concept often sits in
+// different tag families on a show and a person, so a name both sides carry
+// counts as shared too. Every name goes through cleanField and then
+// normalizeName before it is matched or deduplicated, so both sides of each
+// comparison come out of the same normaliser.
+function sharedTagsOf({ tags, a, b }: QlooCompareResult): SharedTag[] {
+  const keyOf = (name: string) => normalizeName(cleanField(name, MAX_NAME_CHARS));
+  const personSide = new Set(b.map((tag) => keyOf(tag.name)));
+  const seen = new Set<string>();
+  const shared: SharedTag[] = [];
+  const add = (raw: string, score: number | null) => {
+    const name = cleanField(raw, MAX_NAME_CHARS);
+    const key = normalizeName(name);
+    if (key === "" || seen.has(key)) return;
+    seen.add(key);
+    shared.push({ name, score });
+  };
+  for (const tag of tags) add(tag.name, isFiniteNumber(tag.query?.score) ? tag.query.score : null);
+  for (const tag of a) if (personSide.has(keyOf(tag.name))) add(tag.name, null);
+  return shared;
+}
+
+// Qloo ranks people who have died as high as anyone, and they can never be
+// booked. Any death date that is not empty counts, including one in a shape
+// never seen, so an odd value drops the person rather than letting them in.
+function hasDied(entity: QlooEntity): boolean {
+  const died = entity.properties?.date_of_death;
+  return died !== undefined && died !== null && died !== "";
+}
+
+// Every person a tool returns passes through here, so a person dropped here
+// never reaches the model, the board, compare or demographics.
 function recordPerson(ctx: RunContext, entity: QlooEntity, affinity: number | null): { personId: string; name: string } | null {
   if (!QLOO_ID.test(entity.entity_id)) return null;
+  // A later answer can carry a death date an earlier one lacked; the person
+  // then leaves the run, so the board never lists them.
+  if (hasDied(entity)) {
+    ctx.people.delete(entity.entity_id);
+    return null;
+  }
   const name = cleanField(entity.name, MAX_NAME_CHARS);
   if (name === "") return null;
   const popularity = isFiniteNumber(entity.popularity) ? entity.popularity : null;
@@ -272,6 +327,35 @@ function fullWeeksBefore(today: Date, weeks: number): { startDate: string; endDa
   const end = midnight - (weekday === 0 ? 7 : weekday) * DAY_MS;
   const start = end - (weeks * 7 - 1) * DAY_MS;
   return { startDate: isoDate(new Date(start)), endDate: isoDate(new Date(end)) };
+}
+
+// The first and last UTC day a release date can mean: one day for
+// YYYY-MM-DD, the whole year for a bare year. An impossible day such as
+// 2026-02-30, or any other shape, gives null.
+function releaseSpan(value: unknown): { first: number; last: number } | null {
+  const text = typeof value === "number" && Number.isInteger(value) ? String(value) : value;
+  if (typeof text !== "string") return null;
+  if (RELEASE_YEAR.test(text)) {
+    const year = Number(text);
+    return { first: Date.UTC(year, 0, 1), last: Date.UTC(year, 11, 31) };
+  }
+  const day = RELEASE_DAY.exec(text);
+  if (day === null) return null;
+  const ms = Date.UTC(Number(day[1]), Number(day[2]) - 1, Number(day[3]));
+  return isoDate(new Date(ms)) === text ? { first: ms, last: ms } : null;
+}
+
+// Qloo ignores the release date filter on films and TV, and its book year
+// filter still returns placeholder years centuries ahead, so each row's own
+// date is checked here against today and the next two years. A bare year
+// counts only when the whole year is inside that window, so a film dated just
+// by a year already under way, and maybe already out, is never called
+// upcoming. A row with no usable date is dropped.
+function isUpcoming(entity: QlooEntity, kind: ReleaseKind, today: Date): boolean {
+  const span = releaseSpan(entity.properties?.[RELEASE_DATE_PROPERTY[kind]]);
+  if (span === null) return false;
+  const start = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  return span.first >= start && span.last <= start + UPCOMING_DAYS * DAY_MS;
 }
 
 const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
@@ -338,15 +422,13 @@ const trendOf: Handler<"trend_of"> = async (ctx, qloo, input, today) => {
 
 const sharedTaste: Handler<"shared_taste"> = async (ctx, qloo, input) => {
   if (!ctx.people.has(input.personId)) return refusal(ctx, "shared_taste", "UNKNOWN_PERSON", "refused: person not found in this run");
-  const { data } = await qloo.call<QlooCompareTag[]>({
+  const { data } = await qloo.call<QlooCompareResult>({
     op: "compare",
     a: [ctx.show.qlooId],
     b: [input.personId],
     take: COMPARE_TAKE,
   });
-  const tags = listOf<QlooCompareTag>(data)
-    .map((tag) => ({ name: cleanField(tag.name, MAX_NAME_CHARS), score: isFiniteNumber(tag.query?.score) ? tag.query.score : null }))
-    .filter((tag) => tag.name !== "");
+  const tags = sharedTagsOf(compareOf(data));
   ctx.compares.set(input.personId, tags);
   const top = [...tags]
     .sort((a, b) => (a.score === b.score ? 0 : a.score === null ? 1 : b.score === null ? -1 : b.score - a.score))
@@ -357,14 +439,16 @@ const sharedTaste: Handler<"shared_taste"> = async (ctx, qloo, input) => {
 };
 
 const upcomingReleases: Handler<"upcoming_releases"> = async (ctx, qloo, input, today) => {
+  const year = today.getUTCFullYear();
   const { data } = await qloo.call<QlooEntity[]>({
     op: "insights",
     filterType: RELEASE_TYPE[input.kind],
     signalEntities: [ctx.show.qlooId],
     take: RELEASES_TAKE,
-    ...(input.kind === "book" ? { publicationYearMin: today.getUTCFullYear() } : { releaseDateMin: isoDate(today) }),
+    ...(input.kind === "book" ? { publicationYearMin: year } : { releaseYearMin: year }),
   });
   const titles = listOf<QlooEntity>(data)
+    .filter((entity) => isUpcoming(entity, input.kind, today))
     .map((entity) => cleanField(entity.name, MAX_TITLE_CHARS))
     .filter((title) => title !== "");
   step(ctx, "upcoming_releases", true, `found ${titles.length} upcoming ${RELEASE_WORDS[input.kind]}`);

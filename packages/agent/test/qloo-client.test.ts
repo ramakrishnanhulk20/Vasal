@@ -260,9 +260,17 @@ describe("parseQlooResponse (synthetic fixtures only)", () => {
 
     const compare = parseQlooResponse(
       { op: "compare", a: [SYNTH_ID], b: [SYNTH_ID] },
-      { duration: 0.4, results: { tags: [{ tag_id: "urn:tag:synthetic:one", name: "Synthetic One", query: { score: 0.7 } }] } },
+      {
+        duration: 0.4,
+        results: {
+          tags: [{ tag_id: "urn:tag:synthetic:one", name: "Synthetic One", query: { score: 0.7 } }],
+          a: [{ tag_id: "urn:tag:synthetic:two", name: "Synthetic Two", query: { count: "1" } }],
+        },
+      },
     );
-    expect(compare[0]?.query?.score).toBe(0.7);
+    expect(compare.tags[0]?.query?.score).toBe(0.7);
+    expect(compare.a.map((tag) => tag.name)).toEqual(["Synthetic Two"]);
+    expect(compare.b).toEqual([]);
 
     const tags = parseQlooResponse(
       { op: "tags", query: "synthetic" },
@@ -280,6 +288,7 @@ describe("parseQlooResponse (synthetic fixtures only)", () => {
       [{ op: "demographics", signalEntities: [SYNTH_ID] }, { results: { demographics: [{ entity_id: SYNTH_ID, query: { age: { x: "y" }, gender: {} } }] } }],
       [{ op: "trending", filterType: "urn:entity:person", entity: SYNTH_ID, startDate: "2026-07-27", endDate: "2026-10-18" }, { results: { trending: [{ population_rank: 3 }] } }],
       [{ op: "compare", a: [SYNTH_ID], b: [SYNTH_ID] }, { results: { entities: [] } }],
+      [{ op: "compare", a: [SYNTH_ID], b: [SYNTH_ID] }, { results: { tags: [], b: [{ tag_id: "urn:tag:synthetic:nameless" }] } }],
       [{ op: "tags", query: "q" }, { results: { tags: [{ name: "No id at all" }] } }],
       [SEARCH, null],
     ];
