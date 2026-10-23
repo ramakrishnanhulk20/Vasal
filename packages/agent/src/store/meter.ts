@@ -109,16 +109,19 @@ async function reserveWithin(tx: Db, totals: Map<string, number>, now: Date): Pr
 
 /**
  * Operator use. Creates the bucket, or updates an existing one's cap. When the
- * stored window has already ended, it also resets used to 0 and moves
- * window_end to policy.windowEnd; inside a live window, used and window_end
- * are left alone. Throws StoreError("STORE_BAD_INPUT") for a key outside 1 to
- * 200 characters, a cap that is not a non-negative safe integer, or an
- * invalid date.
+ * stored window has already ended, or ends within `opts.graceMs` (default 0)
+ * of now, it also resets used to 0 and moves window_end to policy.windowEnd;
+ * otherwise used and window_end are left alone. Throws
+ * StoreError("STORE_BAD_INPUT") for a key outside 1 to 200 characters, a cap
+ * that is not a non-negative safe integer, an invalid date, or a graceMs
+ * that is not a whole number from 0 to 86,400,000.
  */
-export async function setBucket(db: Db, policy: BucketPolicy): Promise<void> {
+export async function setBucket(db: Db, policy: BucketPolicy, opts: { graceMs?: number } = {}): Promise<void> {
   const key = checkKey(policy.key);
   if (!Number.isSafeInteger(policy.cap) || policy.cap < 0) throw badInput();
   const windowEnd = checkInstant(policy.windowEnd);
+  const graceMs = opts.graceMs ?? 0;
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > 24 * 60 * 60 * 1_000) throw badInput();
 
   await db.query(
     `INSERT INTO usage_buckets AS b (key, cap, used, window_end)
@@ -127,7 +130,7 @@ export async function setBucket(db: Db, policy: BucketPolicy): Promise<void> {
        cap = excluded.cap,
        used = CASE WHEN b.window_end <= $4::timestamptz THEN 0 ELSE b.used END,
        window_end = CASE WHEN b.window_end <= $4::timestamptz THEN excluded.window_end ELSE b.window_end END`,
-    [key, policy.cap, windowEnd.toISOString(), new Date().toISOString()],
+    [key, policy.cap, windowEnd.toISOString(), new Date(Date.now() + graceMs).toISOString()],
   );
 }
 

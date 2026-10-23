@@ -284,6 +284,7 @@ describe("startRun (C6.2)", () => {
       port: 8787,
       appOrigin: "http://localhost:3000",
       databaseUrl: null,
+      databaseNetwork: null,
       visitorHashSecret: "v".repeat(32),
       turnstileSecret: "test-secret",
       clientIpHeader: null,

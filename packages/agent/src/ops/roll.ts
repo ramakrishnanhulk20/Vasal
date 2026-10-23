@@ -31,29 +31,39 @@ export type RollOutcome =
 const windowMoved = (before: BucketState, after: BucketState) =>
   before.windowEnd.getTime() !== after.windowEnd.getTime() || after.used < before.used;
 
+// A cron that starts a few minutes late must never leave visitors refused at
+// midnight UTC, so every window stays open this long past its nominal end.
+// The roll passes the same amount to setBucket as its grace, so it resets a
+// window once its nominal end has passed and never before: a roll a little
+// early does not reset the day still in progress. With no roll at all, the
+// meter still refuses once the stored end passes (fail closed, C5.7).
+const ROLL_GRACE_MS = 2 * 60 * 60 * 1_000;
+
 /**
- * The end of the window that holds `now`: the next 00:00 UTC for a day, and
- * 00:00 UTC on the first of the next month for a month. Always later than
- * `now`, so a roll at exactly midnight opens the window that starts then.
- * Throws RangeError for an invalid date.
+ * The stored end of the window that holds `now`, two hours past its nominal
+ * end: 02:00 UTC on the next day for a day, and 02:00 UTC on the first of the
+ * next month for a month. A roll at exactly midnight opens the window that
+ * starts then. Throws RangeError for an invalid date.
  */
 export function windowEndFor(window: BucketWindow, now: Date): Date {
   if (!Number.isFinite(now.getTime())) throw new RangeError("now must be a valid date");
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
-  return window === "day" ? new Date(Date.UTC(year, month, now.getUTCDate() + 1)) : new Date(Date.UTC(year, month + 1, 1));
+  const nominalEnd = window === "day" ? Date.UTC(year, month, now.getUTCDate() + 1) : Date.UTC(year, month + 1, 1);
+  return new Date(nominalEnd + ROLL_GRACE_MS);
 }
 
 /**
  * Operator use, as the owner role (the app role cannot change a cap or a
  * window). Calls setBucket for every bucket in the profile covering `now`,
- * with that bucket's cap and the window end from windowEndFor, all in one
- * transaction so a failure leaves every bucket as it was. setBucket keeps
- * `used` and the window end inside a live window and resets them only once
- * the stored window has ended, so running this twice in one window changes
- * nothing the second time. setBucket judges "ended" by this machine's clock,
- * so `now` must be the current time. With no profile covering `now`, nothing
- * is set and { covered: false } is returned.
+ * with that bucket's cap, the window end from windowEndFor and a two-hour
+ * grace, all in one transaction so a failure leaves every bucket as it was.
+ * setBucket keeps `used` and the window end until the window's nominal end
+ * (its stored end less the grace) has passed and resets them after, so
+ * running this twice in one window changes nothing the second time, and a
+ * roll up to two hours late still resets the day it should. setBucket judges
+ * this by this machine's clock, so `now` must be the current time. With no
+ * profile covering `now`, nothing is set and { covered: false } is returned.
  *
  * Throws RangeError for an invalid date, StoreError("STORE_BAD_INPUT") for a
  * bucket the meter refuses, and StoreError("STORE_UNAVAILABLE") if the
@@ -68,7 +78,7 @@ export async function rollBuckets(db: Db, policy: BudgetPolicy, now: Date): Prom
     for (const bucket of profile.buckets) {
       const windowEndWanted = windowEndFor(bucket.window, now);
       const before = await usage(tx, bucket.key);
-      await setBucket(tx, { key: bucket.key, cap: bucket.cap, windowEnd: windowEndWanted });
+      await setBucket(tx, { key: bucket.key, cap: bucket.cap, windowEnd: windowEndWanted }, { graceMs: ROLL_GRACE_MS });
       const after = await usage(tx, bucket.key);
 
       const changed: BucketRoll["changed"] = [];

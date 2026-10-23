@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { isDbNetwork, type DbNetwork } from "../store/db.js";
 import { ServerError, type ServerConfigVariable } from "./errors.js";
 
 export type ServerConfig = {
@@ -9,6 +10,7 @@ export type ServerConfig = {
   port: number;
   appOrigin: string;
   databaseUrl: string | null;
+  databaseNetwork: DbNetwork | null;
   visitorHashSecret: string;
   turnstileSecret: string;
   clientIpHeader: string | null;
@@ -21,11 +23,18 @@ export type ServerConfig = {
   trends: boolean;
 };
 
-type AgentVariable = "ANTHROPIC_API_KEY" | "VASAL_MODEL" | "VASAL_EFFORT" | "ANTHROPIC_TOKENS_PER_DAY" | "VASAL_TRENDS";
+type LocalVariable =
+  | "DATABASE_NETWORK"
+  | "ANTHROPIC_API_KEY"
+  | "VASAL_MODEL"
+  | "VASAL_EFFORT"
+  | "ANTHROPIC_TOKENS_PER_DAY"
+  | "VASAL_TRENDS";
 
 // errors.ts holds the messages for the other variables. Like those, each of
 // these names its variable and never contains the value.
-const AGENT_MESSAGES: Record<AgentVariable, string> = {
+const LOCAL_MESSAGES: Record<LocalVariable, string> = {
+  DATABASE_NETWORK: "DATABASE_NETWORK must be railway-private, or unset.",
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY has spaces or characters a key cannot contain. Copy the key into .env again.",
   VASAL_MODEL: "VASAL_MODEL must be a Claude model id such as claude-haiku-5-5.",
   VASAL_EFFORT: "VASAL_EFFORT must be low, medium or high.",
@@ -105,6 +114,7 @@ const apiKeySchema = z.string().max(500).regex(/^[\x21-\x7E]+$/);
 const modelSchema = z.string().regex(/^claude-[a-z0-9-]{3,60}$/);
 const effortSchema = z.enum(["low", "medium", "high"]);
 const trendsSchema = z.enum(["on", "off"]);
+const networkSchema = z.custom<DbNetwork>(isDbNetwork);
 
 function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -112,11 +122,11 @@ function parsed<T>(variable: ServerConfigVariable, schema: z.ZodType<T>, value: 
   return result.data;
 }
 
-function agentSetting<T>(variable: AgentVariable, schema: z.ZodType<T>, value: unknown): T {
+function localSetting<T>(variable: LocalVariable, schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) {
     const error = new ServerError("SRV_CONFIG");
-    error.message = AGENT_MESSAGES[variable];
+    error.message = LOCAL_MESSAGES[variable];
     throw error;
   }
   return result.data;
@@ -136,7 +146,9 @@ function agentSetting<T>(variable: AgentVariable, schema: z.ZodType<T>, value: u
  * must look like a Claude model id, VASAL_EFFORT is low, medium or high
  * (default medium), ANTHROPIC_TOKENS_PER_DAY defaults to 2,000,000, and
  * VASAL_TRENDS is on or off (default off), which decides whether the agent
- * asks Qloo for trend data at all.
+ * asks Qloo for trend data at all. DATABASE_NETWORK is unset (null) or
+ * railway-private, which lets createPgDb skip TLS for .railway.internal hosts
+ * only.
  * Throws ServerError("SRV_CONFIG") at the first bad or missing variable; the
  * message names the variable and never contains its value.
  */
@@ -205,23 +217,27 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const maxInflightRuns =
     inflightText === undefined ? DEFAULT_MAX_INFLIGHT_RUNS : parsed("MAX_INFLIGHT_RUNS", wholeNumber(1, 20), inflightText);
 
-  const agentText = (variable: AgentVariable): string | undefined => agentSetting(variable, optionalText, env[variable]);
-  const keyText = agentText("ANTHROPIC_API_KEY");
-  const anthropicApiKey = keyText === undefined ? null : agentSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
-  const model = agentSetting("VASAL_MODEL", modelSchema, agentText("VASAL_MODEL") ?? DEFAULT_MODEL);
-  const effort = agentSetting("VASAL_EFFORT", effortSchema, agentText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
-  const tokensText = agentText("ANTHROPIC_TOKENS_PER_DAY");
+  const localText = (variable: LocalVariable): string | undefined => localSetting(variable, optionalText, env[variable]);
+  const networkText = localText("DATABASE_NETWORK");
+  const databaseNetwork = networkText === undefined ? null : localSetting("DATABASE_NETWORK", networkSchema, networkText);
+
+  const keyText = localText("ANTHROPIC_API_KEY");
+  const anthropicApiKey = keyText === undefined ? null : localSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
+  const model = localSetting("VASAL_MODEL", modelSchema, localText("VASAL_MODEL") ?? DEFAULT_MODEL);
+  const effort = localSetting("VASAL_EFFORT", effortSchema, localText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
+  const tokensText = localText("ANTHROPIC_TOKENS_PER_DAY");
   const anthropicTokensPerDay =
     tokensText === undefined
       ? DEFAULT_ANTHROPIC_TOKENS_PER_DAY
-      : agentSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
-  const trends = agentSetting("VASAL_TRENDS", trendsSchema, agentText("VASAL_TRENDS") ?? DEFAULT_TRENDS) === "on";
+      : localSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
+  const trends = localSetting("VASAL_TRENDS", trendsSchema, localText("VASAL_TRENDS") ?? DEFAULT_TRENDS) === "on";
 
   return {
     production,
     port,
     appOrigin,
     databaseUrl,
+    databaseNetwork,
     visitorHashSecret,
     turnstileSecret,
     clientIpHeader,

@@ -793,7 +793,8 @@ describe("listShowcase (C6.3, C6.5)", () => {
       .split(/\r?\n/)
       .filter((line) => !line.trimStart().startsWith("--"))
       .join("\n")
-      .split(";")
+      // A semicolon inside the DO block's $$ body does not end a statement.
+      .split(/;(?=(?:[^$]*\$\$[^$]*\$\$)*[^$]*$)/)
       .map((statement) => statement.trim())
       .filter((statement) => statement !== "");
     for (const statement of statements) await db.query(statement);

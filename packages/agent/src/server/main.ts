@@ -63,7 +63,9 @@ async function seedDevBudgets(db: Db, config: ServerConfig): Promise<void> {
 // Production and any configured DATABASE_URL never migrate or seed: the
 // operator does that as the owner role, and the app role could not anyway.
 async function openDb(config: ServerConfig): Promise<Db> {
-  if (config.databaseUrl !== null) return createPgDb(config.databaseUrl);
+  if (config.databaseUrl !== null) {
+    return createPgDb(config.databaseUrl, config.databaseNetwork === null ? {} : { network: config.databaseNetwork });
+  }
   if (config.production) throw new ServerError("SRV_CONFIG", "DATABASE_URL");
 
   const db = await createPgliteDb();

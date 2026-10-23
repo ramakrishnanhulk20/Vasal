@@ -15,7 +15,9 @@
     "feed:demo": "tsx scripts/feed-demo.ts",
     "youtube:demo": "tsx scripts/youtube-demo.ts",
     "server:dev": "tsx src/server/main.ts",
+    "start": "node --import tsx src/server/main.ts",
     "ops": "tsx scripts/ops.ts",
+    "prove": "tsx scripts/prove.ts",
     "backtest": "tsx scripts/backtest.ts"
   },
   "dependencies": {

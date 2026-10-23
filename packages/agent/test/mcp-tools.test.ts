@@ -66,6 +66,7 @@ const CONFIG: ServerConfig = {
   port: 8787,
   appOrigin: APP_ORIGIN,
   databaseUrl: null,
+  databaseNetwork: null,
   visitorHashSecret: "v".repeat(32),
   turnstileSecret: "test-secret",
   clientIpHeader: IP_HEADER,

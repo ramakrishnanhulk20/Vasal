@@ -2,9 +2,10 @@
 // report and exits 1 when it finds a problem, so it can run from a scheduler.
 // They connect as the database owner (OWNER_DATABASE_URL), because the app
 // role cannot set caps, flip the kill switch or the MCP switch, revoke agent
-// keys, promote runs or delete rows (C6.3, C6.6, D1.6).
+// keys, promote runs or delete rows (C6.3, C6.6, D1.6). bootstrap alone
+// connects as the database superuser, once, to create that owner.
 //
-// Usage: npx tsx scripts/ops.ts [--dev] <command>, see USAGE below.
+// Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>, see USAGE below.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -18,7 +19,18 @@ import {
   revokeToken,
   TOKEN_LIST_LIMIT,
 } from "../src/mcp/tokens.js";
-import { OpsConfigError, openDevDb, openOwnerDb } from "../src/ops/db.js";
+import {
+  applyRoles,
+  bootstrapOwner,
+  hexPasswordFrom,
+  OpsConfigError,
+  openBootstrapDb,
+  openDevDb,
+  openOwnerDb,
+  RoleSetupError,
+  ROLES_FILE,
+  tunnelPortFrom,
+} from "../src/ops/db.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
 import { loadPolicy, PolicyError } from "../src/ops/policy.js";
 import {
@@ -41,13 +53,16 @@ import { liveRunsEnabled, setFlag } from "../src/store/flags.js";
 import { migrate } from "../src/store/migrate.js";
 
 const POLICY_FILE = fileURLToPath(new URL("./budget-policy.json", import.meta.url));
-const ROLES_FILE = fileURLToPath(new URL("../src/store/roles.sql", import.meta.url));
 
-const USAGE = `Usage: npx tsx scripts/ops.ts [--dev] <command>
+const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
 
+  bootstrap               once, as the database superuser: create the owner role vasal_owner
+                          with the password in VASAL_OWNER_PASSWORD
   migrate                 apply src/store/schema.sql
-  roles                   print roles.sql and the psql steps that create the app role
-  budgets                 set today's caps from scripts/budget-policy.json (run daily)
+  roles [--apply]         print roles.sql and the setup steps; with --apply, run it as the
+                          owner and set vasal_app's password from VASAL_APP_PASSWORD
+  budgets                 set today's caps from scripts/budget-policy.json (run daily, after
+                          00:00 UTC; each window stays open until 02:00 UTC for a late run)
   prune                   delete expired cache rows, per-second buckets, old visitor and MCP
                           counters, and agent keys expired over a week that no run points to
   flag live-runs on|off   switch live runs on the site on or off
@@ -65,15 +80,20 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev] <command>
                           on, mcp list, mcp revoke and mcp revoke-all on synthetic keys
 
 --dev uses a throwaway in-memory database with the schema applied and live
-runs on. Without it every command except roles needs OWNER_DATABASE_URL.
---yes is accepted only by promote.`;
+runs on. Without it bootstrap needs BOOTSTRAP_DATABASE_URL, and every other
+command except roles without --apply needs OWNER_DATABASE_URL.
+--tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
+database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
+as vasal_owner with VASAL_OWNER_PASSWORD.
+--yes is accepted only by promote, and --apply only by roles.`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
-type PlainCommand = "migrate" | "roles" | "budgets" | "prune" | "health" | "showcase" | "selftest";
+type PlainCommand = "bootstrap" | "migrate" | "budgets" | "prune" | "health" | "showcase" | "selftest";
 // One member per name, so a check on the name narrows the whole command.
 type Command =
   | { [Name in PlainCommand]: { name: Name } }[PlainCommand]
+  | { name: "roles"; apply: boolean }
   | { name: "flag"; flag: Switch; on: boolean }
   | { name: "mcp"; action: "list" | "revoke-all" }
   | { name: "mcp"; action: "revoke"; tokenId: string }
@@ -94,12 +114,24 @@ const positionFrom = (text: string): number => (/^\d{1,2}$/.test(text) ? Number(
 const grouped = new Intl.NumberFormat("en-US");
 const utc = (date: Date) => `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
-function readArgs(argv: string[]): { dev: boolean; command: Command } | undefined {
-  let parsed: { values: { dev?: boolean | undefined; yes?: boolean | undefined }; positionals: string[] };
+type Args = { dev: boolean; tunnelPort: number | undefined; command: Command };
+
+// --tunnel is a connection, so it is refused with --dev and with the commands
+// that never connect: roles without --apply, and selftest, which is --dev only.
+function readArgs(argv: string[]): Args | undefined {
+  let parsed: {
+    values: { dev?: boolean | undefined; yes?: boolean | undefined; apply?: boolean | undefined; tunnel?: string | undefined };
+    positionals: string[];
+  };
   try {
     parsed = parseArgs({
       args: argv,
-      options: { dev: { type: "boolean", default: false }, yes: { type: "boolean", default: false } },
+      options: {
+        dev: { type: "boolean", default: false },
+        yes: { type: "boolean", default: false },
+        apply: { type: "boolean", default: false },
+        tunnel: { type: "string" },
+      },
       allowPositionals: true,
       strict: true,
     });
@@ -107,41 +139,58 @@ function readArgs(argv: string[]): { dev: boolean; command: Command } | undefine
     return undefined;
   }
   const dev = parsed.values.dev === true;
-  const yes = parsed.values.yes === true;
-  const [name, ...rest] = parsed.positionals;
+  let tunnelPort: number | undefined;
+  if (parsed.values.tunnel !== undefined) {
+    try {
+      tunnelPort = tunnelPortFrom(parsed.values.tunnel);
+    } catch {
+      return undefined;
+    }
+  }
+  if (dev && tunnelPort !== undefined) return undefined;
+  const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true);
+  if (command === undefined) return undefined;
+  if (tunnelPort !== undefined && ((command.name === "roles" && !command.apply) || command.name === "selftest")) return undefined;
+  return { dev, tunnelPort, command };
+}
+
+function readCommand(positionals: string[], yes: boolean, apply: boolean): Command | undefined {
+  const [name, ...rest] = positionals;
+  if (name === "roles") return rest.length === 0 && !yes ? { name, apply } : undefined;
+  if (apply) return undefined;
   if (name === "promote") {
     const [runId, position] = rest;
     if (rest.length !== 2 || runId === undefined || position === undefined) return undefined;
-    return { dev, command: { name, runId, position: positionFrom(position), yes } };
+    return { name, runId, position: positionFrom(position), yes };
   }
   if (yes) return undefined;
   if (name === "unpromote") {
     const [runId] = rest;
     if (rest.length !== 1 || runId === undefined) return undefined;
-    return { dev, command: { name, runId } };
+    return { name, runId };
   }
   if (name === "flag") {
     const [flag, state] = rest;
     if (rest.length !== 2 || (flag !== "live-runs" && flag !== "mcp") || (state !== "on" && state !== "off")) return undefined;
-    return { dev, command: { name, flag, on: state === "on" } };
+    return { name, flag, on: state === "on" };
   }
   if (name === "mcp") {
     const [action, tokenId] = rest;
-    if ((action === "list" || action === "revoke-all") && rest.length === 1) return { dev, command: { name, action } };
-    if (action === "revoke" && rest.length === 2 && tokenId !== undefined) return { dev, command: { name, action, tokenId } };
+    if ((action === "list" || action === "revoke-all") && rest.length === 1) return { name, action };
+    if (action === "revoke" && rest.length === 2 && tokenId !== undefined) return { name, action, tokenId };
     return undefined;
   }
   if (rest.length !== 0) return undefined;
   if (
+    name === "bootstrap" ||
     name === "migrate" ||
-    name === "roles" ||
     name === "budgets" ||
     name === "prune" ||
     name === "health" ||
     name === "showcase" ||
     name === "selftest"
   ) {
-    return { dev, command: { name } };
+    return { name };
   }
   return undefined;
 }
@@ -250,16 +299,42 @@ async function runHealth(db: Db): Promise<{ ok: boolean; problems: string[] }> {
 function runRoles(): boolean {
   console.log(readFileSync(ROLES_FILE, "utf8").trimEnd());
   console.log("");
-  console.log("This command only prints. Run these yourself, from packages/agent, with the owner's connection string:");
+  console.log("This command only prints. To set the roles up, run these from packages/agent, in order:");
   for (const step of [
-    "1. npx tsx scripts/ops.ts migrate",
-    '2. psql "<owner connection string>" -v ON_ERROR_STOP=1 -f src/store/roles.sql',
-    '3. psql "<owner connection string>", then type \\password vasal_app and enter a new password twice. psql sends it hashed, so it never sits in a file or your shell history.',
-    "4. Give the web and agent servers DATABASE_URL with user vasal_app, that password, and the same host and database. The owner's string stays in OWNER_DATABASE_URL for these commands only.",
-    "5. npx tsx scripts/ops.ts health",
+    "1. Make two passwords, VASAL_OWNER_PASSWORD and VASAL_APP_PASSWORD, each with: node -e \"console.log(require('node:crypto').randomBytes(32).toString('hex'))\"",
+    "2. Once, as the database superuser: npx tsx scripts/ops.ts bootstrap, with BOOTSTRAP_DATABASE_URL set, or --tunnel <port> with PGUSER, PGPASSWORD and PGDATABASE. It creates the owner role vasal_owner.",
+    "3. As vasal_owner, from OWNER_DATABASE_URL or --tunnel <port>: npx tsx scripts/ops.ts migrate, so the owner owns every table.",
+    "4. As vasal_owner: npx tsx scripts/ops.ts roles --apply. It runs the SQL above and sets vasal_app's password as a SCRAM verifier made on this machine, so the password itself never reaches the server.",
+    "5. Give the web and agent servers DATABASE_URL with user vasal_app, VASAL_APP_PASSWORD, and the same host and database. The owner's string stays with these commands only.",
+    "6. npx tsx scripts/ops.ts health",
   ]) {
     console.log(`  ${step}`);
   }
+  return true;
+}
+
+// Prints what was done in fixed words. The password, the verifier and the
+// connection string are never printed.
+async function runBootstrap(db: Db): Promise<boolean> {
+  const password = hexPasswordFrom(process.env, "VASAL_OWNER_PASSWORD");
+  const { created } = await bootstrapOwner(db, password);
+  console.log(
+    created
+      ? "Created the role vasal_owner: LOGIN and CREATEROLE, with no SUPERUSER, CREATEDB, REPLICATION or BYPASSRLS."
+      : "The role vasal_owner already existed with the right attributes, so it was kept.",
+  );
+  console.log("Set the password of vasal_owner from VASAL_OWNER_PASSWORD.");
+  console.log("Granted USAGE and CREATE on schema public to vasal_owner.");
+  return true;
+}
+
+async function runApplyRoles(db: Db): Promise<boolean> {
+  const password = hexPasswordFrom(process.env, "VASAL_APP_PASSWORD");
+  const { created } = await applyRoles(db, password);
+  console.log(
+    `Applied src/store/roles.sql as one batch: ${created ? "created the role vasal_app" : "the role vasal_app already existed with the right attributes and was kept"}, and set its grants.`,
+  );
+  console.log("Set the password of vasal_app from VASAL_APP_PASSWORD.");
   return true;
 }
 
@@ -443,7 +518,13 @@ function printProblems(problems: string[]): void {
 // carry a connection string or a driver message, so it gets a fixed line.
 function messageOf(error: unknown): string {
   if (error instanceof PolicyError) return [error.message, ...error.issues.map((issue) => `  ${issue}`)].join("\n");
-  if (error instanceof OpsConfigError || error instanceof StoreError || error instanceof ServerError || error instanceof PromoteError) {
+  if (
+    error instanceof OpsConfigError ||
+    error instanceof RoleSetupError ||
+    error instanceof StoreError ||
+    error instanceof ServerError ||
+    error instanceof PromoteError
+  ) {
     return error.message;
   }
   return "The command stopped with an unexpected error.";
@@ -455,18 +536,28 @@ async function main(): Promise<number> {
     console.error(USAGE);
     return 2;
   }
-  const { dev, command } = args;
-  if (command.name === "roles") return runRoles() ? 0 : 1;
+  const { dev, tunnelPort, command } = args;
+  if (command.name === "roles" && !command.apply) return runRoles() ? 0 : 1;
   if (command.name === "selftest" && !dev) {
     console.error("selftest switches live runs off, so it runs only with --dev.");
     return 2;
   }
+  if (dev && (command.name === "bootstrap" || command.name === "roles")) {
+    console.error("bootstrap and roles --apply set up roles on a hosted database, so they never run with --dev.");
+    return 2;
+  }
 
+  const connection = tunnelPort === undefined ? {} : { tunnelPort };
   let db: Db | undefined;
   try {
-    db = dev ? await openDevDb() : openOwnerDb();
+    if (dev) db = await openDevDb();
+    else db = command.name === "bootstrap" ? openBootstrapDb(process.env, connection) : openOwnerDb(process.env, connection);
     if (dev) console.log("Using a throwaway in-memory database. Nothing here touches a hosted database.\n");
     switch (command.name) {
+      case "bootstrap":
+        return (await runBootstrap(db)) ? 0 : 1;
+      case "roles":
+        return (await runApplyRoles(db)) ? 0 : 1;
       case "migrate":
         await migrate(db);
         console.log("Schema applied. Every statement in schema.sql ran in one transaction.");
@@ -502,4 +593,45 @@ async function main(): Promise<number> {
   }
 }
 
-process.exitCode = await main();
+const OPS_TIME_LIMIT_MS = 10 * 60 * 1_000;
+
+/**
+ * Runs `work` and always ends the process, so a scheduled job can never hang
+ * on a stuck connection: it exits with the code `work` returns, with 1 and
+ * one fixed UNEXPECTED line if `work` throws, and with 1 and one OPS_TIMEOUT
+ * line if `work` has not settled within `limitMs` (default 10 minutes). The
+ * timer is unref'd, so it never holds a finished process open, and `exit`
+ * (default process.exit) is called once. Neither line holds an error message.
+ */
+export async function runToExit(
+  work: () => Promise<number>,
+  opts: { limitMs?: number; exit?: (code: number) => void } = {},
+): Promise<void> {
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  let exited = false;
+  const exitOnce = (code: number): void => {
+    if (exited) return;
+    exited = true;
+    clearTimeout(timer);
+    exit(code);
+  };
+  const timer = setTimeout(() => {
+    console.error(JSON.stringify({ level: "error", route: "ops", code: "OPS_TIMEOUT" }));
+    exitOnce(1);
+  }, opts.limitMs ?? OPS_TIME_LIMIT_MS);
+  timer.unref();
+
+  let code: number;
+  try {
+    code = await work();
+  } catch {
+    console.error(JSON.stringify({ level: "error", route: "ops", code: "UNEXPECTED" }));
+    code = 1;
+  }
+  // process.exit can cut off output still queued for a terminal, so it waits
+  // for both streams to take what was written. The timer stays armed in case
+  // a stream never drains.
+  process.stdout.write("", () => process.stderr.write("", () => exitOnce(code)));
+}
+
+if (import.meta.main) await runToExit(main);

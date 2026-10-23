@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+
+# Installed and generated files, rebuilt inside the image
+**/node_modules
+coverage
+dist
+*.log
+
+# Local data, including Qloo responses that must never ship (C7.3)
+packages/agent/data
+data
+
+# Private planning, research and tooling
+scratchpad
+reference
+.claude
+.git
+CLAUDE.md
+INTAKE.md
+PLAN.md
+STATE.md
+DECISIONS.md
+AGENT-RETROS.md
+SPEC.md
+docs/RD-BRIEF.md
+docs/AUDIT-PACKET.md

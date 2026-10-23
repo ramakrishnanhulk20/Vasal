@@ -99,6 +99,13 @@ describe("loadServerConfig in development", () => {
     expect(loadServerConfig({ VASAL_TRENDS: "  " }).trends).toBe(false);
   });
 
+  it("reads DATABASE_NETWORK as railway-private, and treats unset or blank as no network", () => {
+    expect(loadServerConfig({ DATABASE_NETWORK: "railway-private" }).databaseNetwork).toBe("railway-private");
+    expect(loadServerConfig({ ...PRODUCTION, DATABASE_NETWORK: " railway-private " }).databaseNetwork).toBe("railway-private");
+    expect(loadServerConfig({}).databaseNetwork).toBeNull();
+    expect(loadServerConfig({ DATABASE_NETWORK: "  " }).databaseNetwork).toBeNull();
+  });
+
   it("does not load the .env file for a custom env", () => {
     const load = vi.spyOn(process, "loadEnvFile");
     loadServerConfig({});
@@ -114,6 +121,7 @@ describe("loadServerConfig in production", () => {
       port: 8080,
       appOrigin: "https://app.example",
       databaseUrl: PRODUCTION.DATABASE_URL,
+      databaseNetwork: null,
       visitorHashSecret: PRODUCTION.VISITOR_HASH_SECRET,
       turnstileSecret: PRODUCTION.TURNSTILE_SECRET_KEY,
       clientIpHeader: "fly-client-ip",
@@ -181,6 +189,9 @@ describe("loadServerConfig with bad values", () => {
       ["VASAL_TRENDS", `on${MARKER}`],
       ["VASAL_TRENDS", "true"],
       ["VASAL_TRENDS", "ON"],
+      ["DATABASE_NETWORK", `railway-private${MARKER}`],
+      ["DATABASE_NETWORK", "RAILWAY-PRIVATE"],
+      ["DATABASE_NETWORK", "public"],
     ];
     for (const [variable, value] of cases) {
       expectRefusal({ ...PRODUCTION, [variable]: value }, variable);

@@ -39,6 +39,16 @@ async function guarded<R>(run: () => Promise<{ rows: unknown[] }>): Promise<{ ro
   }
 }
 
+/** A network createPgDb can be told it runs on. Each one changes the TLS rule for its own hosts only. */
+export type DbNetwork = "railway-private";
+
+const RAILWAY_PRIVATE_HOST_SUFFIX = ".railway.internal";
+
+/** True only for a DbNetwork name, compared exactly. */
+export function isDbNetwork(value: unknown): value is DbNetwork {
+  return value === "railway-private";
+}
+
 function isLocalHost(hostname: string): boolean {
   if (hostname === "localhost") return true;
   try {
@@ -48,11 +58,32 @@ function isLocalHost(hostname: string): boolean {
   }
 }
 
+function tlsFor(host: string, network: DbNetwork | undefined): PoolConfig["ssl"] {
+  if (isLocalHost(host)) return false;
+  // Railway's private network is WireGuard-encrypted between services, and
+  // its Postgres certificate is signed by a CA made inside the container, so
+  // full verification cannot pass there. TLS goes off only when the caller
+  // names that network AND the host is one of its names; the URL alone can
+  // never turn it off.
+  if (network === "railway-private" && host.endsWith(RAILWAY_PRIVATE_HOST_SUFFIX)) return false;
+  return { rejectUnauthorized: true };
+}
+
 // The pool is configured from explicit fields, never from `connectionString`:
 // pg lets the parsed string override explicit options, so `?sslmode=disable`
 // or `?host=` in the URL could otherwise switch TLS off or move the target.
 // Query parameters in the URL are therefore ignored on purpose.
-function poolConfigFrom(connectionString: string): PoolConfig {
+/**
+ * Turns a postgres URL into the pool settings createPgDb uses. TLS is off for
+ * localhost and loopback addresses, off for a host ending in
+ * .railway.internal when `network` is "railway-private", and on with
+ * certificate checks for everything else. Throws
+ * StoreError("STORE_BAD_INPUT") for a string that is not a postgres URL with a
+ * host, or a network that is not a DbNetwork; the message never contains the
+ * string.
+ */
+export function poolConfigFrom(connectionString: string, network?: DbNetwork): PoolConfig {
+  if (network !== undefined && !isDbNetwork(network)) throw new StoreError("STORE_BAD_INPUT");
   let url: URL;
   try {
     url = new URL(connectionString);
@@ -76,6 +107,10 @@ function poolConfigFrom(connectionString: string): PoolConfig {
   } catch {
     throw new StoreError("STORE_BAD_INPUT");
   }
+  // pg fills an empty user from the PGUSER environment variable, and tools
+  // such as `railway run` set PGUSER to the database superuser. A URL with no
+  // user could then connect with full power, so it is refused instead.
+  if (user === "") throw new StoreError("STORE_BAD_INPUT");
 
   return {
     host,
@@ -83,7 +118,7 @@ function poolConfigFrom(connectionString: string): PoolConfig {
     user,
     password,
     database,
-    ssl: isLocalHost(host) ? false : { rejectUnauthorized: true },
+    ssl: tlsFor(host, network),
     statement_timeout: STATEMENT_TIMEOUT_MS,
     idle_in_transaction_session_timeout: IDLE_IN_TRANSACTION_TIMEOUT_MS,
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
@@ -102,13 +137,17 @@ function pgClientDb(client: PoolClient): Db {
 
 /**
  * Opens a pg pool for hosted Postgres. TLS with certificate checks is required
- * unless the host is localhost or a loopback address. Each connection starts
- * with statement_timeout 5000 ms, a 5 s connect timeout and a 10 s idle in
- * transaction timeout. Throws StoreError("STORE_BAD_INPUT") if the string is
- * not a postgres URL with a host; the message never contains the string.
+ * unless the host is localhost or a loopback address, or `opts.network` is
+ * "railway-private" and the host ends in .railway.internal (see
+ * poolConfigFrom). The network only ever comes from `opts`, never from the
+ * URL. Each connection starts with statement_timeout 5000 ms, a 5 s connect
+ * timeout and a 10 s idle in transaction timeout. A query with no params is
+ * sent with pg's simple protocol, so it may hold several statements. Throws
+ * StoreError("STORE_BAD_INPUT") if the string is not a postgres URL with a
+ * host or the network is unknown; the message never contains the string.
  */
-export function createPgDb(connectionString: string): Db {
-  const pool = new Pool(poolConfigFrom(connectionString));
+export function createPgDb(connectionString: string, opts: { network?: DbNetwork } = {}): Db {
+  const pool = new Pool(poolConfigFrom(connectionString, opts.network));
   // pg emits idle client failures on the pool, and an "error" event with no
   // listener exits the whole process. The next query reports the failure.
   pool.on("error", () => {});

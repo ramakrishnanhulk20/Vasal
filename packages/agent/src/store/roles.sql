@@ -1,13 +1,17 @@
--- Run by the operator, once, on Neon, connected as the database owner, after
--- migrate has created the tables. Never run on PGlite.
+-- The app role and its grants. Run by the operator as the owner role
+-- (vasal_owner, made once by `ops bootstrap`) after migrate has created the
+-- tables, so the owner owns every table granted on here. It is safe to run
+-- again: the role is created only if it is missing, and the grants end the
+-- same way each time. `ops roles --apply` sends the whole file as one batch.
 --
--- Create this role here in SQL, not in the Neon console. Roles made in the
--- console, CLI or API join neon_superuser and can create roles, databases and
+-- Create this role here in SQL, not in a hosting console. Some providers put
+-- console-made roles in an admin group that can create roles, databases and
 -- more. A role made in SQL holds only what is granted below.
 --
--- No password lives in this file. Afterwards, set one from psql with
--- \password vasal_app (it is sent hashed) and give the web and agent servers
--- the vasal_app connection string, never the owner's.
+-- No password lives in this file. `ops roles --apply` then sets one from
+-- VASAL_APP_PASSWORD as a SCRAM verifier built on the operator's machine, so
+-- the password itself never reaches the server. Give the web and agent
+-- servers the vasal_app connection string, never the owner's.
 --
 -- What the app role cannot do, by design (C6.6): change the schema, write the
 -- kill switch or the showcase, change an agent key, or delete rows. Pruning
@@ -16,7 +20,13 @@
 -- CREATE on schema public, so this role cannot add tables either; on an older
 -- server, revoke that first.
 
-CREATE ROLE vasal_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vasal_app') THEN
+    CREATE ROLE vasal_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END
+$$;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vasal_app;
 

@@ -21,6 +21,7 @@ const CONFIG: ServerConfig = {
   port: 8787,
   appOrigin: "http://localhost:3000",
   databaseUrl: null,
+  databaseNetwork: null,
   visitorHashSecret: "v".repeat(32),
   turnstileSecret: "test-secret",
   clientIpHeader: "x-test-client-ip",
