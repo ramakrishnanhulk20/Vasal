@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { loadQlooConfig, type QlooConfig } from "../src/config.js";
 import {
   authenticateToken,
   issueToken,
@@ -45,6 +46,8 @@ import {
 } from "../src/ops/promote.js";
 import { pruneExpired } from "../src/ops/prune.js";
 import { rollBuckets, type BucketRoll, type BucketState } from "../src/ops/roll.js";
+import { createSeedAgent, seedShow } from "../src/ops/seed.js";
+import { loadAgentSettings } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
 import { createRun, finishRun, listShowcase, putBoard, setRunStatus } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
@@ -73,6 +76,10 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   mcp revoke-all          revoke every agent key at once
   promote <runId> <position> [--yes]
                           print a run's board; with --yes, put it on the home page at position 1 to 12
+  seed "<show>" [--pick N]
+                          preview the shows that match, writing nothing; with --pick, run the
+                          real agent on candidate N and build a board for promote. It spends
+                          only qloo:day:offline, qloo:month and anthropic:day:offline
   unpromote <runId>       take a run off the home page
   showcase                list the runs on the home page
   selftest                with --dev only: budgets, health, flag live-runs off, health, then
@@ -85,7 +92,7 @@ command except roles without --apply needs OWNER_DATABASE_URL.
 --tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
 database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
 as vasal_owner with VASAL_OWNER_PASSWORD.
---yes is accepted only by promote, and --apply only by roles.`;
+--yes is accepted only by promote, --apply only by roles, and --pick only by seed.`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
@@ -98,7 +105,8 @@ type Command =
   | { name: "mcp"; action: "list" | "revoke-all" }
   | { name: "mcp"; action: "revoke"; tokenId: string }
   | { name: "promote"; runId: string; position: number; yes: boolean }
-  | { name: "unpromote"; runId: string };
+  | { name: "unpromote"; runId: string }
+  | { name: "seed"; show: string; pick: number | undefined };
 
 type Switch = "live-runs" | "mcp";
 // Each switch the operator can flip, the app_flags row behind it, and how
@@ -110,6 +118,10 @@ const SWITCHES: Record<Switch, { flag: string; label: string; read: (db: Db) => 
 
 // Digits only, so " 3", "3.0" and "0x3" are refused rather than read as 3.
 const positionFrom = (text: string): number => (/^\d{1,2}$/.test(text) ? Number(text) : Number.NaN);
+// A run stores at most 10 candidates (putCandidates), so no higher pick exists.
+const MAX_PICK = 10;
+// Counted in code points, the way createRun counts the show it is passed.
+const MAX_SEED_SHOW_CHARS = 200;
 
 const grouped = new Intl.NumberFormat("en-US");
 const utc = (date: Date) => `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -118,9 +130,15 @@ type Args = { dev: boolean; tunnelPort: number | undefined; command: Command };
 
 // --tunnel is a connection, so it is refused with --dev and with the commands
 // that never connect: roles without --apply, and selftest, which is --dev only.
-function readArgs(argv: string[]): Args | undefined {
+export function readArgs(argv: string[]): Args | undefined {
   let parsed: {
-    values: { dev?: boolean | undefined; yes?: boolean | undefined; apply?: boolean | undefined; tunnel?: string | undefined };
+    values: {
+      dev?: boolean | undefined;
+      yes?: boolean | undefined;
+      apply?: boolean | undefined;
+      tunnel?: string | undefined;
+      pick?: string | undefined;
+    };
     positionals: string[];
   };
   try {
@@ -131,6 +149,7 @@ function readArgs(argv: string[]): Args | undefined {
         yes: { type: "boolean", default: false },
         apply: { type: "boolean", default: false },
         tunnel: { type: "string" },
+        pick: { type: "string" },
       },
       allowPositionals: true,
       strict: true,
@@ -148,15 +167,27 @@ function readArgs(argv: string[]): Args | undefined {
     }
   }
   if (dev && tunnelPort !== undefined) return undefined;
-  const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true);
+  const pick = parsed.values.pick === undefined ? undefined : positionFrom(parsed.values.pick);
+  if (pick !== undefined && !(pick >= 1 && pick <= MAX_PICK)) return undefined;
+  const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true, pick);
   if (command === undefined) return undefined;
+  if (pick !== undefined && command.name !== "seed") return undefined;
   if (tunnelPort !== undefined && ((command.name === "roles" && !command.apply) || command.name === "selftest")) return undefined;
   return { dev, tunnelPort, command };
 }
 
-function readCommand(positionals: string[], yes: boolean, apply: boolean): Command | undefined {
+function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: number | undefined): Command | undefined {
   const [name, ...rest] = positionals;
   if (name === "roles") return rest.length === 0 && !yes ? { name, apply } : undefined;
+  if (name === "seed") {
+    const [show] = rest;
+    if (rest.length !== 1 || show === undefined || yes || apply) return undefined;
+    // The same normalising the website's run body applies (app.ts), so both
+    // doors hand the agent the same text for the same typed name.
+    const text = show.normalize("NFC").trim();
+    if (text === "" || [...text].length > MAX_SEED_SHOW_CHARS) return undefined;
+    return { name, show: text, pick };
+  }
   if (apply) return undefined;
   if (name === "promote") {
     const [runId, position] = rest;
@@ -359,6 +390,70 @@ async function runUnpromote(db: Db, runId: string): Promise<boolean> {
   return true;
 }
 
+// Show names and publishers come from Apple and Qloo. Control characters (an
+// escape starts a terminal command) and format characters (direction and
+// invisible ones) are removed and the text is cut, so that text cannot drive
+// the operator's terminal or hide part of itself (C3.6). The board lines get
+// formatPreview's own rule in promote.ts.
+const MAX_PRINTED_NAME_CHARS = 120;
+const printableName = (text: string): string =>
+  [...text.replace(/[\p{Cc}\p{Cf}]/gu, "")].slice(0, MAX_PRINTED_NAME_CHARS).join("");
+
+async function runSeed(db: Db, show: string, pick: number | undefined): Promise<boolean> {
+  let qloo: QlooConfig;
+  try {
+    qloo = loadQlooConfig();
+  } catch (error) {
+    // loadQlooConfig's messages name a variable, never its value.
+    console.log(error instanceof Error ? error.message : "The Qloo settings could not be read.");
+    return false;
+  }
+  const settings = loadAgentSettings(process.env);
+  if (qloo.apiKey === undefined || settings.anthropicApiKey === null) {
+    console.log("seed needs QLOO_API_KEY and ANTHROPIC_API_KEY in the environment or the repo-root .env.");
+    return false;
+  }
+  console.log(
+    `Seeding with ${settings.model}, effort ${settings.effort}, trends ${settings.trends ? "on" : "off"}. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.`,
+  );
+  const agent = createSeedAgent(db, {
+    qlooApiKey: qloo.apiKey,
+    qlooBaseUrl: qloo.baseUrl,
+    anthropicApiKey: settings.anthropicApiKey,
+    model: settings.model,
+    effort: settings.effort,
+    trends: settings.trends,
+  });
+  const outcome = await seedShow(db, agent, show, pick);
+
+  if (outcome.kind === "preview") {
+    console.log(`Candidates for "${printableName(show)}". No run was written.`);
+    for (const candidate of outcome.candidates) {
+      console.log(
+        `  ${candidate.rank}. ${printableName(candidate.name)} by ${printableName(candidate.publisher)} (Qloo: ${printableName(candidate.qlooName)})`,
+      );
+    }
+    console.log("Run again with --pick <number> to research one and build its board.");
+    return true;
+  }
+  if (outcome.kind === "failed") {
+    console.log(`The seed run ${outcome.runId ?? "(none)"} failed with ${outcome.code}.`);
+    return false;
+  }
+
+  console.log(
+    `Run ${outcome.runId} finished with ${outcome.guests} guests on the board, from candidate ${outcome.picked.rank}: ${printableName(outcome.picked.name)}.`,
+  );
+  // The same board and refusal runPromote prints without --yes, then the
+  // command that promotes it.
+  const preview = await previewRun(db, outcome.runId);
+  for (const line of formatPreview(preview)) console.log(line);
+  if (preview.refusal !== null) return false;
+  console.log("");
+  console.log(`Put it on the home page: npx tsx scripts/ops.ts promote ${outcome.runId} <position> --yes`);
+  return true;
+}
+
 // A promoted run the home page does not show is a problem worth exit 1.
 async function runShowcase(db: Db): Promise<boolean> {
   const promoted = await listPromoted(db);
@@ -546,6 +641,10 @@ async function main(): Promise<number> {
     console.error("bootstrap and roles --apply set up roles on a hosted database, so they never run with --dev.");
     return 2;
   }
+  if (dev && command.name === "seed") {
+    console.error("seed builds showcase runs on the hosted database, so it never runs with --dev.");
+    return 2;
+  }
 
   const connection = tunnelPort === undefined ? {} : { tunnelPort };
   let db: Db | undefined;
@@ -580,6 +679,8 @@ async function main(): Promise<number> {
         return (await runUnpromote(db, command.runId)) ? 0 : 1;
       case "showcase":
         return (await runShowcase(db)) ? 0 : 1;
+      case "seed":
+        return (await runSeed(db, command.show, command.pick)) ? 0 : 1;
       case "selftest":
         return (await runSelftest(db)) ? 0 : 1;
     }

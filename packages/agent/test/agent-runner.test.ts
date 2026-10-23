@@ -10,21 +10,11 @@
 // (server-app), the real network, the real model, main.ts itself (the live
 // dev smoke starts it), or races between database connections (PGlite has
 // one).
-import type Anthropic from "@anthropic-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ZodType } from "zod";
 import { AgentError } from "../src/agent/errors.js";
 import type { ModelClient } from "../src/agent/model.js";
-import {
-  createAgentRunner,
-  reserveSurfaceTokens,
-  SURFACE_BUDGETS,
-  waitForSurfaceQlooSlot,
-  type AgentFeeds,
-} from "../src/agent/runner.js";
+import { createAgentRunner, reserveSurfaceTokens, SURFACE_BUDGETS, waitForSurfaceQlooSlot } from "../src/agent/runner.js";
 import { FeedError } from "../src/feeds/errors.js";
-import type { ShowCandidate } from "../src/feeds/lookup.js";
-import { parseFeed } from "../src/feeds/rss.js";
 import { issueToken } from "../src/mcp/tokens.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
@@ -34,7 +24,6 @@ import type { ServerConfig } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
 import {
   claimBrief,
-  claimRunStatus,
   createRun,
   finishRun,
   getBrief,
@@ -51,13 +40,23 @@ import {
 } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { setBucket, usage } from "../src/store/meter.js";
+import {
+  confirmFirst as confirmFirstIn,
+  fakeFeeds,
+  fakeModel,
+  fakeQloo,
+  MARKER,
+  NOW,
+  personId,
+  PICKS,
+  PODCAST_ID,
+  sameForBoth,
+  show,
+  synthResponse,
+  trackingDb,
+} from "./helpers/agent-fakes.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
-const NOW = new Date("2026-10-19T12:00:00.000Z");
-const MARKER = "MARKER-ru11";
-const PODCAST_ID = "00000000-0000-4000-8000-000000000500";
-const personId = (n: number) => `00000000-0000-4000-8000-0000000002${String(n).padStart(2, "0")}`;
-const PICKS = [1, 2, 3, 4];
 // A bell, a hidden instruction in invisible Unicode tag characters, a
 // zero-width space and a direction override.
 const asTags = (text: string) => [...text].map((letter) => String.fromCodePoint(0xe0000 + letter.charCodeAt(0))).join("");
@@ -71,10 +70,6 @@ const stringsIn = (value: unknown): string[] =>
     : typeof value === "object" && value !== null
       ? Object.values(value).flatMap(stringsIn)
       : [];
-const RSS = `<?xml version="1.0"?><rss><channel><title>Synthetic Show</title>
-<item><title>Episode one with a past guest</title><pubDate>Mon, 12 Oct 2026 08:00:00 GMT</pubDate></item>
-<item><title>Episode two</title><pubDate>Mon, 05 Oct 2026 08:00:00 GMT</pubDate></item>
-</channel></rss>`;
 
 let db: Db;
 
@@ -85,123 +80,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await db.close();
 });
-
-const show = (n: number): ShowCandidate => ({
-  appleId: String(1000 + n),
-  name: `Synthetic Show ${n}`,
-  publisher: `Synthetic Publisher ${n}`,
-  feedUrl: new URL(`https://feeds.example/show-${n}.xml?token=${MARKER}`),
-  genre: null,
-});
-
-function fakeFeeds(opts: { shows?: ShowCandidate[]; feed?: string | Error } = {}) {
-  const fetched: URL[] = [];
-  const feeds: AgentFeeds = {
-    searchShows: async () => opts.shows ?? [1, 2, 3, 4, 5].map(show),
-    lookupShow: async () => null,
-    safeFetch: async (url) => {
-      fetched.push(url);
-      if (opts.feed instanceof Error) throw opts.feed;
-      return { body: opts.feed ?? RSS };
-    },
-    parseFeed,
-  };
-  return { feeds, fetched };
-}
-
-const fitScores: Record<string, number> = { [personId(1)]: 0.41, [personId(2)]: 0.77, [personId(3)]: 0.55 };
-
-function synthResponse(op: QlooOperation): unknown {
-  switch (op.op) {
-    case "search":
-      return [{ entity_id: PODCAST_ID, name: op.query }];
-    case "insights":
-      if (op.resultEntities !== undefined) {
-        return op.resultEntities.filter((id) => id in fitScores).map((id) => ({ entity_id: id, name: "ignored", query: { affinity: fitScores[id] } }));
-      }
-      return PICKS.map((n) => ({ entity_id: personId(n), name: `Synthetic Person ${n}`, popularity: 0.5, query: { affinity: 0.9 } }));
-    case "demographics":
-      return [{ entity_id: op.signalEntities[0], query: { age: { "25_to_29": op.signalEntities[0] === PODCAST_ID ? -0.2 : 0.4 }, gender: {} } }];
-    case "trending":
-      return Array.from({ length: 12 }, (_, week) => ({
-        date: new Date(Date.UTC(2026, 9, 11) - week * 7 * 86_400_000).toISOString().slice(0, 10),
-        population_percentile: week < 4 ? 70 : 60,
-      }));
-    case "compare":
-      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
-    default:
-      return [];
-  }
-}
-
-function fakeQloo(fail?: (op: QlooOperation) => QlooError | null) {
-  const ops: QlooOperation[] = [];
-  const qloo: MeteredQloo = {
-    async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
-      ops.push(op);
-      const error = fail?.(op) ?? null;
-      if (error !== null) throw error;
-      return { data: synthResponse(op) as T, fromCache: false };
-    },
-    stats: () => ({ calls: ops.length, cacheHits: 0 }),
-  };
-  return { qloo, ops };
-}
-
-const toolUse = (id: string, name: string, input: unknown) => ({ type: "tool_use", id, name, input, caller: { type: "direct" } });
-const reply = (content: unknown[]) =>
-  ({
-    id: "msg_synthetic",
-    type: "message",
-    role: "assistant",
-    model: "claude-haiku-5-5",
-    content,
-    stop_reason: "tool_use",
-    stop_sequence: null,
-    stop_details: null,
-    container: null,
-    diagnostics: null,
-    usage: { input_tokens: 100, output_tokens: 50 },
-  }) as unknown as Anthropic.Message;
-
-function fakeModel(briefDraft?: unknown) {
-  const turns: Array<Parameters<ModelClient["turn"]>[0]> = [];
-  const model: ModelClient = {
-    async turn(params) {
-      turns.push(structuredClone(params));
-      if (turns.length === 1) return reply([toolUse("p", "people_for_show", { reach: "any" }), toolUse("t", "recent_episode_titles", {})]);
-      return reply([
-        toolUse("f", "finish_board", { picks: PICKS.map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." })) }),
-      ]);
-    },
-    async structured<T>(params: { system: string; user: string; schema: ZodType<T>; maxTokens: number }): Promise<T> {
-      const parsed = params.schema.safeParse(briefDraft);
-      if (!parsed.success) throw new AgentError("AGENT_BAD_PROSE");
-      return parsed.data;
-    },
-  };
-  return { model, turns };
-}
-
-// Most tests here are about the run, not its surface, so both surfaces get
-// the same fakes.
-const sameForBoth = (model: ModelClient, qloo: MeteredQloo) => ({ modelFor: () => model, qlooFor: () => qloo });
-
-// Records which transaction each statement ran in, so a test can show two
-// writes were committed together.
-function trackingDb(inner: Db) {
-  const log: Array<{ tx: number | null; text: string; params: unknown[] }> = [];
-  let opened = 0;
-  const wrap = (target: Db, tx: number | null): Db => ({
-    query: <R = Record<string, unknown>>(text: string, params?: unknown[]) => {
-      log.push({ tx, text, params: params ?? [] });
-      return target.query<R>(text, params);
-    },
-    transaction: <T>(fn: (handle: Db) => Promise<T>) => target.transaction((handle) => fn(wrap(handle, tx ?? (opened += 1)))),
-    close: () => target.close(),
-  });
-  return { db: wrap(inner, null), log };
-}
 
 async function setup(
   opts: { input?: RunInput; feed?: string | Error; fail?: (op: QlooOperation) => QlooError | null; database?: Db; trends?: boolean } = {},
@@ -216,12 +94,7 @@ async function setup(
   return { runId, input, agent, fetched, ops, turns };
 }
 
-// What the confirm route does before it calls continueRun.
-async function confirmFirst(runId: string): Promise<string> {
-  const [first] = await listCandidates(db, runId);
-  expect(await claimRunStatus(db, runId, "awaiting_confirm", "running", NOW)).toBe(true);
-  return first!.id;
-}
+const confirmFirst = (runId: string) => confirmFirstIn(db, runId);
 
 const BRIEF = {
   why: "{{guest}} has {{fit}} with {{show}} listeners. See https://evil.example now.",

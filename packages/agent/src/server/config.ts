@@ -23,6 +23,8 @@ export type ServerConfig = {
   trends: boolean;
 };
 
+export type AgentSettings = Pick<ServerConfig, "anthropicApiKey" | "model" | "effort" | "anthropicTokensPerDay" | "trends">;
+
 type LocalVariable =
   | "DATABASE_NETWORK"
   | "ANTHROPIC_API_KEY"
@@ -133,6 +135,34 @@ function localSetting<T>(variable: LocalVariable, schema: z.ZodType<T>, value: u
 }
 
 /**
+ * Reads and checks the model and trend settings the agent itself needs,
+ * exactly as given in `env`: it never loads .env and never looks at
+ * NODE_ENV, so an operator script can use it after loading the file its own
+ * way. ANTHROPIC_API_KEY is optional (null when unset or blank) and must be
+ * printable ASCII with no spaces, VASAL_MODEL defaults to claude-haiku-5-5
+ * and must look like a Claude model id, VASAL_EFFORT is low, medium or high
+ * (default medium), ANTHROPIC_TOKENS_PER_DAY is a whole number from 1 to
+ * 100,000,000 (default 2,000,000), and VASAL_TRENDS is on or off (default
+ * off). The variables are checked in that order. Throws
+ * ServerError("SRV_CONFIG") at the first bad one; the message names the
+ * variable and never contains its value.
+ */
+export function loadAgentSettings(env: NodeJS.ProcessEnv): AgentSettings {
+  const localText = (variable: LocalVariable): string | undefined => localSetting(variable, optionalText, env[variable]);
+  const keyText = localText("ANTHROPIC_API_KEY");
+  const anthropicApiKey = keyText === undefined ? null : localSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
+  const model = localSetting("VASAL_MODEL", modelSchema, localText("VASAL_MODEL") ?? DEFAULT_MODEL);
+  const effort = localSetting("VASAL_EFFORT", effortSchema, localText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
+  const tokensText = localText("ANTHROPIC_TOKENS_PER_DAY");
+  const anthropicTokensPerDay =
+    tokensText === undefined
+      ? DEFAULT_ANTHROPIC_TOKENS_PER_DAY
+      : localSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
+  const trends = localSetting("VASAL_TRENDS", trendsSchema, localText("VASAL_TRENDS") ?? DEFAULT_TRENDS) === "on";
+  return { anthropicApiKey, model, effort, anthropicTokensPerDay, trends };
+}
+
+/**
  * Reads and checks the agent server settings. When reading the real process
  * environment, the repo-root .env is loaded first if it exists, and values
  * already set win over the file; a custom `env` is read exactly as given.
@@ -221,16 +251,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const networkText = localText("DATABASE_NETWORK");
   const databaseNetwork = networkText === undefined ? null : localSetting("DATABASE_NETWORK", networkSchema, networkText);
 
-  const keyText = localText("ANTHROPIC_API_KEY");
-  const anthropicApiKey = keyText === undefined ? null : localSetting("ANTHROPIC_API_KEY", apiKeySchema, keyText);
-  const model = localSetting("VASAL_MODEL", modelSchema, localText("VASAL_MODEL") ?? DEFAULT_MODEL);
-  const effort = localSetting("VASAL_EFFORT", effortSchema, localText("VASAL_EFFORT") ?? DEFAULT_EFFORT);
-  const tokensText = localText("ANTHROPIC_TOKENS_PER_DAY");
-  const anthropicTokensPerDay =
-    tokensText === undefined
-      ? DEFAULT_ANTHROPIC_TOKENS_PER_DAY
-      : localSetting("ANTHROPIC_TOKENS_PER_DAY", wholeNumber(1, 100_000_000), tokensText);
-  const trends = localSetting("VASAL_TRENDS", trendsSchema, localText("VASAL_TRENDS") ?? DEFAULT_TRENDS) === "on";
+  const { anthropicApiKey, model, effort, anthropicTokensPerDay, trends } = loadAgentSettings(env);
 
   return {
     production,
