@@ -32,13 +32,18 @@ const PLACEHOLDER = /\{\{([A-Za-z_][A-Za-z0-9_]{0,39})\}\}/g;
 // number needs digits, so this also keeps phone numbers out (C3.5).
 const NUMBER_CHARACTER = /\p{N}/u;
 const SPACE_RUN = /[^\S\r\n]{2,}/g;
+/** The words the prompts and finish_board's hint name, kept next to TREND_CLAIM so the two cannot drift apart. */
+export const TREND_CLAIM_WORDS = "rising, on the rise, trending, up and coming, a breakout, buzzy, surging or growing in popularity";
 // Words that say someone is gaining popularity, matched case-insensitively on
 // word boundaries, so "surprising", "uprising", "arising" and "risings" pass.
 // Each gap takes any run of spaces or Unicode dashes, so "up and coming",
-// "up-and-coming" and a non-breaking hyphen all match. It does not catch
-// every synonym, such as "hot right now"; the prompts forbid those too.
+// "up-and-coming" and a non-breaking hyphen all match. A breakout role, film
+// or album is a past work, not a claim about momentum, so "breakout" passes
+// when a named kind of work follows it. "Breakout year", "breakout star" and
+// "a breakout" on its own still claim momentum. It does not catch every
+// synonym, such as "hot right now"; the prompts forbid those too.
 const TREND_CLAIM =
-  /\b(?:rising(?:\s+star)?|on\s+the\s+rise|trending|up[\s\p{Pd}]+and[\s\p{Pd}]+coming|breakout|buzzy|surging|growing\s+in\s+popularity)\b/iu;
+  /\b(?:rising(?:\s+star)?|on\s+the\s+rise|trending|up[\s\p{Pd}]+and[\s\p{Pd}]+coming|breakout(?![\s\p{Pd}]+(?:roles?|films?|movies?|performances?|parts?|albums?|singles?|songs?|records?|hits?|shows?|series|seasons?|books?|novels?|specials?|plays?)\b)|buzzy|surging|growing\s+in\s+popularity)\b/iu;
 
 const refuse = (reason: NonNullable<ProseCheck["reason"]>, removed: ProseCheck["removed"]): ProseCheck => ({
   ok: false,
@@ -88,9 +93,10 @@ export function withoutLinks(text: string): { text: string; removed: ProseCheck[
  * whose name is in `placeholders` (C3.4). A placeholder not on that list is
  * plain text, so any digit inside it fails. With `noTrendClaims`, the same
  * text outside the listed placeholders is refused with reason "trend_claim"
- * if it calls someone rising, on the rise, trending, up and coming, a
- * breakout, buzzy, surging or growing in popularity. The check runs before placeholders are filled, so a
- * filled-in value never trips it. Text left empty by removals is refused as
+ * if it calls someone rising, on the rise, trending, up and coming, "a
+ * breakout" (but not a breakout role, film, album or other named work),
+ * buzzy, surging or growing in popularity. The check runs before placeholders
+ * are filled, so a filled-in value never trips it. Text left empty by removals is refused as
  * "empty". On refusal `text` is "", so failed prose cannot be shown by
  * mistake.
  *

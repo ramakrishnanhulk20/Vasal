@@ -14,6 +14,7 @@ import {
   finishRun,
   getRun,
   listCandidates,
+  listEventsAfter,
   type RunInput,
   type RunRecord,
 } from "../server/runs.js";
@@ -40,10 +41,14 @@ export const SEED_PREVIEW_FAILED = "SEED_PREVIEW_FAILED";
 export type SeedCandidate = { rank: number; name: string; publisher: string; qlooName: string };
 /** What the seed needs from the agent: the show lookup on its own, and the real runner. */
 export type SeedAgent = { preview(show: string): Promise<SeedCandidate[]>; runner: AgentPort };
-/** How seedShow ended. A failed outcome carries only a fixed upper-case code, never error text (C3.6). */
+/**
+ * How seedShow ended. A failed outcome carries only a fixed upper-case code,
+ * never error text (C3.6). A done outcome's pastGuests is read from the run's
+ * done event, and is null when that event has none or it cannot be read.
+ */
 export type SeedOutcome =
   | { kind: "preview"; candidates: SeedCandidate[] }
-  | { kind: "done"; runId: string; picked: SeedCandidate; guests: number }
+  | { kind: "done"; runId: string; picked: SeedCandidate; guests: number; pastGuests: { checked: boolean; skipped: number } | null }
   | { kind: "failed"; runId: string | null; code: string };
 
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
@@ -63,6 +68,23 @@ const CandidateRow = z
     qlooName: z.string().min(1).max(200),
   })
   .strict();
+
+// A run holds at most 500 events (appendEvent in server/runs.ts), so one page
+// this size always reaches its done event.
+const RUN_EVENT_PAGE = 500;
+
+// Read back through a schema like any stored row, so a done event written
+// before past guests were counted, or one that does not fit, reads as null
+// rather than as a count nobody made (C6.5).
+const DonePastGuests = z.object({
+  pastGuests: z.object({ checked: z.boolean(), skipped: z.number().int().min(0) }).strict(),
+});
+
+async function pastGuestsOf(db: Db, runId: string): Promise<{ checked: boolean; skipped: number } | null> {
+  const done = (await listEventsAfter(db, runId, 0, RUN_EVENT_PAGE)).findLast((event) => event.event === "done");
+  const parsed = DonePastGuests.safeParse(done?.data);
+  return parsed.success ? parsed.data.pastGuests : null;
+}
 
 // Only a fixed upper-case code ever leaves the preview, never an error's
 // message, which could quote an upstream answer (C3.6).
@@ -181,8 +203,9 @@ export function createSeedAgent(
  * the run is then awaiting_confirm it takes the stored candidate at rank
  * `pick`, claims the run from awaiting_confirm to running as the confirm
  * route does, runs continueRun on that candidate, and returns done with the
- * pick and the board's guest count. Each outcome is read from the run row,
- * never from what the runner returned or threw. A run that failed in the
+ * pick, the board's guest count and the done event's pastGuests (null when
+ * absent or unreadable). Each outcome is read from the run row and its
+ * events, never from what the runner returned or threw. A run that failed in the
  * runner returns its own code. A run left open is closed as failed with
  * SEED_UNEXPECTED_STATUS, and a pick that is not a stored, readable
  * candidate (past the list, below 1 or not whole) closes it as failed with
@@ -243,7 +266,7 @@ export async function seedShow(db: Db, agent: SeedAgent, show: string, pick: num
   const finished = await getRun(db, runId);
   if (finished?.status === "done") {
     const { board } = await previewRun(db, runId);
-    return { kind: "done", runId, picked, guests: board.length };
+    return { kind: "done", runId, picked, guests: board.length, pastGuests: await pastGuestsOf(db, runId) };
   }
   if (isOpen(finished)) return closeFailed(db, runId, SEED_UNEXPECTED_STATUS);
   return { kind: "failed", runId, code: finished?.errorCode ?? SEED_UNEXPECTED_STATUS };

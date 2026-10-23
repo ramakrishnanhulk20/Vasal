@@ -140,12 +140,16 @@ function knownCode(error: unknown): string | null {
  * continueRun acts only on a candidate the server stored for that run
  * (C6.2). It fetches the candidate's feed only through a FeedHandles handle
  * issued for this run, and the model has no fetch tool at all (C1.5); on any
- * FeedError it carries on with no episode titles and says so in a step. It
- * then runs the research loop, fetches every pick's fit in one metered Qloo
+ * FeedError it carries on with no episode titles and says so in a step. The
+ * model is shown the newest 40 titles, and every title the feed gave is used
+ * to leave past guests out of every tool result (isPastGuest). It then runs
+ * the research loop, fetches every pick's fit in one metered Qloo
  * call so every fit on the board is comparable, fills missing audience,
  * trend and shared-taste data for the picks left after exclusions through
  * runTool (so the per-tool caps hold), builds the board in code, and stores
- * it with a "board" event and a done event. Fewer than 3 guests fails with
+ * it with a "board" event and a done event. Both carry pastGuests
+ * { checked, skipped }: checked is false when the feed could not be read, and
+ * skipped counts the people left out as past guests. Fewer than 3 guests fails with
  * AGENT_BOARD_TOO_SMALL; nothing is padded. With `trends` false the research
  * loop is never offered trend_of and the fill skips it, so no trend call is
  * spent and every guest's rising state is "unknown".
@@ -205,33 +209,41 @@ export function createAgentRunner(deps: {
     }
   };
 
-  const recentTitles = async (runId: string, feedUrl: string | null, source: "directory" | "visitor"): Promise<string[]> => {
+  // recent is what the model may read; all is every title the parser kept,
+  // because a guest from years back is still a past guest. null means past
+  // guests cannot be checked, which the run reports instead of implying
+  // there were none.
+  const feedTitles = async (
+    runId: string,
+    feedUrl: string | null,
+    source: "directory" | "visitor",
+  ): Promise<{ recent: string[]; all: string[] } | null> => {
     const url = feedUrl === null ? null : URL.parse(feedUrl);
     if (url === null) {
       await step(runId, { tool: "feed", ok: false, label: "This show lists no feed, so past guests are not checked" });
-      return [];
+      return null;
     }
     const handles = new FeedHandles();
     const handle = handles.issue(url, source);
-    let titles: string[];
+    let all: string[];
     try {
       const { body } = await feeds.safeFetch(handles.resolve(handle));
-      titles = feeds
+      all = feeds
         .parseFeed(body)
         .episodes.map((episode) => episode.title)
-        .filter((title) => title !== "")
-        .slice(0, MAX_EPISODE_TITLES);
+        .filter((title) => title !== "");
     } catch (error) {
       if (!(error instanceof FeedError)) throw error;
       await step(runId, { tool: "feed", ok: false, label: "Could not read the show's feed, so past guests are not checked" });
-      return [];
+      return null;
     }
+    const recent = all.slice(0, MAX_EPISODE_TITLES);
     await step(runId, {
       tool: "feed",
       ok: true,
-      label: `Read ${plural(titles.length, "recent episode title", "recent episode titles")} from the show's feed`,
+      label: `Read ${plural(recent.length, "recent episode title", "recent episode titles")} from the show's feed`,
     });
-    return titles;
+    return { recent, all };
   };
 
   // One request for every pick, so all fits share one signal and one scale.
@@ -318,13 +330,14 @@ export function createAgentRunner(deps: {
         if (!candidate.success) throw new AgentError("SHOW_NOT_FOUND");
         const show = candidate.data;
 
-        const episodeTitles = await recentTitles(runId, show.feedUrl, show.feedHandleSource);
+        const titles = await feedTitles(runId, show.feedUrl, show.feedHandleSource);
         // The Qloo name, not the directory's or the visitor's text, is what
         // the model is told (C2.7).
         const ctx = createRunContext({
           show: { qlooId: show.qlooId, name: show.qlooName },
-          episodeTitles,
+          episodeTitles: titles?.recent ?? [],
           exclusions: run.input.exclude,
+          pastGuestTitles: titles?.all ?? null,
         });
         const startedAt = clock().getTime();
         const overTime = () => clock().getTime() - startedAt >= DEFAULT_LIMITS.maxWallMs;
@@ -367,8 +380,9 @@ export function createAgentRunner(deps: {
           reach: entry.reach,
           rising: entry.rising.state,
         }));
-        await appendEvent(db, runId, "board", { guests }, clock());
-        await finishRun(db, runId, "done", { name: "done", data: { guests: board.length } }, undefined, clock());
+        const pastGuests = { checked: ctx.pastGuests.checked, skipped: ctx.pastGuests.skipped.size };
+        await appendEvent(db, runId, "board", { guests, pastGuests }, clock());
+        await finishRun(db, runId, "done", { name: "done", data: { guests: board.length, pastGuests } }, undefined, clock());
       });
     },
 

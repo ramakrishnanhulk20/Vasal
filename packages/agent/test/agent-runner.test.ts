@@ -5,8 +5,9 @@
 // GET /runs/:id once to show a pasted feed's URL stays private, and reads a
 // stored board back through listShowcase so the two schemas agree. It also
 // covers which surface's buckets a run spends from, through the real meter
-// functions main.ts wires in, and that a run with trends off spends no trend
-// call. It does not cover the other HTTP routes
+// functions main.ts wires in, that a run with trends off spends no trend
+// call, and that a past guest the feed names never reaches the board. It
+// does not cover the other HTTP routes
 // (server-app), the real network, the real model, main.ts itself (the live
 // dev smoke starts it), or races between database connections (PGlite has
 // one).
@@ -237,7 +238,7 @@ describe("continueRun (C1.5, C6.4)", () => {
     expect(turns[0]!.tools.some((tool) => /fetch|url|feed/i.test(tool.name))).toBe(false);
 
     const events = await listEventsAfter(db, runId, 0);
-    expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 3 } });
+    expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 3, pastGuests: { checked: true, skipped: 0 } } });
     const boardEvent = events.find((event) => event.event === "board")?.data as { guests: Array<Record<string, unknown>> };
     expect(boardEvent.guests.map((guest) => [guest["name"], guest["fitRank"]])).toEqual([
       ["Synthetic Person 2", 1],
@@ -308,6 +309,63 @@ describe("continueRun (C1.5, C6.4)", () => {
       label: "Could not read the show's feed, so past guests are not checked",
     });
     expect(JSON.stringify(turns)).not.toContain("Episode one");
+  });
+
+  it("a past guest named in an old episode title never reaches the board", async () => {
+    // 45 weekly episodes. Only the oldest names the guest, so it is past the
+    // 40 titles the model is shown and only code can catch it.
+    const items = Array.from({ length: 45 }, (_, week) => {
+      const title = week === 44 ? "Synthetic Person 1 looks back" : `Episode ${45 - week}`;
+      return `<item><title>${title}</title><pubDate>${new Date(Date.UTC(2026, 9, 12) - week * 7 * 86_400_000).toUTCString()}</pubDate></item>`;
+    });
+    const feed = `<?xml version="1.0"?><rss><channel><title>Synthetic Show</title>${items.join("")}</channel></rss>`;
+    // The first finish_board still names the past guest; the retry picks the
+    // rest, so the board is kept clean by the tools, not by the model.
+    const { model: scripted, turns } = fakeModel(BRIEF);
+    let finishes = 0;
+    const model: ModelClient = {
+      ...scripted,
+      async turn(params, options) {
+        const reply = await scripted.turn(params, options);
+        const content = reply.content.map((block) => {
+          if (block.type !== "tool_use" || block.name !== "finish_board") return block;
+          finishes += 1;
+          const picks = [2, 3, 4].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
+          return finishes === 1 ? block : { ...block, input: { picks } };
+        });
+        return { ...reply, content };
+      },
+    };
+    const input: RunInput = { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(model, fakeQloo().qloo), feeds: fakeFeeds({ feed }).feeds, trends: true, now: () => NOW });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    expect((await getRun(db, runId))?.status).toBe("done");
+    const board = (await listBoard(db, runId)).map((item) => item.data as { name: string });
+    expect(board.map((entry) => entry.name)).toEqual([2, 3, 4].map((n) => `Synthetic Person ${n}`));
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 3, pastGuests: { checked: true, skipped: 1 } } });
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { checked: true, skipped: 1 } });
+    const labels = events.flatMap((event) => (event.event === "step" ? [(event.data as { label: string }).label] : []));
+    expect(labels).toContain("Read 40 recent episode titles from the show's feed");
+    expect(labels).toContain("Found 3 people this show's listeners love, leaving out 1 past guest");
+    expect(labels).toContain("Sent some picks back to be fixed");
+    expect(finishes).toBe(2);
+    expect(JSON.stringify(turns)).not.toContain("Synthetic Person 1");
+  });
+
+  it("a feed that cannot be read leaves past guests unchecked", async () => {
+    const { runId, input, agent } = await setup({ feed: new FeedError("FEED_TIMEOUT") });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 4, pastGuests: { checked: false, skipped: 0 } } });
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { checked: false, skipped: 0 } });
   });
 
   it("gives a person Qloo returns no fit for fit 0 and fitKnown false", async () => {

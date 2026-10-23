@@ -102,6 +102,24 @@ describe("checkProse with noTrendClaims", () => {
     }
   });
 
+  it("a breakout role, film or other named work is not a trend claim", () => {
+    for (const text of [
+      "Reinventing yourself after a breakout role",
+      "Her breakout film and what came after",
+      "The breakout album that changed their sound",
+      "A breakout performance on stage",
+      "Life after a breakout-role year",
+    ]) {
+      expect(checkProse(text, NO_TRENDS), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });
+    }
+  });
+
+  it("breakout as momentum is still a trend claim", () => {
+    for (const text of ["Their breakout year", "A breakout star", "A true breakout", "A breakout moment for the band", "Breakout"]) {
+      expect(checkProse(text, NO_TRENDS).reason, text).toBe("trend_claim");
+    }
+  });
+
   it("lets words that only contain rising pass, because the match is on word boundaries", () => {
     for (const text of ["A surprising guest", "A film about an uprising", "Questions arising from the show", "Two risings in one story"]) {
       expect(checkProse(text, NO_TRENDS), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });

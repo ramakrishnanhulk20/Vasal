@@ -90,6 +90,7 @@ describe("seed", () => {
     expect(await getRun(db, outcome.runId)).toMatchObject({ status: "done", surface: "web", errorCode: null });
     expect(outcome.guests).toBeGreaterThanOrEqual(3);
     expect(outcome.guests).toBe((await listBoard(db, outcome.runId)).length);
+    expect(outcome.pastGuests).toEqual({ checked: true, skipped: 0 });
     expect((await previewRun(db, outcome.runId)).refusal).toBeNull();
   });
 

@@ -7,7 +7,8 @@ import type { QlooCompareResult, QlooDemographic, QlooEntity, QlooTrendRow } fro
 import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
-import { checkProse } from "./prose.js";
+import { isPastGuest } from "./past-guests.js";
+import { checkProse, type ProseCheck, TREND_CLAIM_WORDS } from "./prose.js";
 
 export type ToolName =
   | "people_for_show"
@@ -82,6 +83,22 @@ const RELEASE_DATE_PROPERTY: Record<ReleaseKind, "release_date" | "publication_d
 const UPCOMING_DAYS = 730;
 const RELEASE_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 const RELEASE_YEAR = /^[1-9]\d{3}$/;
+
+// Taken from ProseCheck's reasons, so a new prose reason fails to compile
+// until PICK_HINTS has a hint for it.
+type RejectReason = "unknown_person" | "duplicate" | NonNullable<ProseCheck["reason"]>;
+
+// A refusal code alone does not tell the model what to change, so it can
+// repeat the same mistake until the board is lost. Each hint is fixed text
+// that quotes nothing the model or Qloo wrote (C2.1).
+export const PICK_HINTS: Record<RejectReason, string> = Object.freeze({
+  unknown_person: "Use a personId exactly as a tool returned it in this run.",
+  duplicate: "Pick each person once.",
+  digits: "Write no digits: say numbers in words or leave them out. The app shows numbers itself.",
+  too_long: "Keep the angle under 200 characters.",
+  empty: "Write one plain sentence.",
+  trend_claim: `Qloo has no trend data right now, so do not call anyone ${TREND_CLAIM_WORDS}. A past breakout role or album is fine.`,
+});
 
 const PersonId = z.string().min(1).max(64);
 
@@ -179,7 +196,7 @@ export function researchTools(opts: ToolOptions): Anthropic.Tool[] {
     ),
     toolDefinition(
       "recent_episode_titles",
-      "Titles of the show's recent episodes, so you can avoid suggesting someone who was on the show recently. Call it once.",
+      "Titles of the show's recent episodes, so you can see what the show covers. Past guests are already left out of every list. Call it once.",
       {},
     ),
     toolDefinition(
@@ -232,14 +249,24 @@ function refusal(ctx: RunContext, tool: StepSummary["tool"], code: string, summa
 }
 
 // Drops whole items from the end until the JSON fits (C2.8). Text is never cut
-// here; every string was already capped when it came in.
-function listContent<T>(key: string, items: readonly T[]): string {
+// here; every string was already capped when it came in. Extra fields are
+// counts only, written next to the list and inside the same cap.
+function listContent<T>(key: string, items: readonly T[], extra: Readonly<Record<string, number>> = {}): string {
   for (let kept = items.length; kept > 0; kept -= 1) {
     const omitted = items.length - kept;
-    const text = JSON.stringify(omitted > 0 ? { [key]: items.slice(0, kept), omitted } : { [key]: items.slice(0, kept) });
+    const text = JSON.stringify(
+      omitted > 0 ? { [key]: items.slice(0, kept), ...extra, omitted } : { [key]: items.slice(0, kept), ...extra },
+    );
     if (text.length <= MAX_CONTENT_CHARS) return text;
   }
-  return JSON.stringify(items.length > 0 ? { [key]: [], omitted: items.length } : { [key]: [] });
+  return JSON.stringify(items.length > 0 ? { [key]: [], ...extra, omitted: items.length } : { [key]: [], ...extra });
+}
+
+// Counted from this answer only, so the number is what this call left out,
+// never a running total the model could read as new people dropped.
+function pastGuestsLeftOut(ctx: RunContext, answer: readonly QlooEntity[]): Readonly<Record<string, number>> {
+  const skipped = new Set(answer.map((entity) => entity.entity_id).filter((id) => ctx.pastGuests.skipped.has(id))).size;
+  return skipped > 0 ? { skippedPastGuests: skipped } : {};
 }
 
 function listOf<T>(data: unknown): T[] {
@@ -285,7 +312,10 @@ function hasDied(entity: QlooEntity): boolean {
 }
 
 // Every person a tool returns passes through here, so a person dropped here
-// never reaches the model, the board, compare or demographics.
+// never reaches the model, the board, compare or demographics. Past guests
+// stop here too: anyone an episode title of this show names is left out and
+// counted in ctx.pastGuests.skipped, so their id is one no tool returned and
+// every later tool refuses it as an unknown person with no Qloo call (C2.2).
 function recordPerson(ctx: RunContext, entity: QlooEntity, affinity: number | null): { personId: string; name: string } | null {
   if (!QLOO_ID.test(entity.entity_id)) return null;
   // A later answer can carry a death date an earlier one lacked; the person
@@ -296,6 +326,11 @@ function recordPerson(ctx: RunContext, entity: QlooEntity, affinity: number | nu
   }
   const name = cleanField(entity.name, MAX_NAME_CHARS);
   if (name === "") return null;
+  if (isPastGuest(ctx.pastGuests.index, name)) {
+    ctx.people.delete(entity.entity_id);
+    ctx.pastGuests.skipped.add(entity.entity_id);
+    return null;
+  }
   const popularity = isFiniteNumber(entity.popularity) ? entity.popularity : null;
   const known = ctx.people.get(entity.entity_id);
   // The first affinity seen is kept, so the board's fit never changes under
@@ -380,8 +415,9 @@ const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
     ...(popularityMax === undefined ? {} : { popularityMax }),
   };
   const { data } = await qloo.call<QlooEntity[]>(op);
+  const answer = listOf<QlooEntity>(data);
   const people = uniqueById(
-    listOf<QlooEntity>(data).map((entity) => {
+    answer.map((entity) => {
       const affinity = entity.query?.affinity ?? entity.properties?.affinity;
       return recordPerson(ctx, entity, isFiniteNumber(affinity) ? affinity : null);
     }),
@@ -395,7 +431,7 @@ const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
     };
   });
   step(ctx, "people_for_show", true, `found ${people.length} people`);
-  return { content: listContent("people", people), isError: false };
+  return { content: listContent("people", people, pastGuestsLeftOut(ctx, answer)), isError: false };
 };
 
 const audienceOf: Handler<"audience_of"> = async (ctx, qloo, input) => {
@@ -475,9 +511,10 @@ const findPerson: Handler<"find_person"> = async (ctx, qloo, input) => {
   });
   // A search score says how well a name matched, not how well a person fits
   // the show, so it is never recorded as affinity.
-  const people = uniqueById(listOf<QlooEntity>(data).map((entity) => recordPerson(ctx, entity, null)));
+  const answer = listOf<QlooEntity>(data);
+  const people = uniqueById(answer.map((entity) => recordPerson(ctx, entity, null)));
   step(ctx, "find_person", true, `found ${people.length} matching people`);
-  return { content: listContent("people", people), isError: false };
+  return { content: listContent("people", people, pastGuestsLeftOut(ctx, answer)), isError: false };
 };
 
 const recentEpisodeTitles: Handler<"recent_episode_titles"> = async (ctx) => {
@@ -491,17 +528,17 @@ const recentEpisodeTitles: Handler<"recent_episode_titles"> = async (ctx) => {
 
 const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input, _today, opts) => {
   const finished: Array<{ personId: string; angle: string }> = [];
-  const rejected: Array<{ index: number; reason: string }> = [];
+  const rejected: Array<{ index: number; reason: RejectReason; hint: string }> = [];
   const removed = { links: 0, emails: 0 };
   const seen = new Set<string>();
 
   for (const [index, pick] of input.picks.entries()) {
     if (!ctx.people.has(pick.personId)) {
-      rejected.push({ index, reason: "unknown_person" });
+      rejected.push({ index, reason: "unknown_person", hint: PICK_HINTS.unknown_person });
       continue;
     }
     if (seen.has(pick.personId)) {
-      rejected.push({ index, reason: "duplicate" });
+      rejected.push({ index, reason: "duplicate", hint: PICK_HINTS.duplicate });
       continue;
     }
     seen.add(pick.personId);
@@ -511,7 +548,8 @@ const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input, _today, o
     // With no trend data behind the board, an angle may not call anyone rising.
     const check = checkProse(angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [], noTrendClaims: !opts.trends });
     if (!check.ok) {
-      rejected.push({ index, reason: check.reason ?? "empty" });
+      const reason = check.reason ?? "empty";
+      rejected.push({ index, reason, hint: PICK_HINTS[reason] });
       continue;
     }
     removed.links += check.removed.links;

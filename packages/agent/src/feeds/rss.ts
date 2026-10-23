@@ -12,7 +12,7 @@ export type ParsedFeed = { title: string; episodes: FeedEpisode[] };
 
 const MAX_DEPTH = 32;
 const MAX_ELEMENTS = 50_000;
-const MAX_EPISODES = 500;
+const MAX_EPISODES = 2_000;
 const MAX_TITLE_CHARS = 500;
 const MAX_DATE_CHARS = 100;
 const DOCTYPE = /<!doctype/i;
@@ -145,7 +145,7 @@ function fromAtom(feed: XmlNode): ParsedFeed {
 
 /**
  * Reads an RSS 2.0 (rss > channel > item) or Atom (feed > entry) document
- * into a show title and its newest 500 episodes, newest first. Titles are
+ * into a show title and its newest 2,000 episodes, newest first. Titles are
  * capped at 500 characters. Episodes with no readable date sort last.
  *
  * Throws FeedError:

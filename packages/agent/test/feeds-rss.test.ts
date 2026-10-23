@@ -76,14 +76,14 @@ describe("reading RSS 2.0 and Atom", () => {
     ]);
   });
 
-  it("keeps only the newest 500 episodes, newest first", () => {
-    const start = Date.UTC(2020, 0, 1);
-    const days = Array.from({ length: 600 }, (_, i) => i).sort((a, b) => ((a * 7919) % 600) - ((b * 7919) % 600));
+  it("keeps only the newest 2,000 episodes, newest first", () => {
+    const start = Date.UTC(2010, 0, 1);
+    const days = Array.from({ length: 2_100 }, (_, i) => i).sort((a, b) => ((a * 7919) % 2_100) - ((b * 7919) % 2_100));
     const items = days.map((day) => item(`Day ${day}`, new Date(start + day * 86_400_000).toUTCString())).join("");
     const feed = parseFeed(rss(items));
-    expect(feed.episodes).toHaveLength(500);
-    expect(feed.episodes[0]?.title).toBe("Day 599");
-    expect(feed.episodes[499]?.title).toBe("Day 100");
+    expect(feed.episodes).toHaveLength(2_000);
+    expect(feed.episodes[0]?.title).toBe("Day 2099");
+    expect(feed.episodes[1_999]?.title).toBe("Day 100");
   });
 
   it("caps each title at 500 characters without splitting a character", () => {

@@ -171,6 +171,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C2.6 No secret, environment variable, database URL or internal hostname appears in any message to the model, including tool results and tool errors.
 - C2.7 Exclusions are applied in code to the ranked board, and the model never sees them. Visitor free text never reaches the brief or pitch prompts. Those get only the confirmed show, the guest picked from the stored board, computed numbers and tool data.
 - C2.8 Tool results reach the model only as tool-result content, capped in size, and are never merged into the system prompt. Every third-party string in a tool result is cleaned first by the same cleaner as D5.2: NFC, `\p{Cc}` removed, `\p{Default_Ignorable_Code_Point}` and `\p{Bidi_Control}` removed. That takes out the invisible Unicode tag characters (U+E0000 to U+E007F), which a model reads and a person cannot see.
+- C2.9 A person the show has already had as a guest never reaches the board. Code (isPastGuest, at recordPerson, the one gate every person passes) removes anyone whose whole name, first and last name, or a three-letter short first name before the same surname appears in any episode title the feed gave, before the model sees them. Their id is then unknown, so it is refused like any id no tool returned (C2.2). When the feed cannot be read, the run records that past guests were not checked, rather than implying there were none. A false match only removes a person; it can never add one.
 
 ### C3 What leaves the server (A5, A11, G4, G5)
 - C3.1 No attacker-influenced string is ever treated as HTML or script in the browser. This covers model prose, feed fields, Qloo and YouTube text, tool inputs in step events, and anything read back from the database. All of it renders as React text, with no `dangerouslySetInnerHTML`. If prose is rendered as markdown, raw HTML and images are off.
@@ -284,7 +285,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
    - request body: 8 KB
    - show text: 300 characters
    - exclusions: 25 names of 100 characters each
-   - feed fetch: 5 s to connect, 15 s total, 10 MB decoded, 3 redirects, newest 500 items parsed
+   - feed fetch: 5 s to connect, 15 s total, 10 MB decoded, 3 redirects, IPv4 addresses dialled first, newest 2,000 items parsed
    - model: 12 turns, 25 tool calls, 8,000 output tokens per reply (raised from a first guess of 4,000, so a turn that plans several tool calls is not cut off; the per-run cap is unchanged), 150,000 tokens per run
    - run wall clock: 120 s
    - streams: 3 per run, 10 minutes each

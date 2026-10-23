@@ -69,10 +69,28 @@ function countIn(content: string, key: string): number {
   return shown + (typeof omitted === "number" && Number.isSafeInteger(omitted) && omitted > 0 ? omitted : 0);
 }
 
+// Read from runTool's own JSON like countIn, and anything but a whole number
+// above 0 reads as 0, so the label never shows a figure code did not write.
+function numberIn(content: string, key: string): number {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return 0;
+  }
+  const value = field(parsed, key);
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function pastGuestsSuffix(outcome: ToolOutcome): string {
+  const skipped = numberIn(outcome.content, "skippedPastGuests");
+  return skipped > 0 ? `, leaving out ${plural(skipped, "past guest", "past guests")}` : "";
+}
+
 function okLabel(tool: ToolName, ctx: RunContext, input: unknown, outcome: ToolOutcome): string {
   switch (tool) {
     case "people_for_show":
-      return `Found ${plural(countIn(outcome.content, "people"), "person", "people")} this show's listeners love`;
+      return `Found ${plural(countIn(outcome.content, "people"), "person", "people")} this show's listeners love${pastGuestsSuffix(outcome)}`;
     case "audience_of":
       return `Checked who ${personName(ctx, input)}'s fans are`;
     case "trend_of":
@@ -85,7 +103,7 @@ function okLabel(tool: ToolName, ctx: RunContext, input: unknown, outcome: ToolO
       return `Found ${countIn(outcome.content, "titles")} upcoming ${words}`;
     }
     case "find_person":
-      return `Looked up a name and found ${plural(countIn(outcome.content, "people"), "match", "matches")}`;
+      return `Looked up a name and found ${plural(countIn(outcome.content, "people"), "match", "matches")}${pastGuestsSuffix(outcome)}`;
     case "recent_episode_titles":
       return `Read ${plural(countIn(outcome.content, "titles"), "recent episode title", "recent episode titles")}`;
     case "finish_board":

@@ -1,3 +1,4 @@
+import { NO_PAST_GUESTS, pastGuestIndex, type PastGuestIndex } from "./past-guests.js";
 import type { ToolName } from "./tools.js";
 
 /** A person some tool returned in this run. Only these may appear on the board. */
@@ -32,6 +33,9 @@ export type RunContext = {
   readonly compares: Map<string, SharedTag[]>;
   readonly toolCalls: Map<ToolName, number>;
   readonly steps: StepSummary[];
+  // checked is false when the show's feed could not be read, so the run can
+  // say past guests were not checked instead of implying there were none.
+  readonly pastGuests: { readonly checked: boolean; readonly index: PastGuestIndex; readonly skipped: Set<string> };
 };
 
 /**
@@ -39,14 +43,18 @@ export type RunContext = {
  * titles and the visitor's exclusion list. The lists are copied, so later
  * changes to the caller's arrays do not reach the run. The show's demographics
  * may be passed in when already known; otherwise the first audience_of call
- * fetches them.
+ * fetches them. pastGuestTitles is every episode title the feed gave, used
+ * only to leave past guests out; undefined or null means the feed could not
+ * be read, so nobody is left out and pastGuests.checked is false.
  */
 export function createRunContext(input: {
   show: { qlooId: string; name: string };
   episodeTitles: readonly string[];
   exclusions: readonly string[];
   showDemographics?: Demographics | null;
+  pastGuestTitles?: readonly string[] | null;
 }): RunContext {
+  const titles = input.pastGuestTitles;
   return {
     show: Object.freeze({ qlooId: input.show.qlooId, name: input.show.name }),
     episodeTitles: Object.freeze([...input.episodeTitles]),
@@ -58,5 +66,9 @@ export function createRunContext(input: {
     compares: new Map(),
     toolCalls: new Map(),
     steps: [],
+    pastGuests:
+      titles === undefined || titles === null
+        ? { checked: false, index: NO_PAST_GUESTS, skipped: new Set() }
+        : { checked: true, index: pastGuestIndex(titles), skipped: new Set() },
   };
 }

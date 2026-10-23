@@ -1,13 +1,16 @@
 // Covers the research tools against a fake metered Qloo: the fixed tool list,
 // every refusal that must happen before any Qloo call, the request each tool
 // builds, size caps on what goes back to the model, step summaries that
-// carry no ids or upstream text, and the trends switch. It does not cover
+// carry no ids or upstream text, the trends switch, and past guests left out
+// of people lists. It does not cover
 // the model loop or the Anthropic client (next work order), the real cache
 // and meter (see
 // qloo-metered.test.ts), or real Qloo response shapes. All data is synthetic.
 import { describe, expect, it } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
-import { researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
+import { stepFor } from "../src/agent/loop.js";
+import { TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import { buildQlooRequest, type QlooOperation } from "../src/qloo/request.js";
@@ -634,9 +637,9 @@ describe("finish_board", () => {
     expect(JSON.parse(outcome.content)).toEqual({
       error: "PICKS_REJECTED",
       rejected: [
-        { index: 1, reason: "digits" },
-        { index: 2, reason: "unknown_person" },
-        { index: 3, reason: "duplicate" },
+        { index: 1, reason: "digits", hint: "Write no digits: say numbers in words or leave them out. The app shows numbers itself." },
+        { index: 2, reason: "unknown_person", hint: "Use a personId exactly as a tool returned it in this run." },
+        { index: 3, reason: "duplicate", hint: "Pick each person once." },
       ],
     });
   });
@@ -648,12 +651,40 @@ describe("finish_board", () => {
     const refused = await runTool(off.ctx, off.qloo, "finish_board", { picks }, TODAY, OFF);
     expect(refused.isError).toBe(true);
     expect(refused.finished).toBeUndefined();
-    expect(JSON.parse(refused.content)).toEqual({ error: "PICKS_REJECTED", rejected: [{ index: 1, reason: "trend_claim" }] });
+    const hint = `Qloo has no trend data right now, so do not call anyone ${TREND_CLAIM_WORDS}. A past breakout role or album is fine.`;
+    expect(JSON.parse(refused.content)).toEqual({ error: "PICKS_REJECTED", rejected: [{ index: 1, reason: "trend_claim", hint }] });
 
     const on = await withPeople();
     const accepted = await runTool(on.ctx, on.qloo, "finish_board", { picks }, TODAY, ON);
     expect(accepted.isError).toBe(false);
     expect(accepted.finished?.[1]?.angle).toBe("A rising voice in sketch comedy.");
+  });
+
+  it("every refused pick carries the fixed hint for its reason", async () => {
+    const { ctx, qloo } = await withPeople();
+    const input = {
+      picks: [
+        { personId: personId(1), angle: "Their fans already love this show." },
+        { personId: NEVER_RETURNED, angle: "Invented guest." },
+        { personId: personId(1), angle: "Same guest twice." },
+        { personId: personId(2), angle: "Book them, fit 9.7/10" },
+        { personId: personId(3), angle: "A rising voice in sketch comedy." },
+      ],
+    };
+
+    const outcome = await runTool(ctx, qloo, "finish_board", input, TODAY, OFF);
+    const { rejected } = JSON.parse(outcome.content) as { rejected: Array<{ index: number; reason: keyof typeof PICK_HINTS; hint: string }> };
+
+    expect(rejected.map((entry) => [entry.index, entry.reason])).toEqual([
+      [1, "unknown_person"],
+      [2, "duplicate"],
+      [3, "digits"],
+      [4, "trend_claim"],
+    ]);
+    for (const entry of rejected) expect(entry.hint, entry.reason).toBe(PICK_HINTS[entry.reason]);
+    // The hint goes only to the model: the stored summary and the streamed label stay fixed words (C3.1, C3.3).
+    expect(ctx.steps.at(-1)).toEqual({ tool: "finish_board", ok: false, summary: "rejected 4 of 5 picks" });
+    expect(stepFor(ctx, "finish_board", input, outcome)).toEqual({ tool: "finish_board", ok: false, label: "Sent some picks back to be fixed" });
   });
 
   it("allows one retry and then refuses further calls", async () => {
@@ -665,6 +696,77 @@ describe("finish_board", () => {
     const third = await runTool(ctx, qloo, "finish_board", VALID_INPUT.finish_board, TODAY, ON);
 
     expect(errorOf(third.content)).toEqual({ error: "LIMIT_REACHED" });
+  });
+});
+
+describe("past guests (C2.1, C2.2)", () => {
+  const PAST_EPISODE = `Synthetic Person 2 ${MARKER} on a past episode`;
+  const withFeed = (pastGuestTitles: string[] | null): RunContext =>
+    createRunContext({ show: SHOW, episodeTitles: [], exclusions: [], pastGuestTitles });
+
+  it("people_for_show leaves out a past guest and says how many", async () => {
+    const ctx = withFeed([PAST_EPISODE]);
+    const { qloo } = fakeQloo();
+    const input = { reach: "any" };
+
+    const outcome = await runTool(ctx, qloo, "people_for_show", input, TODAY, ON);
+    const body = JSON.parse(outcome.content) as { people: Array<{ personId: string }>; skippedPastGuests: number };
+
+    expect(Object.keys(body)).toEqual(["people", "skippedPastGuests"]);
+    expect(body.people.map((person) => person.personId)).toEqual([personId(1), personId(3)]);
+    expect(body.skippedPastGuests).toBe(1);
+    expect(ctx.people.has(personId(2))).toBe(false);
+    expect([...ctx.pastGuests.skipped]).toEqual([personId(2)]);
+    expect(ctx.pastGuests.checked).toBe(true);
+    expect(stepFor(ctx, "people_for_show", input, outcome).label).toBe("Found 2 people this show's listeners love, leaving out 1 past guest");
+  });
+
+  it("find_person leaves out a past guest", async () => {
+    const ctx = withFeed([`Synthetic Found ${MARKER} returns`]);
+    const { qloo } = fakeQloo();
+    const input = { name: "Synthetic Found" };
+
+    const outcome = await runTool(ctx, qloo, "find_person", input, TODAY, ON);
+
+    expect(JSON.parse(outcome.content)).toEqual({ people: [], skippedPastGuests: 1 });
+    expect(ctx.people.has(personId(50))).toBe(false);
+    expect([...ctx.pastGuests.skipped]).toEqual([personId(50)]);
+    expect(stepFor(ctx, "find_person", input, outcome).label).toBe("Looked up a name and found 0 matches, leaving out 1 past guest");
+  });
+
+  it("finish_board refuses a past guest's id as unknown_person", async () => {
+    const ctx = withFeed([PAST_EPISODE]);
+    const { qloo, ops } = fakeQloo();
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const before = ops.length;
+
+    const audience = await runTool(ctx, qloo, "audience_of", { personId: personId(2) }, TODAY, ON);
+    const outcome = await runTool(ctx, qloo, "finish_board", VALID_INPUT.finish_board, TODAY, ON);
+
+    expect(errorOf(audience.content)).toEqual({ error: "UNKNOWN_PERSON" });
+    expect(outcome.finished).toBeUndefined();
+    expect(JSON.parse(outcome.content)).toEqual({
+      error: "PICKS_REJECTED",
+      rejected: [{ index: 1, reason: "unknown_person", hint: PICK_HINTS.unknown_person }],
+    });
+    expect(ops).toHaveLength(before);
+  });
+
+  it("with no feed titles nobody is left out", async () => {
+    const ctx = withFeed(null);
+    const { qloo } = fakeQloo();
+    const input = { reach: "any" };
+
+    const listed = await runTool(ctx, qloo, "people_for_show", input, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+
+    expect(ctx.pastGuests.checked).toBe(false);
+    expect(newContext().pastGuests.checked).toBe(false);
+    expect(ctx.pastGuests.skipped.size).toBe(0);
+    expect(JSON.parse(listed.content)).not.toHaveProperty("skippedPastGuests");
+    expect((JSON.parse(listed.content) as { people: unknown[] }).people).toHaveLength(3);
+    expect(JSON.parse(found.content)).toEqual({ people: [{ personId: personId(50), name: `Synthetic Found ${MARKER}` }] });
+    expect(stepFor(ctx, "people_for_show", input, listed).label).toBe("Found 3 people this show's listeners love");
   });
 });
 

@@ -444,6 +444,13 @@ async function runSeed(db: Db, show: string, pick: number | undefined): Promise<
   console.log(
     `Run ${outcome.runId} finished with ${outcome.guests} guests on the board, from candidate ${outcome.picked.rank}: ${printableName(outcome.picked.name)}.`,
   );
+  if (outcome.pastGuests !== null) {
+    console.log(
+      outcome.pastGuests.checked
+        ? `Left out ${outcome.pastGuests.skipped} ${outcome.pastGuests.skipped === 1 ? "person who has" : "people who have"} been on the show before.`
+        : "Past guests were not checked: the show's feed could not be read.",
+    );
+  }
   // The same board and refusal runPromote prints without --yes, then the
   // command that promotes it.
   const preview = await previewRun(db, outcome.runId);

@@ -12,6 +12,7 @@ import { writeBrief } from "../src/agent/brief.js";
 import { AgentError } from "../src/agent/errors.js";
 import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
 import { BRIEF_SYSTEM } from "../src/agent/prompts.js";
+import { TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 
 const SHOW_NAME = "Synthetic Show";
 const GUEST: BoardEntry = {
@@ -252,7 +253,7 @@ describe("writeBrief wording", () => {
     await writeBrief(model, { guest: UNKNOWN_RISING, showName: SHOW_NAME });
 
     expect(factsOf(calls[0]!.user)["rising"]).toEqual({ placeholder: "{{rising}}", meaning: "no trend data exists for this guest, so do not use it" });
-    expect(BRIEF_SYSTEM).toContain("Never describe the guest as rising, trending or growing unless the rising fact has a value.");
+    expect(BRIEF_SYSTEM).toContain(`Never describe the guest as ${TREND_CLAIM_WORDS} unless the rising fact has a value.`);
   });
 
   it("refuses a draft calling an unknown-rising guest rising, and keeps a clean rewrite", async () => {
