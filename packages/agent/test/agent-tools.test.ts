@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { stepFor } from "../src/agent/loop.js";
-import { TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 import { PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
@@ -658,6 +658,26 @@ describe("finish_board", () => {
     const accepted = await runTool(on.ctx, on.qloo, "finish_board", { picks }, TODAY, ON);
     expect(accepted.isError).toBe(false);
     expect(accepted.finished?.[1]?.angle).toBe("A rising voice in sketch comedy.");
+  });
+
+  it("finish_board sends back a sensitive-trait angle with its hint", async () => {
+    const angle = "The bits, group chats and friendships that shape a queer comedy career.";
+    const input = { picks: VALID_PICKS.map((pick, n) => (n === 1 ? { ...pick, angle } : pick)) };
+
+    for (const opts of [ON, OFF]) {
+      const { ctx, qloo } = await withPeople();
+      const outcome = await runTool(ctx, qloo, "finish_board", input, TODAY, opts);
+
+      expect(outcome.isError).toBe(true);
+      expect(outcome.finished).toBeUndefined();
+      expect(JSON.parse(outcome.content)).toEqual({
+        error: "PICKS_REJECTED",
+        rejected: [{ index: 1, reason: "sensitive_trait", hint: SENSITIVE_TRAITS_RULE }],
+      });
+      expect(PICK_HINTS.sensitive_trait).toBe(SENSITIVE_TRAITS_RULE);
+      expect(ctx.steps.at(-1)).toEqual({ tool: "finish_board", ok: false, summary: "rejected 1 of 3 picks" });
+      expect(stepFor(ctx, "finish_board", input, outcome)).toEqual({ tool: "finish_board", ok: false, label: "Sent some picks back to be fixed" });
+    }
   });
 
   it("every refused pick carries the fixed hint for its reason", async () => {

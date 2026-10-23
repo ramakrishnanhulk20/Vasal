@@ -188,6 +188,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C3.7 Upstream text is cleaned before display by the D5.2 cleaner: `\p{Bidi_Control}`, `\p{Default_Ignorable_Code_Point}` (including the invisible tag characters) and `\p{Cc}` are removed, so text reads the way it is stored and hides nothing from the person reading it.
 - C3.8 Visitor run pages are marked noindex, and no other page links to them.
 - C3.9 The kolam that GET /runs/:id and GET /showcase send carries only numbers computed by code and server-issued guest ids, never third-party text: kolamFor is given only a guest id, a rank and a tag count per guest, and draws nothing for an id that is not a lower-case UUID.
+- C3.10 Nothing Vasal writes about a real person claims their sexuality, gender identity, health, religion, ethnicity or politics. Both prompts forbid all six (SENSITIVE_TRAITS_RULE). checkProse refuses, on every angle and brief, the words that almost always make such a claim: sexuality and gender identity terms, and named diagnoses and pregnancy. Religion, ethnicity and politics words are also everyday topics, so they stay prompt rules. A refused angle goes back to the model with that rule as its hint.
 
 ### C4 Secrets (A6, A12, G3)
 - C4.1 No secret value appears in any byte sent to a browser, stored in the database, written to logs, sent to the model, or committed to git.

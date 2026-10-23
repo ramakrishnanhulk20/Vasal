@@ -1,10 +1,12 @@
 // Covers the prose guard on model-written text: digits only through allowed
 // placeholders (C3.4), links and emails removed and counted (C3.5), direction
-// controls stripped (C3.7), the length and empty refusals, and the optional
-// trend-claim refusal. It does not cover spelled-out numbers or disguised
-// links such as "evil dot com", which are named non-goals, synonyms for
-// rising that the trend pattern does not list, or the rendering of the result
-// in the browser.
+// controls stripped (C3.7), the length and empty refusals, the optional
+// trend-claim refusal and the always-on sensitive-trait refusal. It does not
+// cover spelled-out numbers or disguised links such as "evil dot com", which
+// are named non-goals, synonyms for rising that the trend pattern does not
+// list, claims about religion, ethnicity, politics or most health topics,
+// which only the prompts forbid, or the rendering of the result in the
+// browser.
 import { describe, expect, it } from "vitest";
 import { checkProse, fillPlaceholders } from "../src/agent/prose.js";
 
@@ -134,6 +136,56 @@ describe("checkProse with noTrendClaims", () => {
   it("checks the text outside listed placeholders, so a placeholder's name never trips it", () => {
     expect(checkProse("Interest is {{rising}}", { maxChars: 200, placeholders: ["rising"], noTrendClaims: true }).ok).toBe(true);
     expect(checkProse("Interest is {{rising}}", { maxChars: 200, placeholders: [], noTrendClaims: true }).reason).toBe("trend_claim");
+  });
+});
+
+describe("checkProse sensitive traits", () => {
+  it("a claim about a guest's sexuality, gender identity or health is refused", () => {
+    for (const text of [
+      "the friendships that shape a queer comedy career",
+      "Life as a gay comic",
+      "Her coming out story",
+      "He came out as bisexual",
+      "A trans actor's path",
+      "Being non-binary in Hollywood",
+      "Growing up LGBTQ",
+      "After being diagnosed with ADHD",
+      "Raising a child with autism",
+      "Her pregnancy and the tour",
+      "Living with HIV",
+    ]) {
+      for (const noTrendClaims of [true, false]) {
+        expect(checkProse(text, { ...ANGLE, noTrendClaims }), `${text} ${noTrendClaims}`).toEqual({
+          ok: false,
+          text: "",
+          removed: { links: 0, emails: 0 },
+          reason: "sensitive_trait",
+        });
+      }
+    }
+  });
+
+  it("topic words and lookalikes are not sensitive traits", () => {
+    for (const text of [
+      "Transformers, transitions and transfers",
+      "The science of religion and meaning",
+      "Political satire on late night",
+      "Cancer research and the next decade",
+      "Tech addiction and attention",
+      "A sober look at the draft",
+      "The album came out in spring",
+      "Gaylord Perry's spitball",
+      "Christian Bale's method",
+    ]) {
+      expect(checkProse(text, ANGLE), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });
+    }
+  });
+
+  it("a sensitive word inside a listed placeholder is not checked", () => {
+    expect(checkProse("{{guest}} and {{show}}", { maxChars: 200, placeholders: ["guest", "show"] }).ok).toBe(true);
+    // A placeholder named like a trait proves the listed token is skipped, and an unlisted one is plain text.
+    expect(checkProse("{{guest}} on {{trans}}", { maxChars: 200, placeholders: ["guest", "trans"] }).ok).toBe(true);
+    expect(checkProse("{{guest}} on {{trans}}", { maxChars: 200, placeholders: ["guest"] }).reason).toBe("sensitive_trait");
   });
 });
 

@@ -8,7 +8,7 @@ import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
 import { isPastGuest } from "./past-guests.js";
-import { checkProse, type ProseCheck, TREND_CLAIM_WORDS } from "./prose.js";
+import { checkProse, type ProseCheck, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "./prose.js";
 
 export type ToolName =
   | "people_for_show"
@@ -98,6 +98,7 @@ export const PICK_HINTS: Record<RejectReason, string> = Object.freeze({
   too_long: "Keep the angle under 200 characters.",
   empty: "Write one plain sentence.",
   trend_claim: `Qloo has no trend data right now, so do not call anyone ${TREND_CLAIM_WORDS}. A past breakout role or album is fine.`,
+  sensitive_trait: SENSITIVE_TRAITS_RULE,
 });
 
 const PersonId = z.string().min(1).max(64);

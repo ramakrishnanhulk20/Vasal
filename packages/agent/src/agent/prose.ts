@@ -5,7 +5,7 @@ export type ProseCheck = {
   ok: boolean;
   text: string;
   removed: { links: number; emails: number };
-  reason?: "digits" | "too_long" | "empty" | "trend_claim";
+  reason?: "digits" | "too_long" | "empty" | "trend_claim" | "sensitive_trait";
 };
 
 // By default linkify-it treats a bare domain as a link only when its last
@@ -44,6 +44,18 @@ export const TREND_CLAIM_WORDS = "rising, on the rise, trending, up and coming, 
 // synonym, such as "hot right now"; the prompts forbid those too.
 const TREND_CLAIM =
   /\b(?:rising(?:\s+star)?|on\s+the\s+rise|trending|up[\s\p{Pd}]+and[\s\p{Pd}]+coming|breakout(?![\s\p{Pd}]+(?:roles?|films?|movies?|performances?|parts?|albums?|singles?|songs?|records?|hits?|shows?|series|seasons?|books?|novels?|specials?|plays?)\b)|buzzy|surging|growing\s+in\s+popularity)\b/iu;
+/** The sentence the prompts and finish_board's hint share. */
+export const SENSITIVE_TRAITS_RULE =
+  "Do not describe the guest's sexuality, gender identity, health, religion, ethnicity or politics; talk about their work and ideas.";
+// The list is narrow on purpose: each of these words, used about a person,
+// almost always claims something about them. Religion, ethnicity and politics
+// words are also everyday topics ("science and religion", "political
+// satire"), and so are some health words ("cancer research", "tech
+// addiction"), so those stay prompt rules only. A false refusal costs the
+// model one rewrite. Matched case-insensitively on word boundaries, so
+// "Transformers" and "Gaylord" pass.
+const SENSITIVE_TRAIT =
+  /\b(?:queer|gay|lesbian|bisexual|pansexual|asexual|transgender|trans|nonbinary|non[\s\p{Pd}]+binary|lgbt[a-z+]*|sexuality|sexual\s+orientation|(?:came|coming)\s+out\s+as|coming\s+out\s+stor(?:y|ies)|diagnosed|autism|autistic|adhd|bipolar|schizophreni(?:a|c)|miscarriage(?:s)?|infertility|pregnan(?:t|cy)|hiv)\b/iu;
 
 const refuse = (reason: NonNullable<ProseCheck["reason"]>, removed: ProseCheck["removed"]): ProseCheck => ({
   ok: false,
@@ -95,8 +107,12 @@ export function withoutLinks(text: string): { text: string; removed: ProseCheck[
  * text outside the listed placeholders is refused with reason "trend_claim"
  * if it calls someone rising, on the rise, trending, up and coming, "a
  * breakout" (but not a breakout role, film, album or other named work),
- * buzzy, surging or growing in popularity. The check runs before placeholders
- * are filled, so a filled-in value never trips it. Text left empty by removals is refused as
+ * buzzy, surging or growing in popularity. Always, that text is refused with
+ * reason "sensitive_trait" if it uses a word that almost always claims a
+ * person's sexuality, gender identity or health, such as "queer", "trans" or
+ * "diagnosed"; every prose check is about a real person, so this is not
+ * optional. Both checks run before placeholders are filled, so a filled-in
+ * value never trips them. Text left empty by removals is refused as
  * "empty". On refusal `text` is "", so failed prose cannot be shown by
  * mistake.
  *
@@ -123,6 +139,7 @@ export function checkProse(
   const outsidePlaceholders = text.replace(PLACEHOLDER, (token, name: string) => (allowed.has(name) ? "" : token));
   if (NUMBER_CHARACTER.test(outsidePlaceholders)) return refuse("digits", removed);
   if (opts.noTrendClaims === true && TREND_CLAIM.test(outsidePlaceholders)) return refuse("trend_claim", removed);
+  if (SENSITIVE_TRAIT.test(outsidePlaceholders)) return refuse("sensitive_trait", removed);
 
   return { ok: true, text, removed };
 }

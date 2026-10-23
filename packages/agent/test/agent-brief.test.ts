@@ -1,7 +1,8 @@
 // Covers writing a brief with a scripted fake model: the facts the model is
 // given, each draft's fixed time limit, the one rewrite after failed prose,
 // removal of links and emails, placeholders filled with code values, the
-// reach phrase, and the trend-claim refusal for a guest with no trend data. It
+// reach phrase, the trend-claim refusal for a guest with no trend data, and
+// the sensitive-trait refusal for every guest. It
 // does not cover checkProse's own rules (agent-prose), how the client
 // enforces the limit (agent-model), the real model's writing, or storing the
 // brief (agent-runner). All data is synthetic.
@@ -12,7 +13,7 @@ import { writeBrief } from "../src/agent/brief.js";
 import { AgentError } from "../src/agent/errors.js";
 import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
 import { BRIEF_SYSTEM } from "../src/agent/prompts.js";
-import { TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 
 const SHOW_NAME = "Synthetic Show";
 const GUEST: BoardEntry = {
@@ -267,6 +268,24 @@ describe("writeBrief wording", () => {
     const { brief } = await writeBrief(rewritten.model, { guest: UNKNOWN_RISING, showName: SHOW_NAME });
     expect(rewritten.calls).toHaveLength(2);
     expect(brief.why).toBe("Blink-182 has 86% fit with Synthetic Show listeners, and interest is not yet tracked.");
+  });
+
+  it("tells the model not to describe the guest's sensitive traits", () => {
+    expect(BRIEF_SYSTEM).toContain(SENSITIVE_TRAITS_RULE);
+  });
+
+  // GUEST's trend is rising, so the trend check is off and only the always-on check can refuse these.
+  it("refuses a draft claiming a guest's sexuality or health, and keeps a clean rewrite", async () => {
+    const queer = { ...GOOD, why: "{{guest}} brings a queer comedy voice {{show}} listeners will love." };
+
+    const refused = fakeModel([queer, queer]);
+    expect(await codeOf(writeBrief(refused.model, { guest: GUEST, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
+    expect(refused.calls).toHaveLength(2);
+
+    const rewritten = fakeModel([{ ...GOOD, pitch_body: "We loved hearing {{guest}} talk about being diagnosed with ADHD. Could we find a date?" }, GOOD]);
+    const { brief } = await writeBrief(rewritten.model, { guest: GUEST, showName: SHOW_NAME });
+    expect(rewritten.calls).toHaveLength(2);
+    expect(brief.pitch_body).toBe("Hi team, we would love Blink-182 on Synthetic Show. Could we find a date that works?");
   });
 
   it("checks before filling, so a shared tag named like a trend never trips the refusal", async () => {
