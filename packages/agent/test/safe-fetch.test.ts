@@ -12,7 +12,7 @@ import zlib from "node:zlib";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { FeedError } from "../src/feeds/errors.js";
 import { isPublicUnicast, type AddressCheck } from "../src/net/address-check.js";
-import { safeFetch } from "../src/net/safe-fetch.js";
+import { ipv4First, safeFetch } from "../src/net/safe-fetch.js";
 
 type CountingServer = { server: http.Server; connections: number };
 
@@ -337,5 +337,26 @@ describe("C1.4 every fetch is bounded", () => {
   it("turns a non-2xx final status into FEED_HTTP_STATUS", async () => {
     const err = await failure(safeFetch(new URL("http://127.0.0.1/missing"), { addressCheck: allowLoopback }));
     expect(err.code).toBe("FEED_HTTP_STATUS");
+  });
+});
+
+describe("ipv4First", () => {
+  // A resolver that lists IPv6 first made most reads of one feed host fail on
+  // a network with no IPv6 route, which Railway is.
+  it("puts every IPv4 address first and keeps each family's own order", () => {
+    const answer = [
+      { address: "2001:db8::1", family: 6 },
+      { address: "203.0.113.1", family: 4 },
+      { address: "2001:db8::2", family: 6 },
+      { address: "203.0.113.2", family: 4 },
+    ];
+    expect(ipv4First(answer).map((entry) => entry.address)).toEqual(["203.0.113.1", "203.0.113.2", "2001:db8::1", "2001:db8::2"]);
+    expect(answer[0]?.address).toBe("2001:db8::1");
+  });
+
+  it("neither adds nor drops an address, so the address check still sees all of them", () => {
+    const onlySix = [{ address: "2001:db8::1", family: 6 }];
+    expect(ipv4First(onlySix)).toEqual(onlySix);
+    expect(ipv4First([])).toEqual([]);
   });
 });

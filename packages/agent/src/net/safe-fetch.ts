@@ -38,6 +38,17 @@ function literalAddress(url: URL): string | null {
   return net.isIP(bare) === 0 ? null : bare;
 }
 
+/**
+ * The same addresses with every IPv4 one first, each family in its original
+ * order. Railway gives the server no IPv6 route, and some resolvers list IPv6
+ * first, so dialing the first answer as given failed most reads of one feed
+ * host (5 of 8, measured 23 Oct). Ordering never adds or drops an address, so
+ * the address check still covers every one.
+ */
+export function ipv4First<T extends { family: number }>(addresses: readonly T[]): T[] {
+  return [...addresses].sort((a, b) => (a.family === b.family ? 0 : a.family === 4 ? -1 : b.family === 4 ? 1 : 0));
+}
+
 // Runs inside the socket's own connect, so the addresses checked here are the
 // exact addresses the socket dials. A second, later DNS answer never gets to
 // skip the check, because there is no separate "check" lookup to race against.
@@ -48,13 +59,14 @@ function checkedLookup(addressCheck: AddressCheck): net.LookupFunction {
         callback(err, "");
         return;
       }
-      const first = addresses[0];
-      if (first === undefined || !addresses.every((entry) => addressCheck(entry.address))) {
+      const ordered = ipv4First(addresses);
+      const first = ordered[0];
+      if (first === undefined || !ordered.every((entry) => addressCheck(entry.address))) {
         callback(new FeedError("FEED_BLOCKED_ADDRESS"), "");
         return;
       }
       if (options.all) {
-        callback(null, addresses);
+        callback(null, ordered);
       } else {
         callback(null, first.address, first.family);
       }
