@@ -12,6 +12,7 @@ import type { ServerConfig } from "../src/server/config.js";
 import { createRun, finishRun, putBoard, setRunStatus } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
+import { storeBriefs } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
 const APP_ORIGIN = "https://vasal.site";
@@ -63,8 +64,9 @@ afterEach(async () => {
 async function promotedRun(): Promise<string> {
   const runId = await createRun(db, { show: "Synthetic Show", exclude: [] });
   await setRunStatus(db, runId, "running");
-  await putBoard(db, runId, GUESTS);
+  const guestIds = await putBoard(db, runId, GUESTS);
   await finishRun(db, runId, "done", { name: "done", data: { guests: GUESTS.length } });
+  await storeBriefs(db, runId, guestIds);
   await promoteRun(db, runId, 1);
   return runId;
 }

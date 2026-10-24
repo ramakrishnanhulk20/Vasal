@@ -18,7 +18,8 @@
     "start": "node --import tsx src/server/main.ts",
     "ops": "tsx scripts/ops.ts",
     "prove": "tsx scripts/prove.ts",
-    "backtest": "tsx scripts/backtest.ts"
+    "backtest": "tsx scripts/backtest.ts",
+    "backtest:robustness": "tsx scripts/backtest-robustness.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.135.0",

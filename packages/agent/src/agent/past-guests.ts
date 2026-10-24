@@ -1,9 +1,10 @@
 import { normalizeName } from "../text/normalize.js";
 
 /**
- * A show's episode titles, each reduced to its match key and padded with one
- * space on both sides, so a name can only match whole words. Built once per
- * run by pastGuestIndex.
+ * A show's episode titles and the names it goes by (directory name,
+ * publisher, Qloo name, feed title), each reduced to its match key and padded
+ * with one space on both sides, so a name can only match whole words. Built
+ * once per run by pastGuestIndex.
  */
 export type PastGuestIndex = { readonly titles: readonly string[] };
 
@@ -64,11 +65,28 @@ function shortFormIn(title: string, tokens: readonly string[]): boolean {
 
 /**
  * Builds the index isPastGuest reads from a show's episode titles, every one
- * of them, in any order. The titles are not kept, only their match keys. The
- * result is frozen.
+ * of them, in any order. The run context adds the names the show goes by as
+ * extra entries, because a host is named there and rarely in a title. The
+ * titles are not kept, only their match keys. The result is frozen.
  */
 export function pastGuestIndex(titles: readonly string[]): PastGuestIndex {
   return Object.freeze({ titles: Object.freeze(titles.map((title) => ` ${matchKey(title)} `)) });
+}
+
+/**
+ * True when the two names share a match key: the whole name, or first plus
+ * last name once a trailing Jr, Sr, II, III or IV is dropped, after the same
+ * normalising isPastGuest uses (normalizeName, accents dropped, punctuation
+ * as spaces). So "Jose Andres" matches "José Andrés", "Mel Kiper" matches
+ * "Mel Kiper, Jr." and "Nassim Taleb" matches "Nassim Nicholas Taleb". A
+ * surname alone, a word that only starts the same ("Kiper" in "Kiperman"),
+ * a short first name ("Meg" for Megan), nicknames, misspellings and
+ * lookalike letters from other scripts do not match. An empty name matches
+ * nothing. A false match can only drop a person, never add one.
+ */
+export function sameName(a: string, b: string): boolean {
+  const left = new Set(nameKeys(nameTokens(a)));
+  return left.size > 0 && nameKeys(nameTokens(b)).some((key) => left.has(key));
 }
 
 /**
@@ -80,7 +98,8 @@ export function pastGuestIndex(titles: readonly string[]): PastGuestIndex {
  * A surname alone in a title never matches, so "Taleb" in a title does not
  * mark "Nassim Nicholas Taleb" as a past guest. An empty name never matches.
  *
- * It reads titles only, so a guest the titles never name is missed, and a
+ * It reads the index's entries only, so a guest neither the titles nor the
+ * show's own names hold is missed, and a
  * different person with the same surname and a similar first name is taken
  * for a past guest. That false match only leaves a person off the board; it
  * can never put anyone on it. Nicknames that do not share the first three

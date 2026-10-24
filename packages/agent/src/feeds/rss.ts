@@ -11,7 +11,11 @@ export type FeedEpisode = {
 export type ParsedFeed = { title: string; episodes: FeedEpisode[] };
 
 const MAX_DEPTH = 32;
-const MAX_ELEMENTS = 50_000;
+// The 10 MB cap on decoded bytes is what bounds memory. This cap only stops
+// a document made of nothing but empty tags, and it sits well above what a
+// real feed needs: 50,000 refused rich feeds of about 2,000 items, around 25
+// elements each, before the 2,000-episode cap could apply.
+const MAX_ELEMENTS = 300_000;
 const MAX_EPISODES = 2_000;
 const MAX_TITLE_CHARS = 500;
 const MAX_DATE_CHARS = 100;
@@ -151,7 +155,7 @@ function fromAtom(feed: XmlNode): ParsedFeed {
  * Throws FeedError:
  * - FEED_DOCTYPE_REJECTED if the text holds a DOCTYPE declaration, in any
  *   case, checked before the parser sees a byte (C1.7).
- * - FEED_TOO_DEEP past 32 levels of nesting or 50,000 elements.
+ * - FEED_TOO_DEEP past 32 levels of nesting or 300,000 elements.
  * - FEED_NOT_A_FEED for anything that is not RSS 2.0 or Atom. Nothing from
  *   the body is kept in the error (C1.6).
  */

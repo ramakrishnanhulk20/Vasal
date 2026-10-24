@@ -1,8 +1,11 @@
 import { cleanText, normalizeName } from "../text/normalize.js";
 import type { Demographics, RunContext, SharedTag, TrendRow } from "./context.js";
+import { sameName } from "./past-guests.js";
 
 export type Rising = { state: "rising" | "steady" | "falling" | "unknown"; points: number | null };
 export type BringsNew = { segment: string; label: string; gap: number } | null;
+/** How hard a guest is likely to book. "unknown" means Qloo gave no popularity, never that booking is easy. */
+export type Reach = "household name" | "well known" | "bookable" | "unknown";
 export type BoardEntry = {
   personId: string;
   name: string;
@@ -11,7 +14,7 @@ export type BoardEntry = {
   // and they rank below everyone with a real fit.
   fitKnown: boolean;
   fitRank: number;
-  reach: "household name" | "well known" | "bookable";
+  reach: Reach;
   rising: Rising;
   bringsNew: BringsNew;
   sharedTags: string[];
@@ -27,6 +30,13 @@ const FALLING_AT_POINTS = -2;
 
 const HOUSEHOLD_NAME_AT = 0.95;
 const WELL_KNOWN_AT = 0.8;
+
+/**
+ * The fit a pick needs when only find_person returned it. A pasted feed's
+ * titles can steer the model's name searches to anyone, so such a pick stays
+ * only when Qloo scores it as a real fit for this show (G18).
+ */
+export const FIND_PERSON_FIT_FLOOR = 0.5;
 const SHARED_TAGS_SHOWN = 5;
 const MAX_NAME_CHARS = 120;
 const MAX_TAG_CHARS = 40;
@@ -166,11 +176,12 @@ export function strongestSegments(audience: Demographics, count: number): string
 
 /**
  * How hard a guest is likely to book, from Qloo popularity (0 to 1): 0.95 and
- * up is a household name, 0.8 and up is well known, anything else, including
- * a missing value, is bookable.
+ * up is a household name, 0.8 and up is well known, any other number is
+ * bookable. A missing or non-finite value is unknown, so absent data never
+ * reads as the favourable label (G15).
  */
-export function reachFrom(popularity: number | null): BoardEntry["reach"] {
-  if (popularity === null || !Number.isFinite(popularity)) return "bookable";
+export function reachFrom(popularity: number | null): Reach {
+  if (popularity === null || !Number.isFinite(popularity)) return "unknown";
   if (popularity >= HOUSEHOLD_NAME_AT) return "household name";
   if (popularity >= WELL_KNOWN_AT) return "well known";
   return "bookable";
@@ -179,23 +190,32 @@ export function reachFrom(popularity: number | null): BoardEntry["reach"] {
 /**
  * Computes the ranked guest board from the model's picks. Pure.
  *
- * A pick is kept only if its personId is one a tool returned in this run, it
- * is not a repeat of an earlier pick, and the person's cleaned name is not
- * empty and does not match an exclusion. Names, shared tags and angles go
- * through cleanText and are capped at 120, 40 and 400 code points (C3.7,
- * D5.2). The exclusion check uses the cleaned name, the one the page shows,
- * and both sides go through normalizeName, so case, spacing and invisible
- * characters do not matter (C2.7, C8.3). Every number
- * comes from the context: fit is the Qloo affinity rounded to 2 decimals,
- * ranked by the unrounded affinity highest first, so two guests who both show
- * 0.95 still rank in their true order, ties broken by lower popularity and
- * then by pick order. A person with no affinity gets fit 0, fitKnown false,
- * and ranks last. Shared tags are deduplicated through normalizeName before
- * the top 5 are kept. Precondition: each angle has already passed
- * checkProse, which finish_board does before it returns picks.
+ * A pick is kept only if its personId is one a tool returned in this run and
+ * not one the run dropped (ctx.dropped), it is not a repeat of an earlier
+ * pick, and the person's cleaned name is not empty and does not match an
+ * exclusion. A pick no people_for_show answer returned (ctx.listedForShow)
+ * came only from find_person, so it is kept only when its fit is known and
+ * at least FIND_PERSON_FIT_FLOOR (G18). With opts.applyFitFloor false that
+ * floor is skipped, for the size check made before the fit call gives every
+ * pick a comparable fit. Names, shared tags and angles go through cleanText
+ * and are capped at 120, 40 and 400 code points (C3.7, D5.2). The exclusion
+ * check uses the cleaned name, the one the page shows, and sameName, the
+ * past-guest matcher, so case, spacing, invisible characters, accents,
+ * punctuation, a trailing Jr or Sr and a middle name do not matter (C2.7,
+ * C8.3). Every number comes from the context: fit is the Qloo affinity
+ * rounded to 2 decimals, ranked by the unrounded affinity highest first, so
+ * two guests who both show 0.95 still rank in their true order, ties broken
+ * by lower popularity and then by pick order. A person with no affinity gets
+ * fit 0, fitKnown false, and ranks last. Shared tags are deduplicated through
+ * normalizeName before the top 5 are kept. Precondition: each angle has
+ * already passed checkProse, which finish_board does before it returns picks.
  */
-export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: string; angle: string }>): BoardEntry[] {
-  const excluded = new Set(ctx.exclusions.map(normalizeName).filter((name) => name !== ""));
+export function buildBoard(
+  ctx: RunContext,
+  picks: ReadonlyArray<{ personId: string; angle: string }>,
+  opts: { applyFitFloor: boolean } = { applyFitFloor: true },
+): BoardEntry[] {
+  const exclusions = ctx.exclusions.filter((exclusion) => exclusion.trim() !== "");
   const seen = new Set<string>();
   const kept: Array<{
     personId: string;
@@ -208,11 +228,13 @@ export function buildBoard(ctx: RunContext, picks: ReadonlyArray<{ personId: str
 
   for (const pick of picks) {
     const person = ctx.people.get(pick.personId);
-    if (person === undefined || seen.has(pick.personId)) continue;
+    if (person === undefined || ctx.dropped.has(pick.personId) || seen.has(pick.personId)) continue;
     seen.add(pick.personId);
     const name = cleanLine(person.name, MAX_NAME_CHARS);
-    if (name === "" || excluded.has(normalizeName(name))) continue;
+    if (name === "" || exclusions.some((exclusion) => sameName(exclusion, name))) continue;
     const { affinity } = person;
+    const vouched = ctx.listedForShow.has(pick.personId) || (isFiniteNumber(affinity) && affinity >= FIND_PERSON_FIT_FLOOR);
+    if (opts.applyFitFloor && !vouched) continue;
     kept.push({
       personId: pick.personId,
       angle: cleanLine(pick.angle, MAX_ANGLE_CHARS),

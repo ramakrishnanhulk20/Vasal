@@ -1,14 +1,16 @@
 // Covers the prose guard on model-written text: digits only through allowed
-// placeholders (C3.4), links and emails removed and counted (C3.5), direction
-// controls stripped (C3.7), the length and empty refusals, the optional
-// trend-claim refusal and the always-on sensitive-trait refusal. It does not
-// cover spelled-out numbers or disguised links such as "evil dot com", which
-// are named non-goals, synonyms for rising that the trend pattern does not
+// placeholders (C3.4), figures and phone numbers written in words, links and
+// emails removed and counted (C3.5), direction controls stripped (C3.7), the
+// length and empty refusals, the optional trend-claim refusal, the always-on
+// sensitive-trait and accusation refusals, and which tag names may be shown
+// as chips. It does not cover spelled-out numbers off the number-word list
+// (a bare "ninety"), disguised links such as "evil dot com", which are named
+// non-goals, synonyms for rising, claims or accusations the patterns do not
 // list, claims about religion, ethnicity, politics or most health topics,
-// which only the prompts forbid, or the rendering of the result in the
-// browser.
+// which only the prompts forbid in prose, or the rendering of the result in
+// the browser.
 import { describe, expect, it } from "vitest";
-import { checkProse, fillPlaceholders } from "../src/agent/prose.js";
+import { checkProse, fillPlaceholders, isShowableTag } from "../src/agent/prose.js";
 
 const ANGLE = { maxChars: 200, placeholders: [] as const };
 
@@ -22,6 +24,24 @@ describe("checkProse", () => {
   it("refuses digits in scripts other than 0 to 9", () => {
     for (const text of ["fit ９ of ten", "fit ٩", "two² shows", "chapter Ⅷ"]) {
       expect(checkProse(text, ANGLE).reason).toBe("digits");
+    }
+  });
+
+  it("refuses a figure or a phone number written in words as digits (C3.4, C3.5)", () => {
+    for (const text of [
+      "his three million fans",
+      "a two-time Emmy winner",
+      "a dozen awards",
+      "ninety percent of listeners",
+      "call five five five one two one two",
+    ]) {
+      expect(checkProse(text, ANGLE), text).toEqual({ ok: false, text: "", removed: { links: 0, emails: 0 }, reason: "digits" });
+    }
+  });
+
+  it("lets a small count or an order word pass, because it states no figure", () => {
+    for (const text of ["one plain conversation", "a second act", "the first time on a podcast", "two hosts and a guest"]) {
+      expect(checkProse(text, ANGLE), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });
     }
   });
 
@@ -165,6 +185,53 @@ describe("checkProse sensitive traits", () => {
     }
   });
 
+  it("every plural, derived form and named diagnosis is refused", () => {
+    for (const text of [
+      "Queerness on late night",
+      "Gays and their allies",
+      "Lesbians in stand-up",
+      "Bisexuals on screen",
+      "Bisexuality and fame",
+      "Pansexuals in music",
+      "Pansexuality and art",
+      "Asexuals in fiction",
+      "Asexuality and dating",
+      "Transgenders in sport",
+      "A genderqueer voice",
+      "Being gender fluid on tour",
+      "A genderfluid performer",
+      "Being gender-fluid on tour",
+      "An intersex athlete",
+      "Living with PTSD",
+      "His OCD and the writing room",
+      "Her Parkinson's and the stage",
+      "Her Parkinson’s and the stage",
+      "Caring through Alzheimer's",
+      "A father with dementia",
+      "Dyslexia and the page",
+      "A dyslexic novelist",
+      "Tourette's on stage",
+      "Epilepsy and touring",
+      "An epileptic drummer",
+      "Anorexia and the spotlight",
+      "An anorexic teenager",
+      "Bulimia and dancing",
+      "A bulimic model",
+      "Chemotherapy between shows",
+      "Terminally ill and still writing",
+      "Two miscarriages and a comeback",
+    ]) {
+      for (const noTrendClaims of [true, false]) {
+        expect(checkProse(text, { ...ANGLE, noTrendClaims }), `${text} ${noTrendClaims}`).toEqual({
+          ok: false,
+          text: "",
+          removed: { links: 0, emails: 0 },
+          reason: "sensitive_trait",
+        });
+      }
+    }
+  });
+
   it("topic words and lookalikes are not sensitive traits", () => {
     for (const text of [
       "Transformers, transitions and transfers",
@@ -186,6 +253,37 @@ describe("checkProse sensitive traits", () => {
     // A placeholder named like a trait proves the listed token is skipped, and an unlisted one is plain text.
     expect(checkProse("{{guest}} on {{trans}}", { maxChars: 200, placeholders: ["guest", "trans"] }).ok).toBe(true);
     expect(checkProse("{{guest}} on {{trans}}", { maxChars: 200, placeholders: ["guest"] }).reason).toBe("sensitive_trait");
+  });
+});
+
+describe("checkProse accusations", () => {
+  it("an arrest, a lawsuit, a scandal or an accusation is refused, with trend claims on or off", () => {
+    for (const text of ["after the arrest", "the lawsuit that followed", "his scandal", "accused of fraud", "a cardiac arrest on tour"]) {
+      for (const noTrendClaims of [true, false]) {
+        expect(checkProse(text, { ...ANGLE, noTrendClaims }), `${text} ${noTrendClaims}`).toEqual({
+          ok: false,
+          text: "",
+          removed: { links: 0, emails: 0 },
+          reason: "accusation",
+        });
+      }
+    }
+  });
+
+  it("legal and crime topics are not accusations", () => {
+    for (const text of ["current affairs", "a legal thriller", "true crime storytelling", "sports injury rehab"]) {
+      expect(checkProse(text, ANGLE), text).toEqual({ ok: true, text, removed: { links: 0, emails: 0 } });
+    }
+  });
+});
+
+describe("isShowableTag", () => {
+  it("is false for a sensitive-trait or identity word", () => {
+    for (const name of ["LGBTQ", "Black Culture", "Women", "Latino", "Christian"]) expect(isShowableTag(name), name).toBe(false);
+  });
+
+  it("is true for a taste, and for a word that only starts like an identity word", () => {
+    for (const name of ["Comedy", "Engaging", "Sports", "Blackjack", "Menswear"]) expect(isShowableTag(name), name).toBe(true);
   });
 });
 

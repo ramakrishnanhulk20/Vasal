@@ -1,9 +1,9 @@
 // Not covered here: Apple's live API (the feed demo script calls it), and
 // what safeFetch itself enforces (safe-fetch.test.ts). Every response below
 // is synthetic and the fetch is a stand-in, so no test reaches Apple.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FeedError } from "../src/feeds/errors.js";
-import { lookupShow, searchShows } from "../src/feeds/lookup.js";
+import { createDirectoryLimiter, lookupShow, searchShows } from "../src/feeds/lookup.js";
 import type { SafeFetchOptions, SafeFetchResult } from "../src/net/safe-fetch.js";
 
 type Call = { url: URL; opts: SafeFetchOptions | undefined };
@@ -130,5 +130,88 @@ describe("lookupShow", () => {
       expect(await failureCode(lookupShow(bad, { fetchImpl }))).toBe("FEED_BAD_INPUT");
     }
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("the Apple directory limiter (D3.7)", () => {
+  const EMPTY = JSON.stringify({ resultCount: 0, results: [] });
+
+  function fakeTime(start: number) {
+    let at = start;
+    const sleeps: number[] = [];
+    return {
+      now: () => new Date(at),
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        at += ms;
+      },
+      sleeps,
+      set: (ms: number) => {
+        at = ms;
+      },
+    };
+  }
+
+  it("lets 20 searches and lookups through a minute, holds the 21st up to 5 seconds, fails one that would wait longer, and passes the next minute's", async () => {
+    const start = Date.parse("2026-10-24T12:00:00.000Z");
+    const time = fakeTime(start);
+    const { calls, fetchImpl } = fakeFetch(EMPTY);
+    const opts = { fetchImpl, limiter: createDirectoryLimiter({ now: time.now, sleep: time.sleep }) };
+
+    await searchShows("show", opts);
+    time.set(start + 30_000);
+    for (let i = 0; i < 19; i += 1) await (i % 2 === 0 ? lookupShow("123456", opts) : searchShows("show", opts));
+    expect(calls).toHaveLength(20);
+    expect(time.sleeps).toEqual([]);
+
+    // The first request turns a minute old 4 seconds from here.
+    time.set(start + 56_000);
+    await lookupShow("123456", opts);
+    expect(time.sleeps).toEqual([4_000]);
+    expect(calls).toHaveLength(21);
+
+    // The next place frees when the 19 sent at 30 seconds turn a minute old,
+    // 30 seconds away, so this fails at once with the lookup failure code.
+    expect(await failureCode(searchShows("show", opts))).toBe("LOOKUP_FAILED");
+    expect(time.sleeps).toEqual([4_000]);
+    expect(calls).toHaveLength(21);
+
+    time.set(start + 90_000);
+    await searchShows("show", opts);
+    expect(calls).toHaveLength(22);
+    expect(time.sleeps).toEqual([4_000]);
+  });
+
+  it("gives up once 5 seconds of waiting would pass, even with a clock that stops moving", async () => {
+    const start = Date.parse("2026-10-24T12:00:00.000Z");
+    let at = start;
+    const sleeps: number[] = [];
+    const { calls, fetchImpl } = fakeFetch(EMPTY);
+    const limiter = createDirectoryLimiter({
+      now: () => new Date(at),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    for (let i = 0; i < 20; i += 1) await searchShows("show", { fetchImpl, limiter });
+    at = start + 58_000;
+
+    expect(await failureCode(searchShows("show", { fetchImpl, limiter }))).toBe("LOOKUP_FAILED");
+    expect(sleeps).toEqual([2_000, 2_000]);
+    expect(calls).toHaveLength(20);
+  });
+
+  it("is one limiter for the whole process by default, shared by searchShows and lookupShow", async () => {
+    vi.resetModules();
+    const fresh = await import("../src/feeds/lookup.js");
+    const { calls, fetchImpl } = fakeFetch(EMPTY);
+
+    for (let i = 0; i < 20; i += 1) await (i % 2 === 0 ? fresh.lookupShow("123456", { fetchImpl }) : fresh.searchShows("show", { fetchImpl }));
+    const refused = await fresh.searchShows("show", { fetchImpl }).catch((error: unknown) => error);
+
+    // A fresh module brings its own FeedError class, so the code is read directly.
+    expect((refused as { code?: unknown }).code).toBe("LOOKUP_FAILED");
+    expect(calls).toHaveLength(20);
   });
 });

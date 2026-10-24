@@ -9,6 +9,8 @@ import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { kolamFor, type Kolam } from "../src/kolam/kolam.js";
+import { issueToken } from "../src/mcp/tokens.js";
+import { promoteRun } from "../src/ops/promote.js";
 import { createUnavailableAgent, type AgentPort } from "../src/server/agent-port.js";
 import { createApp, type AppDeps } from "../src/server/app.js";
 import type { ServerConfig } from "../src/server/config.js";
@@ -35,6 +37,7 @@ import { createTurnstileVerifier, TURNSTILE_ACTIONS } from "../src/server/turnst
 import type { Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
 import { setBucket } from "../src/store/meter.js";
+import { storeBriefs, syntheticBrief } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 import { SETTLE } from "./helpers/settle.js";
 
@@ -91,6 +94,7 @@ function build(
     verify?: AppDeps["verifyTurnstile"];
     db?: Db;
     socket?: string;
+    now?: () => Date;
   } = {},
 ) {
   const agent = spyAgent(opts.agent);
@@ -101,6 +105,7 @@ function build(
     verifyTurnstile: verify,
     agent,
     socketAddress: () => opts.socket ?? null,
+    ...(opts.now === undefined ? {} : { now: opts.now }),
   });
   return { app, agent, verify };
 }
@@ -584,14 +589,46 @@ describe("GET /runs/:id", () => {
     expect(JSON.stringify(await (await app.request(`/runs/${runId}`)).json())).not.toContain("feeds.example");
 
     await setRunStatus(db, runId, "done", undefined, NOW);
-    const done = (await (await app.request(`/runs/${runId}`)).json()) as { board: unknown[]; finishedAt: string; kolam: unknown };
-    expect(done.board).toEqual([
-      { name: "first", id: guestIds[0] },
-      { name: "second", id: guestIds[1] },
-    ]);
+    const doneText = await (await app.request(`/runs/${runId}`)).text();
+    const done = JSON.parse(doneText) as { board: unknown[]; finishedAt: string; kolam: unknown };
+    // Neither row reads back as a runner's guest, so neither is shown and
+    // there is nothing to draw (C6.5).
+    expect(done.board).toEqual([]);
+    expect(doneText).not.toContain(guestIds[0]);
+    expect(doneText).not.toContain(guestIds[1]);
+    expect(doneText).not.toContain("personId");
     expect(done.finishedAt).toBe(NOW.toISOString());
-    // Neither row reads back as a runner's guest, so there is nothing to draw.
     expect(done.kolam).toBeNull();
+  });
+
+  it("shows only each board guest's public fields, and leaves out a row the runner could not have written (C6.5, D5.5)", async () => {
+    const { app } = build();
+    const person = "qloo-person-MARKER-a1";
+    const missingAngle: Record<string, unknown> = storedGuest(3, ["film"]);
+    delete missingAngle["angle"];
+    const { runId, guestIds } = await runWithBoard([
+      storedGuest(1, ["jazz"], {
+        personId: person,
+        rising: { state: "rising", points: 0.4242 },
+        bringsNew: { segment: "MARKER-segment", label: "younger listeners", gap: 0.3131 },
+      }),
+      storedGuest(2, []),
+      missingAngle,
+    ]);
+
+    const text = await (await app.request(`/runs/${runId}`)).text();
+    const body = JSON.parse(text) as { board: unknown[] };
+    const shown = { fitKnown: true, reach: "bookable", angle: "A synthetic angle." };
+    expect(body.board).toEqual([
+      { ...shown, id: guestIds[0], name: "Synthetic Guest 1", fit: 0.01, fitRank: 1, rising: "rising", bringsNew: "younger listeners", sharedTags: ["jazz"] },
+      { ...shown, id: guestIds[1], name: "Synthetic Guest 2", fit: 0.02, fitRank: 2, rising: "steady", bringsNew: null, sharedTags: [] },
+    ]);
+    for (const absent of ["personId", person, "00000000-0000-4000-8000-000000000502", "segment", "gap", "showName", "Synthetic Show", guestIds[2]!]) {
+      expect(text, absent).not.toContain(absent);
+    }
+    // The kolam's rings carry their own "points", so only the board is searched for these.
+    const board = JSON.stringify(body.board);
+    for (const absent of ["points", "0.4242", "0.3131"]) expect(board, absent).not.toContain(absent);
   });
 
   it("carries a kolam of the board's ids and tag counts once the run is done, null before, and none of the board's text (C3.9)", async () => {
@@ -927,9 +964,11 @@ describe("refusal logs (6e, C3.6)", () => {
   });
 });
 
-async function awaitingRun(candidates: unknown[]): Promise<{ runId: string; candidateIds: string[] }> {
-  const runId = await createRun(db, INPUT, NOW);
-  await setRunStatus(db, runId, "awaiting_confirm", undefined, NOW);
+// Made on the real clock by default, which the app also reads, so the run is
+// well inside its confirm window.
+async function awaitingRun(candidates: unknown[], createdAt = new Date()): Promise<{ runId: string; candidateIds: string[] }> {
+  const runId = await createRun(db, INPUT, createdAt);
+  await setRunStatus(db, runId, "awaiting_confirm", undefined, createdAt);
   return { runId, candidateIds: await putCandidates(db, runId, candidates) };
 }
 
@@ -1017,6 +1056,69 @@ describe("POST /runs/:id/confirm", () => {
     expect((await postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] })).status).toBe(202);
     await vi.waitFor(async () => expect((await getRun(db, runId))?.errorCode).toBe("AGENT_ERROR"), SETTLE);
     expect(await listEventsAfter(db, runId, 0)).toEqual([{ seq: 1, event: "failed", data: { code: "AGENT_ERROR" } }]);
+  });
+
+  it("closes a run that waited more than 30 minutes as failed with CONFIRM_EXPIRED and answers 410, starting nothing (C6.4)", async () => {
+    const late = build({ now: () => new Date(NOW.getTime() + 31 * 60_000) });
+    const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }], NOW);
+    const confirm = () => postJson(late.app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] });
+
+    const expired = await confirm();
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toEqual({ error: "CONFIRM_EXPIRED" });
+    expect(await getRun(db, runId)).toMatchObject({ status: "failed", errorCode: "CONFIRM_EXPIRED" });
+    expect(await listEventsAfter(db, runId, 0)).toEqual([{ seq: 1, event: "failed", data: { code: "CONFIRM_EXPIRED" } }]);
+    expect(late.agent.continueRun).not.toHaveBeenCalled();
+    expect(await inflight()).toBe(0);
+
+    const again = await confirm();
+    expect(again.status).toBe(409);
+    expect(await again.json()).toEqual({ error: "NOT_AWAITING" });
+    expect(await inflight()).toBe(0);
+
+    const onTime = build({ now: () => new Date(NOW.getTime() + 29 * 60_000) });
+    const fresh = await awaitingRun([{ title: "SmartLess" }], NOW);
+    expect((await postJson(onTime.app, `/runs/${fresh.runId}/confirm`, { candidateId: fresh.candidateIds[0] })).status).toBe(202);
+    expect(onTime.agent.continueRun).toHaveBeenCalledExactlyOnceWith(fresh.runId, fresh.candidateIds[0]);
+    await settled(0);
+  });
+});
+
+describe("the website's doors on an MCP run (D4.1)", () => {
+  it("answers confirm and brief with 404 NOT_FOUND, as for an unknown run, before any claim, cap or agent call", async () => {
+    const counting = countingDb(db);
+    const { app, agent } = build({ db: counting.db });
+    const { id: tokenId } = await issueToken(db);
+    const origin = { surface: "mcp", tokenId } as const;
+    const awaiting = await createRun(db, INPUT, new Date(), origin);
+    await setRunStatus(db, awaiting, "awaiting_confirm");
+    const [candidateId] = await putCandidates(db, awaiting, [{ title: "SmartLess" }]);
+    const done = await createRun(db, INPUT, NOW, origin);
+    await setRunStatus(db, done, "running", undefined, NOW);
+    const [guestId] = await putBoard(db, done, [storedGuest(1, [])]);
+    await setRunStatus(db, done, "done", undefined, NOW);
+    const before = await snapshot();
+
+    const doors: Array<[string, unknown]> = [
+      [`/runs/${awaiting}/confirm`, { candidateId }],
+      [`/runs/${done}/confirm`, { candidateId }],
+      [`/runs/${done}/brief`, { guestId }],
+      [`/runs/${awaiting}/brief`, { guestId }],
+    ];
+    for (const [path, body] of doors) {
+      const res = await postJson(app, path, body);
+      expect(res.status, path).toBe(404);
+      expect(await res.json()).toEqual({ error: "NOT_FOUND" });
+    }
+
+    // Each request read its run and nothing else: no flag, cap, candidate,
+    // board or claim was touched.
+    expect(counting.texts).toHaveLength(doors.length);
+    for (const text of counting.texts) expect(text).toMatch(/^SELECT .* FROM runs WHERE id = \$1::uuid$/);
+    expect(await snapshot()).toBe(before);
+    expect(agent.continueRun).not.toHaveBeenCalled();
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect((await getRun(db, awaiting))?.status).toBe("awaiting_confirm");
   });
 });
 
@@ -1205,6 +1307,54 @@ describe("POST /runs/:id/brief", () => {
     expect(await snapshot()).toBe(before);
     expect(await (await app.request(`/runs/${runId}/briefs/${guestId}`)).json()).toEqual({ status: "none" });
     expect((await getRun(db, runId))?.status).toBe("done");
+  });
+});
+
+describe("briefs on a promoted run (C6.3)", () => {
+  it("answers POST for a missing brief 409 BRIEF_NOT_READY, with live runs on or off, and never claims or calls the agent", async () => {
+    const { app, agent } = build();
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, []), storedGuest(2, []), storedGuest(3, [])]);
+    const [, missing, once] = guestIds as [string, string, string];
+    await claimBrief(db, runId, once, 5, NOW);
+    await markBriefFailed(db, runId, once, "MODEL_TIMEOUT");
+    // Placed by hand, because promote itself refuses a run with a missing brief.
+    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 1, $2::timestamptz)", [
+      runId,
+      NOW.toISOString(),
+    ]);
+    const before = await snapshot();
+
+    for (const live of [true, false]) {
+      await setFlag(db, "live_runs", live);
+      for (const guestId of [missing, once]) {
+        const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
+        expect(res.status, `live ${live}`).toBe(409);
+        expect(await res.json()).toEqual({ error: "BRIEF_NOT_READY" });
+      }
+    }
+
+    expect(await snapshot()).toBe(before);
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await getBriefClaim(db, runId, missing)).toBeNull();
+    expect(await getBriefClaim(db, runId, once)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+  });
+
+  it("serves every stored brief with live runs off, through POST and GET alike (C5.7)", async () => {
+    const { app, agent } = build();
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, []), storedGuest(2, []), storedGuest(3, [])]);
+    await storeBriefs(db, runId, guestIds);
+    await promoteRun(db, runId, 1);
+    await setFlag(db, "live_runs", false);
+
+    for (const [index, guestId] of guestIds.entries()) {
+      const posted = await postJson(app, `/runs/${runId}/brief`, { guestId });
+      expect(posted.status).toBe(200);
+      expect(await posted.json()).toEqual({ brief: syntheticBrief(index + 1) });
+      const read = await app.request(`/runs/${runId}/briefs/${guestId}`);
+      expect(read.status).toBe(200);
+      expect(await read.json()).toEqual({ status: "done", brief: syntheticBrief(index + 1) });
+    }
+    expect(agent.writeBrief).not.toHaveBeenCalled();
   });
 });
 

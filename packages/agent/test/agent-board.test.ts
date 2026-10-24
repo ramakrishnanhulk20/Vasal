@@ -1,10 +1,12 @@
 // Covers the pure board maths: trend state, the new-audience segment, reach
-// bands and the ranked board built from a run context. It does not cover how
+// bands and the ranked board built from a run context, with its exclusions,
+// dropped ids and the fit floor for people only find_person returned. It
+// does not cover how
 // tools fill the context (agent-tools.test.ts), the prose check on angles
 // (agent-prose.test.ts), or whether the thresholds suit real Qloo data, which
 // only the live probe can show. Every row and name here is synthetic.
 import { describe, expect, it } from "vitest";
-import { bringsNewFrom, buildBoard, reachFrom, risingFrom } from "../src/agent/board.js";
+import { bringsNewFrom, buildBoard, FIND_PERSON_FIT_FLOOR, reachFrom, risingFrom } from "../src/agent/board.js";
 import { createRunContext, type Demographics, type RunContext, type TrendRow } from "../src/agent/context.js";
 
 const SHOW = { qlooId: "00000000-0000-4000-8000-000000000001", name: "Synthetic Show" };
@@ -26,9 +28,18 @@ function weeks(recent: number, baseline: number, count = 12): TrendRow[] {
 
 const demographics = (age: Record<string, number>, gender: Record<string, number>): Demographics => ({ age, gender });
 
-function contextWith(people: Array<[number, string, number | null, number | null]>, exclusions: string[] = []): RunContext {
+// Everyone here came from a people_for_show answer unless `found` names them,
+// so only those picks meet the find_person fit floor.
+function contextWith(
+  people: Array<[number, string, number | null, number | null]>,
+  exclusions: string[] = [],
+  found: readonly number[] = [],
+): RunContext {
   const ctx = createRunContext({ show: SHOW, episodeTitles: [], exclusions });
-  for (const [n, name, affinity, popularity] of people) ctx.people.set(id(n), { name, affinity, popularity });
+  for (const [n, name, affinity, popularity] of people) {
+    ctx.people.set(id(n), { name, affinity, popularity });
+    if (!found.includes(n)) ctx.listedForShow.add(id(n));
+  }
   return ctx;
 }
 
@@ -96,12 +107,14 @@ describe("bringsNewFrom", () => {
 });
 
 describe("reachFrom", () => {
-  it("bands popularity, with a missing value counted as bookable", () => {
+  it("bands popularity, and a missing value is unknown, never bookable", () => {
     expect(reachFrom(0.95)).toBe("household name");
     expect(reachFrom(0.9499)).toBe("well known");
     expect(reachFrom(0.8)).toBe("well known");
     expect(reachFrom(0.79)).toBe("bookable");
-    expect(reachFrom(null)).toBe("bookable");
+    expect(reachFrom(0)).toBe("bookable");
+    expect(reachFrom(null)).toBe("unknown");
+    expect(reachFrom(Number.NaN)).toBe("unknown");
   });
 });
 
@@ -150,9 +163,57 @@ describe("buildBoard", () => {
       ["Synthetic C", 0.95, true, 1, "household name"],
       ["Synthetic B", 0.8, true, 2, "bookable"],
       ["Synthetic A", 0.8, true, 3, "well known"],
-      ["Synthetic E", 0.7, true, 4, "bookable"],
+      ["Synthetic E", 0.7, true, 4, "unknown"],
       ["Synthetic D", 0, false, 5, "bookable"],
     ]);
+  });
+
+  it("drops an exclusion written without accents or without a suffix, through sameName (C2.7)", () => {
+    const ctx = contextWith(
+      [
+        [1, "José Andrés", 0.9, 0.5],
+        [2, "Mel Kiper, Jr.", 0.8, 0.5],
+        [3, "Mel Kiperman", 0.7, 0.5],
+      ],
+      ["Jose Andres", "Mel Kiper"],
+    );
+
+    const board = buildBoard(
+      ctx,
+      [1, 2, 3].map((n) => ({ personId: id(n), angle: `pick ${n}` })),
+    );
+
+    expect(board.map((entry) => entry.name)).toEqual(["Mel Kiperman"]);
+  });
+
+  it("keeps a pick only find_person returned when its fit is known and at least the floor, and every people_for_show pick", () => {
+    const ctx = contextWith(
+      [
+        [1, "Synthetic Listed", null, 0.5],
+        [2, "Synthetic Found Low", 0.3, 0.5],
+        [3, "Synthetic Found High", 0.8, 0.5],
+        [4, "Synthetic Found Unscored", null, 0.5],
+        [5, "Synthetic Found At Floor", FIND_PERSON_FIT_FLOOR, 0.5],
+      ],
+      [],
+      [2, 3, 4, 5],
+    );
+    const picks = [1, 2, 3, 4, 5].map((n) => ({ personId: id(n), angle: `pick ${n}` }));
+
+    expect(FIND_PERSON_FIT_FLOOR).toBe(0.5);
+    expect(buildBoard(ctx, picks).map((entry) => entry.name)).toEqual(["Synthetic Found High", "Synthetic Found At Floor", "Synthetic Listed"]);
+    // Before the fit call nobody has a comparable fit yet, so the size check then skips the floor.
+    expect(buildBoard(ctx, picks, { applyFitFloor: false })).toHaveLength(5);
+  });
+
+  it("leaves a person off once their id is dropped, whatever the people map holds", () => {
+    const ctx = contextWith([
+      [1, "Synthetic One", 0.9, 0.5],
+      [2, "Synthetic Two", 0.8, 0.5],
+    ]);
+    ctx.dropped.add(id(1));
+
+    expect(buildBoard(ctx, [1, 2].map((n) => ({ personId: id(n), angle: `pick ${n}` }))).map((entry) => entry.personId)).toEqual([id(2)]);
   });
 
   it("ranks by the unrounded affinity, so 0.9549 beats 0.9512 though both show 0.95", () => {

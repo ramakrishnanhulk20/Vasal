@@ -13,7 +13,7 @@ import { writeBrief } from "../src/agent/brief.js";
 import { AgentError } from "../src/agent/errors.js";
 import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
 import { BRIEF_SYSTEM } from "../src/agent/prompts.js";
-import { SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { ACCUSATIONS_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 
 const SHOW_NAME = "Synthetic Show";
 const GUEST: BoardEntry = {
@@ -195,6 +195,19 @@ describe("writeBrief wording", () => {
     }
   });
 
+  it("says Qloo has no reach data for a guest whose reach is unknown, and never that booking is realistic (G15)", async () => {
+    const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." }]);
+
+    const { brief } = await writeBrief(model, { guest: { ...GUEST, reach: "unknown" }, showName: SHOW_NAME });
+
+    expect(brief.why).toBe("Blink-182 suits Synthetic Show. Qloo has no reach data for this guest.");
+    expect(factsOf(calls[0]!.user)["reach"]).toMatchObject({ placeholder: "{{reach}}", value: "Qloo has no reach data for this guest" });
+    for (const text of [JSON.stringify(brief), calls[0]!.user]) {
+      expect(text).not.toContain("booking is realistic");
+      expect(text).not.toContain("within reach");
+    }
+  });
+
   it("keeps the host's notes out of the pitch: {{reach}} or {{brings}} in the subject or email fails, while why may use both", async () => {
     for (const field of ["pitch_subject", "pitch_body"] as const) {
       for (const note of ["{{reach}}.", "{{brings}}"]) {
@@ -272,6 +285,12 @@ describe("writeBrief wording", () => {
 
   it("tells the model not to describe the guest's sensitive traits", () => {
     expect(BRIEF_SYSTEM).toContain(SENSITIVE_TRAITS_RULE);
+  });
+
+  it("tells the model no accusations, right after the sensitive-traits rule, and no numbers in words either", () => {
+    expect(BRIEF_SYSTEM).toContain(`${SENSITIVE_TRAITS_RULE} ${ACCUSATIONS_RULE}`);
+    expect(BRIEF_SYSTEM).toContain("Write no other numbers, in digits or in words, and no links, email addresses or phone numbers.");
+    expect(BRIEF_SYSTEM).not.toContain("Write no other digits");
   });
 
   // GUEST's trend is rising, so the trend check is off and only the always-on check can refuse these.

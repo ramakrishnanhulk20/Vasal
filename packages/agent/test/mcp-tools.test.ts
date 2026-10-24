@@ -257,7 +257,10 @@ describe("the tool list (D2.4)", () => {
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
     expect(byName["find_show"]?.inputSchema).toMatchObject({ type: "object", additionalProperties: false, required: ["query"] });
     expect(byName["write_brief"]?.inputSchema).toMatchObject({ additionalProperties: false, required: ["runId", "guestId"] });
-    for (const name of ["find_show", "get_board"]) expect(byName[name]?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: true });
+    expect(byName["get_board"]?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: true });
+    // find_show spends a daily find and writes a run, so it is not read-only,
+    // and a repeat call spends again (G6).
+    expect(byName["find_show"]?.annotations).toEqual({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true });
     for (const name of ["book_guests", "write_brief"]) {
       expect(byName[name]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: true });
     }
@@ -419,6 +422,48 @@ describe("find_show (F11)", () => {
     expect(out(await call(quiet, "find_show", { query: "SmartLess" }))).toEqual({ error: "upstream_failed" });
     const [run] = (await db.query<{ id: string }>("SELECT id::text AS id FROM runs")).rows;
     expect(await getRun(db, run!.id)).toMatchObject({ status: "failed", errorCode: "AGENT_ERROR" });
+  });
+
+  it("holds MCP's slot pair for the whole of startRun, so of 30 parallel calls one looks up a show and the rest answer busy, spending nothing (D3.3, D3.7)", async () => {
+    const { gate, release } = deferred();
+    let running = 0;
+    let most = 0;
+    const agent = fakeAgent({
+      startRun: async (runId) => {
+        running += 1;
+        most = Math.max(most, running);
+        try {
+          await setRunStatus(db, runId, "running");
+          await gate;
+          await putCandidates(db, runId, [candidateRow(1)]);
+          await claimRunStatus(db, runId, "running", "awaiting_confirm");
+        } finally {
+          running -= 1;
+        }
+      },
+    });
+    const client = await connect({ agent });
+
+    const answered: CallToolResult[] = [];
+    const all = Promise.all(
+      Array.from({ length: 30 }, async () => {
+        const result = await call(client, "find_show", { query: "SmartLess" });
+        answered.push(result);
+        return result;
+      }),
+    );
+    await vi.waitFor(() => expect(answered).toHaveLength(29), SETTLE);
+    for (const result of answered) expect(out(result)).toEqual({ error: "busy" });
+    expect(await slots()).toEqual({ mcp: 1, runs: 1 });
+    expect(agent.startRun).toHaveBeenCalledOnce();
+
+    release();
+    const results = await all;
+    expect(results.filter((result) => result.isError !== true)).toHaveLength(1);
+    expect(most).toBe(1);
+    expect(await counts()).toMatchObject({ finds: 1 });
+    expect((await db.query("SELECT count(*)::int AS n FROM runs")).rows).toEqual([{ n: 1 }]);
+    expect(await slots()).toEqual({ mcp: 0, runs: 0 });
   });
 });
 
@@ -718,11 +763,15 @@ describe("write_brief (F13, D3.5)", () => {
 });
 
 describe("per-key caps (D3.6)", () => {
-  it("completes exactly 20 of 25 parallel find_show calls against the daily cap of 20", async () => {
+  // One call at a time, because parallel calls now wait on MCP's one slot
+  // pair and answer busy (D3.3); countTokenUse's own race test lives in
+  // mcp-usage.test.ts.
+  it("completes exactly 20 of 25 find_show calls against the daily cap of 20", async () => {
     const agent = fakeAgent();
     const client = await connect({ agent });
 
-    const results = await Promise.all(Array.from({ length: 25 }, () => call(client, "find_show", { query: "SmartLess" })));
+    const results: CallToolResult[] = [];
+    for (let i = 0; i < 25; i += 1) results.push(await call(client, "find_show", { query: "SmartLess" }));
 
     expect(results.filter((result) => result.isError !== true)).toHaveLength(20);
     expect(results.filter((result) => out(result)["error"] === "budget_exhausted")).toHaveLength(5);

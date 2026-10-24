@@ -781,6 +781,11 @@ describe("listShowcase (C6.3, C6.5)", () => {
     }
   });
 
+  it("parses a guest whose reach is unknown, and refuses a reach label the runner never writes", () => {
+    expect(parseBoardGuest(JSON.stringify(guest(1, { reach: "unknown" })))?.reach).toBe("unknown");
+    expect(parseBoardGuest(JSON.stringify(guest(1, { reach: "famous" })))).toBeNull();
+  });
+
   it("gives an empty list when nothing is promoted", async () => {
     await endedRun("done", [guest(1), guest(2), guest(3)]);
 

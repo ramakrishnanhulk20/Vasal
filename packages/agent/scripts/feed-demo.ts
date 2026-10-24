@@ -7,11 +7,16 @@ import { safeFetch } from "../src/net/safe-fetch.js";
 
 const USAGE = 'Usage: npm run feed:demo -- "<show name, Apple Podcasts link or feed URL>"';
 
+// Titles and directory fields are written by podcasters. The same rule as
+// scripts/youtube-demo.ts: control and direction characters are dropped so
+// a title cannot move the cursor or reorder what the terminal shows.
+const printable = (text: string) => text.replace(/[\p{Cc}\p{Bidi_Control}]/gu, "");
+
 function describeCandidate(candidate: ShowCandidate, index: number): string {
-  const publisher = candidate.publisher === "" ? "" : `, by ${candidate.publisher}`;
-  const genre = candidate.genre === null ? "" : ` (${candidate.genre})`;
+  const publisher = candidate.publisher === "" ? "" : `, by ${printable(candidate.publisher)}`;
+  const genre = candidate.genre === null ? "" : ` (${printable(candidate.genre)})`;
   const feed = candidate.feedUrl === null ? " [no usable feed URL]" : "";
-  return `  ${index + 1}. ${candidate.name}${publisher}${genre}${feed}`;
+  return `  ${index + 1}. ${printable(candidate.name)}${publisher}${genre}${feed}`;
 }
 
 async function issueHandle(input: ClassifiedInput, handles: FeedHandles): Promise<string> {
@@ -38,7 +43,7 @@ async function issueHandle(input: ClassifiedInput, handles: FeedHandles): Promis
   if (chosen === undefined || chosen.feedUrl === null) {
     throw new Error("The first candidate has no usable feed URL.");
   }
-  console.log(`Taking candidate 1: ${chosen.name}`);
+  console.log(`Taking candidate 1: ${printable(chosen.name)}`);
   return handles.issue(chosen.feedUrl, "directory");
 }
 
@@ -56,11 +61,11 @@ async function main(): Promise<void> {
   const feed = parseFeed(fetched.body);
 
   console.log("");
-  console.log(`Show: ${feed.title}`);
+  console.log(`Show: ${printable(feed.title)}`);
   console.log(`Episodes read: ${feed.episodes.length}`);
   console.log("Newest 5:");
   for (const episode of feed.episodes.slice(0, 5)) {
-    console.log(`  ${episode.publishedAt?.slice(0, 10) ?? "no date"}  ${episode.title}`);
+    console.log(`  ${episode.publishedAt?.slice(0, 10) ?? "no date"}  ${printable(episode.title)}`);
   }
 }
 

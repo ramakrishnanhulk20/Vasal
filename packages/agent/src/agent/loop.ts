@@ -136,7 +136,8 @@ function checkedLimits(overrides: Partial<LoopLimits>): LoopLimits {
  * model's checked picks from finish_board.
  *
  * The model sees only the fixed system prompt (researchSystem for
- * deps.trends), `Show to research: ` plus the JSON of ctx.show.name, and
+ * deps.trends and ctx.pastGuests.checked), `Show to research: ` plus the
+ * JSON of ctx.show.name, and
  * tool results. It never sees the exclusion list
  * or anything the visitor typed (C2.7, C2.5). Each response is kept in full.
  * Every tool_use block in a response runs through runTool in order, and all
@@ -179,7 +180,7 @@ export async function runResearch(
   const startedAt = clock();
   const toolOptions = { trends: deps.trends };
   const tools = researchTools(toolOptions);
-  const system = researchSystem(toolOptions);
+  const system = researchSystem({ ...toolOptions, pastGuestsChecked: ctx.pastGuests.checked });
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: `Show to research: ${JSON.stringify(ctx.show.name)}` }];
   let turns = 0;
   let toolCalls = 0;

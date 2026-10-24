@@ -65,7 +65,7 @@ const guest = z.strictObject({
   fit: z.number(),
   fitKnown: z.boolean(),
   fitRank: z.number().int().min(1),
-  reach: z.enum(["household name", "well known", "bookable"]),
+  reach: z.enum(["household name", "well known", "bookable", "unknown"]),
   rising: z.enum(["rising", "steady", "falling", "unknown"]),
   bringsNew: capped(NAME_CHARS).nullable(),
   sharedTags: z.array(capped(TAG_CHARS)).max(MAX_TAGS),

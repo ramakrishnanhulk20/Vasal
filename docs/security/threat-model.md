@@ -171,7 +171,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C2.6 No secret, environment variable, database URL or internal hostname appears in any message to the model, including tool results and tool errors.
 - C2.7 Exclusions are applied in code to the ranked board, and the model never sees them. Visitor free text never reaches the brief or pitch prompts. Those get only the confirmed show, the guest picked from the stored board, computed numbers and tool data.
 - C2.8 Tool results reach the model only as tool-result content, capped in size, and are never merged into the system prompt. Every third-party string in a tool result is cleaned first by the same cleaner as D5.2: NFC, `\p{Cc}` removed, `\p{Default_Ignorable_Code_Point}` and `\p{Bidi_Control}` removed. That takes out the invisible Unicode tag characters (U+E0000 to U+E007F), which a model reads and a person cannot see.
-- C2.9 A person the show has already had as a guest never reaches the board. Code (isPastGuest, at recordPerson, the one gate every person passes) removes anyone whose whole name, first and last name, or a three-letter short first name before the same surname appears in any episode title the feed gave, before the model sees them. Their id is then unknown, so it is refused like any id no tool returned (C2.2). When the feed cannot be read, the run records that past guests were not checked, rather than implying there were none. A false match only removes a person; it can never add one.
+- C2.9 A person the show has already had as a guest never reaches the board. Code (isPastGuest, at recordPerson, the one gate every person passes) removes anyone whose whole name, first and last name, or a three-letter short first name before the same surname appears in any episode title the feed gave, or in the show's own names (directory name, publisher, Qloo name, feed title), so a host never reaches the board, before the model sees them. A person dropped once (a past guest, or dead) stays dropped for the whole run, whatever a later answer says. The scoring step applies the death check too. Their id is then unknown, so it is refused like any id no tool returned (C2.2). When the feed cannot be read, or gives no titles, the run records that past guests were not checked, rather than implying there were none. The board records how many titles were checked and how far back. A false match only removes a person; it can never add one.
 
 ### C3 What leaves the server (A5, A11, G4, G5)
 - C3.1 No attacker-influenced string is ever treated as HTML or script in the browser. This covers model prose, feed fields, Qloo and YouTube text, tool inputs in step events, and anything read back from the database. All of it renders as React text, with no `dangerouslySetInnerHTML`. If prose is rendered as markdown, raw HTML and images are off.
@@ -245,8 +245,8 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 
 ### C9 Offline pipeline (A11, G5)
 - C9.1 Every guest name the model pulls from an episode title must appear in that title under the C8.3 normaliser. Names that do not are dropped and counted, and the count is published with the backtest.
-- C9.2 The offline scripts use the same metered Qloo client as the server (C5.1) and the same feed fetcher (C1).
-- C9.3 One script recomputes every number on the backtest page from stored inputs, and the page states the method and the sample size.
+- C9.2 The offline scripts use the same metered Qloo client as the server (C5.1) and the same feed fetcher (C1). A script on a throwaway meter (backtest --dev-db) takes at most 2 Qloo calls a second, so with the server's 8 the total stays within Qloo's 10. The key-day probe (scripts/probe.ts) is unmetered and paced at 2 a second, and it is run only while live runs are off.
+- C9.3 Committed scripts recompute every scripted number on the backtest page from the stored dataset: --analyse for the pre-registered results, backtest:robustness for the post-hoc checks. A hand check is labelled as one. Every pull attempt is listed, including any that stopped, and the page states the method and the sample size.
 
 ### General standards
 
@@ -446,8 +446,8 @@ D3 Spending and capacity (A18, A22, G6)
 - D3.5 One brief per guest per run, under races (C5.8).
   - Show it: 10 parallel write_brief calls make one Anthropic call.
 - D3.6 Each token has caps, counted atomically: runs per day, find_show calls per day, briefs per day, and calls in flight at once. Next to the caps, record how many runs one human check can buy.
-  - Show it: 20 parallel find_show calls against a cap of 5 complete exactly 5.
-- D3.7 One find_show call makes a fixed maximum of outbound requests, and Apple lookups share one limiter, with MCP capped at a share.
+  - Show it: 25 find_show calls one after another against a cap of 5 complete exactly 5. Parallel calls answer busy, because each find_show holds the MCP run slot pair while it runs (D3.3, D3.7).
+- D3.7 One find_show call makes a fixed maximum of outbound requests, and Apple lookups share one limiter (20 a minute, process-wide). MCP's share is bounded by the run slot pair: at most one MCP show lookup runs at a time.
 - D3.8 A request without a valid token costs at most one indexed read and no write. Repeated failures from one address are slowed or refused.
 
 D4 Ids and ownership (A17, G8)

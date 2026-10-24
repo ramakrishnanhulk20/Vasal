@@ -304,6 +304,12 @@ describe("output schemas and the size cap (D5.1, D5.2)", () => {
     });
   });
 
+  it("passes an unknown reach through to the caller as unknown", () => {
+    const result = boardReply(RUN_ID, items([boardRow(1, { reach: "unknown" })]), APP_ORIGIN);
+
+    expect((structured(result)["guests"] as Array<{ reach: string }>)[0]?.reach).toBe("unknown");
+  });
+
   it("answers upstream_failed for rows that fail their schema, never a partial row", () => {
     expect(structured(boardReply(RUN_ID, items([{ name: "no person id" }]), APP_ORIGIN))).toEqual({ error: "upstream_failed" });
     expect(structured(candidatesReply(items([{ name: 5 }])))).toEqual({ error: "upstream_failed" });

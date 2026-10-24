@@ -1,9 +1,10 @@
 // Covers the past-guest matcher on its own: which names a title marks as a
-// past guest, and which it must not. It does not cover where the run uses it
-// (agent-tools and agent-runner do), real feeds, nicknames, misspellings or
-// lookalike letters from other scripts, which it does not try to match.
+// past guest, and which it must not, and sameName, which exclusions use. It
+// does not cover where the run uses them (agent-tools, agent-board and
+// agent-runner do), real feeds, nicknames, misspellings or lookalike letters
+// from other scripts, which it does not try to match.
 import { describe, expect, it } from "vitest";
-import { isPastGuest, NO_PAST_GUESTS, pastGuestIndex, type PastGuestIndex } from "../src/agent/past-guests.js";
+import { isPastGuest, NO_PAST_GUESTS, pastGuestIndex, sameName, type PastGuestIndex } from "../src/agent/past-guests.js";
 
 const LONG_FEED = Array.from({ length: 2_000 }, (_, n) =>
   n === 1_999 ? "Synthetic Guest on the last episode" : `Episode ${n + 1}: a solo show`,
@@ -60,5 +61,23 @@ describe("isPastGuest short first names", () => {
     expect(isPastGuest(pastGuestIndex(["Mike Birbiglia live"]), "Michael Birbiglia")).toBe(false);
     expect(isPastGuest(pastGuestIndex(["Prince live"]), "Prince")).toBe(true);
     expect(isPastGuest(pastGuestIndex(["Meghan live"]), "Megan")).toBe(false);
+  });
+});
+
+describe("sameName", () => {
+  it("is true for accents, a suffix, a middle name, case and punctuation, either way round", () => {
+    expect(sameName("Jose Andres", "José Andrés")).toBe(true);
+    expect(sameName("Mel Kiper", "Mel Kiper, Jr.")).toBe(true);
+    expect(sameName("Mel Kiper, Jr.", "Mel Kiper")).toBe(true);
+    expect(sameName("Nassim Taleb", "Nassim Nicholas Taleb")).toBe(true);
+    expect(sameName("conan o'brien", "Conan O’Brien")).toBe(true);
+  });
+
+  it("is false for a different name, a longer word, a surname alone, a short first name and an empty name", () => {
+    expect(sameName("Mel Kiper", "Mel Kiperman")).toBe(false);
+    expect(sameName("Taleb", "Nassim Nicholas Taleb")).toBe(false);
+    expect(sameName("Meg Stalter", "Megan Stalter")).toBe(false);
+    expect(sameName("", "")).toBe(false);
+    expect(sameName("Ann Lee", " ")).toBe(false);
   });
 });

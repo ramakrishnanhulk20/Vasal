@@ -219,9 +219,22 @@ describe("structure limits", () => {
     expect(failure(() => parseFeed(nested(33))).code).toBe("FEED_TOO_DEEP");
   });
 
-  it("accepts 50,000 elements and refuses 50,001", () => {
+  it("accepts 300,000 elements and refuses 300,001", () => {
     const withElements = (total: number) => `<rss><channel>${"<x/>".repeat(total - 2)}</channel></rss>`;
-    expect(parseFeed(withElements(50_000)).episodes).toEqual([]);
-    expect(failure(() => parseFeed(withElements(50_001))).code).toBe("FEED_TOO_DEEP");
+    expect(parseFeed(withElements(300_000)).episodes).toEqual([]);
+    expect(failure(() => parseFeed(withElements(300_001))).code).toBe("FEED_TOO_DEEP");
+  });
+
+  // 24 child tags is what a rich podcast item carries (enclosure, itunes
+  // tags, content:encoded and the like), so 2,000 of them pass 50,000 elements.
+  it("keeps 2,000 episodes of 24 child tags each, so the episode cap applies before the element cap (R2-8)", () => {
+    const extra = Array.from({ length: 22 }, (_, n) => `<tag${n}>x</tag${n}>`).join("");
+    const items = Array.from({ length: 2_000 }, (_, n) =>
+      item(`Episode ${n}`, new Date(Date.UTC(2010, 0, 1) + n * 86_400_000).toUTCString(), extra),
+    );
+    // The item's own tag plus title, pubDate and the 22 extra.
+    expect(items[0]!.match(/<(?!\/)[^>]+>/g)).toHaveLength(25);
+
+    expect(parseFeed(rss(items.join(""))).episodes).toHaveLength(2_000);
   });
 });

@@ -1,11 +1,12 @@
 // Covers pruneExpired on PGlite, which runs as its owner, including the MCP
-// key and counter rows. It does not cover
-// the app role being refused DELETE (roles.sql needs hosted Postgres) or the
-// time a prune takes on a large table.
+// key and counter rows and the runs nobody confirmed. It does not cover the
+// app role being refused DELETE (roles.sql needs hosted Postgres), a confirm
+// racing the prune on hosted Postgres, or the time a prune takes on a large
+// table.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { issueToken } from "../src/mcp/tokens.js";
 import { pruneExpired } from "../src/ops/prune.js";
-import { createRun } from "../src/server/runs.js";
+import { appendEvent, createRun, getRun, listEventsAfter, setRunStatus } from "../src/server/runs.js";
 import { cachePut } from "../src/store/cache.js";
 import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
@@ -18,7 +19,7 @@ const DAY_MS = 24 * HOUR_MS;
 const FAR_FUTURE = new Date("2099-01-01T00:00:00.000Z");
 const ago = (ms: number) => new Date(NOW.getTime() - ms);
 const hash = (n: number) => n.toString(16).padStart(64, "0");
-const NOTHING = { cacheRows: 0, secondBuckets: 0, visitorCounters: 0, mcpTokens: 0, mcpTokenDaily: 0, mcpKeyIssue: 0 };
+const NOTHING = { cacheRows: 0, secondBuckets: 0, visitorCounters: 0, mcpTokens: 0, mcpTokenDaily: 0, mcpKeyIssue: 0, confirmExpired: 0 };
 
 let db: Db;
 
@@ -125,6 +126,31 @@ describe("pruneExpired", () => {
     expect(issued.map((row) => row.visitor_hash)).toEqual([hash(3), hash(4)]);
     expect((await db.query("SELECT 1 FROM mcp_token_inflight")).rows).toEqual([]);
     expect((await db.query("SELECT 1 FROM runs WHERE id = $1::uuid", [runId])).rows).toHaveLength(1);
+    expect(await pruneExpired(db, NOW)).toEqual(NOTHING);
+  });
+
+  it("closes a run left awaiting its confirm for 2 hours as failed with CONFIRM_EXPIRED and its failed event, and leaves younger and running runs alone (C6.4)", async () => {
+    const input = { show: "Synthetic Show", exclude: [] };
+    const awaiting = async (createdAt: Date) => {
+      const runId = await createRun(db, input, createdAt);
+      await setRunStatus(db, runId, "awaiting_confirm", undefined, createdAt);
+      return runId;
+    };
+    const stale = await awaiting(ago(2 * HOUR_MS));
+    await appendEvent(db, stale, "candidates", { candidates: [] }, ago(2 * HOUR_MS));
+    const young = await awaiting(ago(30 * 60 * 1_000));
+    const running = await createRun(db, input, ago(2 * HOUR_MS));
+    await setRunStatus(db, running, "running", undefined, ago(2 * HOUR_MS));
+
+    expect(await pruneExpired(db, NOW)).toEqual({ ...NOTHING, confirmExpired: 1 });
+
+    expect(await getRun(db, stale)).toMatchObject({ status: "failed", errorCode: "CONFIRM_EXPIRED", finishedAt: NOW });
+    expect(await listEventsAfter(db, stale, 0)).toEqual([
+      { seq: 1, event: "candidates", data: { candidates: [] } },
+      { seq: 2, event: "failed", data: { code: "CONFIRM_EXPIRED" } },
+    ]);
+    expect((await getRun(db, young))?.status).toBe("awaiting_confirm");
+    expect((await getRun(db, running))?.status).toBe("running");
     expect(await pruneExpired(db, NOW)).toEqual(NOTHING);
   });
 

@@ -8,7 +8,7 @@ import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
 import { isPastGuest } from "./past-guests.js";
-import { checkProse, type ProseCheck, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "./prose.js";
+import { ACCUSATIONS_RULE, checkProse, isShowableTag, type ProseCheck, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "./prose.js";
 
 export type ToolName =
   | "people_for_show"
@@ -56,6 +56,10 @@ const RELEASES_TAKE = 20;
 const FIND_TAKE = 3;
 const COMPARE_TAKE = 10;
 const SHARED_TASTES_SHOWN = 5;
+// Must equal MAX_TAG_CHARS in board.ts, which cuts a longer tag to fit its
+// chip. A cut can end on a new whole word ("...Blackjack" becomes
+// "...Black"), so a longer tag is dropped here and the board never cuts one.
+const MAX_TAG_CHARS = 40;
 const SEGMENTS_SHOWN = 3;
 const WEEKS_OF_TREND = 12;
 const DAY_MS = 86_400_000;
@@ -94,11 +98,12 @@ type RejectReason = "unknown_person" | "duplicate" | NonNullable<ProseCheck["rea
 export const PICK_HINTS: Record<RejectReason, string> = Object.freeze({
   unknown_person: "Use a personId exactly as a tool returned it in this run.",
   duplicate: "Pick each person once.",
-  digits: "Write no digits: say numbers in words or leave them out. The app shows numbers itself.",
+  digits: "Leave numbers out, in digits and in words. The app shows numbers itself.",
   too_long: "Keep the angle under 200 characters.",
   empty: "Write one plain sentence.",
   trend_claim: `Qloo has no trend data right now, so do not call anyone ${TREND_CLAIM_WORDS}. A past breakout role or album is fine.`,
   sensitive_trait: SENSITIVE_TRAITS_RULE,
+  accusation: ACCUSATIONS_RULE,
 });
 
 const PersonId = z.string().min(1).max(64);
@@ -197,7 +202,7 @@ export function researchTools(opts: ToolOptions): Anthropic.Tool[] {
     ),
     toolDefinition(
       "recent_episode_titles",
-      "Titles of the show's recent episodes, so you can see what the show covers. Past guests are already left out of every list. Call it once.",
+      "Titles of the show's recent episodes, so you can see what the show covers. Call it once.",
       {},
     ),
     toolDefinition(
@@ -304,38 +309,53 @@ function sharedTagsOf({ tags, a, b }: QlooCompareResult): SharedTag[] {
   return shared;
 }
 
-// Qloo ranks people who have died as high as anyone, and they can never be
-// booked. Any death date that is not empty counts, including one in a shape
-// never seen, so an odd value drops the person rather than letting them in.
-function hasDied(entity: QlooEntity): boolean {
+/**
+ * True when a Qloo entity carries a death date. Qloo ranks people who have
+ * died as high as anyone, and they can never be booked. Any value that is not
+ * empty counts, including one in a shape never seen, so an odd value drops
+ * the person rather than letting them in.
+ */
+export function hasDied(entity: QlooEntity): boolean {
   const died = entity.properties?.date_of_death;
   return died !== undefined && died !== null && died !== "";
 }
 
+/** Takes a person out of the run and refuses their id for the rest of it (ctx.dropped). */
+export function dropPerson(ctx: RunContext, personId: string): void {
+  ctx.people.delete(personId);
+  ctx.dropped.add(personId);
+}
+
 // Every person a tool returns passes through here, so a person dropped here
 // never reaches the model, the board, compare or demographics. Past guests
-// stop here too: anyone an episode title of this show names is left out and
-// counted in ctx.pastGuests.skipped, so their id is one no tool returned and
-// every later tool refuses it as an unknown person with no Qloo call (C2.2).
+// stop here too: anyone an episode title or one of the show's own names
+// holds is left out and counted in ctx.pastGuests.skipped, so their id is
+// one no tool returned and every later tool refuses it as an unknown person
+// with no Qloo call (C2.2).
 function recordPerson(ctx: RunContext, entity: QlooEntity, affinity: number | null): { personId: string; name: string } | null {
   if (!QLOO_ID.test(entity.entity_id)) return null;
+  // A later answer may spell the name another way or leave the death date
+  // out, and neither makes a dropped person bookable again.
+  if (ctx.dropped.has(entity.entity_id)) return null;
   // A later answer can carry a death date an earlier one lacked; the person
   // then leaves the run, so the board never lists them.
   if (hasDied(entity)) {
-    ctx.people.delete(entity.entity_id);
+    dropPerson(ctx, entity.entity_id);
     return null;
   }
   const name = cleanField(entity.name, MAX_NAME_CHARS);
   if (name === "") return null;
   if (isPastGuest(ctx.pastGuests.index, name)) {
-    ctx.people.delete(entity.entity_id);
+    dropPerson(ctx, entity.entity_id);
     ctx.pastGuests.skipped.add(entity.entity_id);
     return null;
   }
   const popularity = isFiniteNumber(entity.popularity) ? entity.popularity : null;
   const known = ctx.people.get(entity.entity_id);
-  // The first affinity seen is kept, so the board's fit never changes under
-  // the model once it has been shown a number for this person.
+  // The first affinity seen is kept for the rest of research, so the number
+  // the model was shown for a person does not move between its calls. The
+  // runner's fit call then replaces it with one comparable fit per pick
+  // before the board is built.
   const record = {
     name: known?.name ?? name,
     affinity: known?.affinity ?? affinity,
@@ -423,6 +443,9 @@ const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
       return recordPerson(ctx, entity, isFiniteNumber(affinity) ? affinity : null);
     }),
   ).map(({ personId, name }) => {
+    // Qloo ranked this person for the show's audience, so the board does not
+    // hold them to the find_person fit floor.
+    ctx.listedForShow.add(personId);
     const record = ctx.people.get(personId);
     return {
       personId,
@@ -476,7 +499,10 @@ const sharedTaste: Handler<"shared_taste"> = async (ctx, qloo, input) => {
     b: [input.personId],
     take: COMPARE_TAKE,
   });
-  const tags = sharedTagsOf(compareOf(data));
+  // The one place shared tags are stored, so the board, the brief and the
+  // model all see only names that are whole and say nothing about who the
+  // person is (C3.10).
+  const tags = sharedTagsOf(compareOf(data)).filter((tag) => [...tag.name].length <= MAX_TAG_CHARS && isShowableTag(tag.name));
   ctx.compares.set(input.personId, tags);
   const top = [...tags]
     .sort((a, b) => (a.score === b.score ? 0 : a.score === null ? 1 : b.score === null ? -1 : b.score - a.score))

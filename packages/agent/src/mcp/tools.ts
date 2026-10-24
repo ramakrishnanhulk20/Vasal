@@ -103,6 +103,9 @@ const LISTED = {
 };
 
 const READS: ToolAnnotations = { readOnlyHint: true, openWorldHint: true };
+// Each call spends one of the key's daily finds and writes a new run, so a
+// repeat is not free and not idempotent, though it deletes nothing (G6).
+const SPENDS: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 // A repeat call returns the same run or brief, so these are idempotent, and
 // they never delete anything (D3.4, D3.5).
 const WRITES: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
@@ -167,8 +170,9 @@ async function pollUntil(
  * book_guests, get_board and write_brief (D2.4). Each lists its strict input
  * JSON Schema and its output schema from results.ts, a fixed description
  * that says results hold third-party text, and truthful annotations:
- * find_show and get_board read-only, book_guests and write_brief not, all
- * four open-world.
+ * get_board read-only; find_show, book_guests and write_brief not, and
+ * find_show not idempotent either, since each call spends a find; all four
+ * open-world.
  *
  * Every handler parses its arguments strictly (an extra key or a wrong type
  * is invalid_input), catches everything, and answers a results.ts object or
@@ -176,7 +180,10 @@ async function pollUntil(
  * looked up only for the calling key, so another key's, a website run's and
  * an unknown id are all not_found (D4.1). A run whose agent call rejects is
  * marked failed with AGENT_ERROR unless the agent already ended it, so no
- * run is left looking alive (C6.4). write_brief with an agent that is not
+ * run is left looking alive (C6.4). find_show holds MCP's slot pair
+ * (acquireMcpRunSlots) from before it counts the find until its run's
+ * candidates are read back, and answers busy at once, spending nothing, when
+ * the pair is taken (D3.3, D3.7). write_brief with an agent that is not
  * ready answers upstream_failed before it counts or claims anything. Must be
  * called before the server connects. Never throws.
  */
@@ -260,30 +267,40 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
 
   server.registerTool(
     "find_show",
-    { title: "Find a show", description: DESCRIPTIONS.find_show, inputSchema: LISTED.find_show, outputSchema: findShowOutput, annotations: READS },
+    { title: "Find a show", description: DESCRIPTIONS.find_show, inputSchema: LISTED.find_show, outputSchema: findShowOutput, annotations: SPENDS },
     guarded("find_show", findShowInput, async ({ query }) => {
       if (!(await liveRunsEnabled(db))) return errorReply("mcp_off");
-      if (!(await countTokenUse(db, tokenId, "finds", MCP_LIMITS.findsPerDay, now()))) return errorReply("budget_exhausted");
-      // Exactly what a website run starts from, through the same resolver
-      // the website uses (D4.3, D4.4).
-      const input: RunInput = { show: query, exclude: [] };
-      const runId = await createRun(db, input, now(), { surface: "mcp", tokenId });
+      // startRun searches Apple or fetches a pasted feed, so it holds MCP's
+      // one place among the site's run places, the pair book_guests takes:
+      // every key together runs one lookup at a time and never crowds out
+      // the website (D3.3, D3.7). Taken before the daily find is counted, so
+      // a busy answer spends nothing.
+      if (!(await acquireMcpRunSlots(db, MCP_RUN_SLOTS, config.maxInflightRuns))) return errorReply("busy");
       try {
-        await agent.startRun(runId, input);
-      } catch (error) {
-        logFailure("find_show", error);
-        await failRun(runId);
+        if (!(await countTokenUse(db, tokenId, "finds", MCP_LIMITS.findsPerDay, now()))) return errorReply("budget_exhausted");
+        // Exactly what a website run starts from, through the same resolver
+        // the website uses (D4.3, D4.4).
+        const input: RunInput = { show: query, exclude: [] };
+        const runId = await createRun(db, input, now(), { surface: "mcp", tokenId });
+        try {
+          await agent.startRun(runId, input);
+        } catch (error) {
+          logFailure("find_show", error);
+          await failRun(runId);
+        }
+        const run = await getRunForToken(db, runId, tokenId);
+        if (run === null) return errorReply("upstream_failed");
+        if (run.status === "failed") return errorReply(runFailureCode(run.errorCode));
+        // startRun settled without handing over candidates or ending the run, so
+        // nothing will move it on, and it must not be left looking alive (C6.4).
+        if (run.status !== "awaiting_confirm") {
+          await failRun(runId);
+          return errorReply("upstream_failed");
+        }
+        return candidatesReply(await listCandidates(db, runId));
+      } finally {
+        await releaseMcpRunSlots(db);
       }
-      const run = await getRunForToken(db, runId, tokenId);
-      if (run === null) return errorReply("upstream_failed");
-      if (run.status === "failed") return errorReply(runFailureCode(run.errorCode));
-      // startRun settled without handing over candidates or ending the run, so
-      // nothing will move it on, and it must not be left looking alive (C6.4).
-      if (run.status !== "awaiting_confirm") {
-        await failRun(runId);
-        return errorReply("upstream_failed");
-      }
-      return candidatesReply(await listCandidates(db, runId));
     }),
   );
 

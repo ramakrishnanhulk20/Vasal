@@ -21,6 +21,7 @@ import { KEYS_BUCKET } from "../../src/server/keys-route.js";
 import { claimBrief, claimRunStatus, createRun, finishRun, getRun, putBoard, setRunStatus } from "../../src/server/runs.js";
 import type { Db } from "../../src/store/db.js";
 import { QLOO_PER_SECOND_CAP, reserve, setBucket, usage, waitForQlooSlot } from "../../src/store/meter.js";
+import { storeBriefs } from "../helpers/briefs.js";
 import { CONTENDERS, freshSchema, HOSTED_URL, openContenders, race, trackRun } from "./harness.js";
 
 const SECRET = "s".repeat(32);
@@ -238,6 +239,7 @@ describe.skipIf(HOSTED_URL === undefined)("hosted races (C5, D3)", () => {
   it("promote: one run per position", async () => {
     await freshSchema(admin);
     const runs = await Promise.all(contenders.map((db) => doneRun(db)));
+    for (const run of runs) await storeBriefs(admin, run.runId, run.guestIds);
 
     const results = await race(contenders, (db, i) => promoteRun(db, runs[i]!.runId, 1));
 

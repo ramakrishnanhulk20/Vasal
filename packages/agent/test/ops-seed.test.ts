@@ -1,21 +1,35 @@
 // Covers the operator's seed in src/ops/seed.ts on PGlite: which buckets its
 // meter charges, the preview, a picked run end to end through the real agent
-// runner with the shared fakes, the closes for a missing pick and a missing
-// show, and the seed arguments of scripts/ops.ts. It does not cover
-// createSeedAgent's real Qloo, Anthropic, directory or feed calls (the
-// operator's first live seed does), runSeed's printed report, or a deploy's
-// restart sweep failing a seed run mid-way.
+// runner with the shared fakes, its briefs and the briefs command's writer,
+// the closes for a missing pick and a missing show, and the seed and briefs
+// arguments of scripts/ops.ts. It does not cover createSeedAgent's real
+// Qloo, Anthropic, directory or feed calls (the operator's first live seed
+// does), runSeed's and runBriefs's printed reports, or a deploy's restart
+// sweep failing a seed run or a brief mid-way.
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readArgs } from "../scripts/ops.js";
 import { loadPolicy } from "../src/ops/policy.js";
-import { previewRun } from "../src/ops/promote.js";
+import { previewRun, readBriefs } from "../src/ops/promote.js";
 import { rollBuckets } from "../src/ops/roll.js";
-import { seedAgentFrom, seedMeterHooks, seedShow, type SeedAgent } from "../src/ops/seed.js";
-import { getRun, listBoard, listEventsAfter } from "../src/server/runs.js";
+import { seedAgentFrom, seedMeterHooks, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import {
+  claimBrief,
+  createRun,
+  finishRun,
+  getBrief,
+  getBriefClaim,
+  getRun,
+  listBoard,
+  listEventsAfter,
+  markBriefFailed,
+  putBoard,
+  setRunStatus,
+} from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { usage } from "../src/store/meter.js";
 import { fakeFeeds, fakeModel, fakeQloo } from "./helpers/agent-fakes.js";
+import { BRIEF_DRAFT } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
 const POLICY_FILE = fileURLToPath(new URL("../scripts/budget-policy.json", import.meta.url));
@@ -33,8 +47,24 @@ afterEach(async () => {
 });
 
 function fakeSeedAgent(feeds = fakeFeeds().feeds): SeedAgent {
-  return seedAgentFrom(db, { qloo: fakeQloo().qloo, model: fakeModel().model, feeds, trends: false });
+  return seedAgentFrom(db, { qloo: fakeQloo().qloo, model: fakeModel(BRIEF_DRAFT).model, feeds, trends: false });
 }
+
+// Seven guests in the runner's board shape, two more than a visitor's run
+// may brief (C7.3).
+const SEVEN_GUESTS = Array.from({ length: 7 }, (_, index) => ({
+  personId: `00000000-0000-4000-8000-0000000008${String(index + 1).padStart(2, "0")}`,
+  name: `Synthetic Guest ${index + 1}`,
+  fit: 0.5,
+  fitKnown: true,
+  fitRank: index + 1,
+  reach: "bookable",
+  rising: { state: "steady", points: 0 },
+  bringsNew: null,
+  sharedTags: [],
+  angle: "A synthetic angle.",
+  showName: SHOW,
+}));
 
 async function runCount(): Promise<number> {
   const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM runs");
@@ -91,7 +121,38 @@ describe("seed", () => {
     expect(outcome.guests).toBeGreaterThanOrEqual(3);
     expect(outcome.guests).toBe((await listBoard(db, outcome.runId)).length);
     expect(outcome.pastGuests).toEqual({ checked: true, skipped: 0 });
+    expect(outcome.briefs.guests.map((guest) => guest.state.kind)).toEqual(Array.from({ length: outcome.guests }, () => "written"));
     expect((await previewRun(db, outcome.runId)).refusal).toBeNull();
+  });
+
+  it("writeBriefs writes all 7 briefs of a done 7-guest board, past the website's 5, and retries a claim that failed once", async () => {
+    const runId = await createRun(db, { show: SHOW, exclude: [] });
+    await setRunStatus(db, runId, "running");
+    const guestIds = await putBoard(db, runId, SEVEN_GUESTS);
+    await finishRun(db, runId, "done", { name: "done", data: { guests: 7 } });
+    const retried = guestIds[6]!;
+    expect(await claimBrief(db, runId, retried, 5)).toBe("claimed");
+    expect(await markBriefFailed(db, runId, retried, "MODEL_TIMEOUT")).toBe(true);
+
+    const before = await readBriefs(db, runId);
+    expect(before.guests.map((guest) => guest.state)).toEqual([
+      ...Array.from({ length: 6 }, () => ({ kind: "none" })),
+      { kind: "retry", code: "MODEL_TIMEOUT" },
+    ]);
+
+    const after = await writeBriefs(db, fakeSeedAgent().runner, runId);
+
+    expect(after.guests.map((guest) => guest.state.kind)).toEqual(Array.from({ length: 7 }, () => "written"));
+    for (const [index, guestId] of guestIds.entries()) {
+      expect(await getBrief(db, runId, guestId)).toMatchObject({
+        why: `Synthetic Guest ${index + 1} has 50% fit with ${SHOW} listeners.`,
+        pitch_subject: `${SHOW} would love to have Synthetic Guest ${index + 1}`,
+      });
+    }
+    expect(await getBriefClaim(db, runId, retried)).toEqual({ status: "done", attempts: 2, errorCode: null });
+    const { rows } = await db.query("SELECT count(*)::int AS n FROM run_brief_claims WHERE run_id = $1::uuid AND status = 'done'", [runId]);
+    expect(rows).toEqual([{ n: 7 }]);
+    expect((await previewRun(db, runId)).refusal).toBeNull();
   });
 
   it("a pick past the list closes the run as SEED_PICK_MISSING", async () => {
@@ -141,6 +202,20 @@ describe("ops.ts seed arguments", () => {
       ["health", "--pick", "1"],
       ["promote", "00000000-0000-4000-8000-000000000700", "1", "--pick", "1"],
     ]) {
+      expect(readArgs(argv), argv.join(" ")).toBeUndefined();
+    }
+  });
+
+  it("readArgs accepts briefs with a run id and an optional --yes, and refuses anything else", () => {
+    const runId = "00000000-0000-4000-8000-000000000700";
+    expect(readArgs(["briefs", runId])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "briefs", runId, yes: false } });
+    expect(readArgs(["--tunnel", "55432", "briefs", runId, "--yes"])).toEqual({
+      dev: false,
+      tunnelPort: 55432,
+      command: { name: "briefs", runId, yes: true },
+    });
+
+    for (const argv of [["briefs"], ["briefs", runId, "extra"], ["briefs", runId, "--apply"], ["briefs", runId, "--pick", "1"]]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
   });

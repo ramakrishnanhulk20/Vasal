@@ -1,11 +1,14 @@
 // Covers healthReport and formatHealth on PGlite, and on a pg pool pointed at
 // a closed local port to stand in for an unreachable database. It does not
-// cover a hosted Postgres that answers slowly, or the app role's read grants.
+// cover a hosted Postgres that answers slowly, the app role's read grants, or
+// a counter read at the very moment a run takes or gives back its place.
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { issueToken, MCP_ENABLED_FLAG, revokeToken } from "../src/mcp/tokens.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
+import { parsePolicy } from "../src/ops/policy.js";
 import { acquireMcpRunSlots } from "../src/server/caps.js";
+import { createRun, setRunStatus } from "../src/server/runs.js";
 import { cachePut } from "../src/store/cache.js";
 import { createPgDb, type Db } from "../src/store/db.js";
 import { setFlag } from "../src/store/flags.js";
@@ -16,6 +19,8 @@ const NOW = new Date("2026-10-19T12:00:00.000Z");
 const HOUR_MS = 60 * 60 * 1_000;
 const FAR_FUTURE = new Date("2099-01-01T00:00:00.000Z");
 const MARKER = "MARKERq7z";
+const policyUntil = (to: string) => parsePolicy({ profiles: [{ from: "2026-10-01", to, buckets: [{ key: "qloo:day", window: "day", cap: 1 }] }] });
+const COVERED = policyUntil("2099-01-01");
 
 let db: Db;
 
@@ -52,7 +57,7 @@ describe("healthReport", () => {
     await addRun("done", new Date(NOW.getTime() - 25 * HOUR_MS));
     await cachePut(db, "k1", { n: 1 }, HOUR_MS, NOW);
 
-    const report = await healthReport(db, NOW);
+    const report = await healthReport(db, NOW, COVERED);
 
     expect(report).toEqual({
       checkedAt: NOW.toISOString(),
@@ -76,17 +81,54 @@ describe("healthReport", () => {
   it("shows MCP's in-progress runs apart from the site's, and flags a missing MCP counter", async () => {
     await healthySite();
     expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+    const { id: tokenId } = await issueToken(db);
+    const mcpRun = await createRun(db, { show: "Synthetic Show", exclude: [] }, NOW, { surface: "mcp", tokenId });
+    await setRunStatus(db, mcpRun, "running", undefined, NOW);
 
-    const busy = await healthReport(db, NOW);
+    const busy = await healthReport(db, NOW, COVERED);
 
     expect([busy.inflight, busy.mcpInflight]).toEqual([1, 1]);
     expect(formatHealth(busy)).toEqual(expect.arrayContaining(["  Runs in progress: 1", "  MCP runs in progress: 1"]));
 
     await db.query("DELETE FROM inflight WHERE slot = 'mcp'");
-    const missing = await healthReport(db, NOW);
+    const missing = await healthReport(db, NOW, COVERED);
 
     expect(missing.mcpInflight).toBeNull();
     expect(missing.problems).toEqual(["The MCP in-progress run counter could not be read, so no MCP run can start."]);
+  });
+
+  it("flags an in-progress counter above 0 while no run is queued or running, for the site and for MCP (G23)", async () => {
+    await healthySite();
+    await db.query("UPDATE inflight SET n = 1");
+    const lostSite =
+      "The in-progress run counter is at 1, but no run is queued or running, so 1 of the site's run places is lost. If the next health check shows it too, restart the agent server, which resets the counter.";
+    const lostMcp =
+      "The MCP in-progress run counter is at 1, but no MCP run is queued or running, so 1 of MCP's run places is lost. If the next health check shows it too, restart the agent server, which resets the counter.";
+
+    expect((await healthReport(db, NOW, COVERED)).problems).toEqual([lostSite, lostMcp]);
+
+    const webRun = await createRun(db, { show: "Synthetic Show", exclude: [] }, NOW);
+    await setRunStatus(db, webRun, "running", undefined, NOW);
+    expect((await healthReport(db, NOW, COVERED)).problems).toEqual([lostMcp]);
+
+    const { id: tokenId } = await issueToken(db);
+    await createRun(db, { show: "Synthetic Show", exclude: [] }, NOW, { surface: "mcp", tokenId });
+    expect((await healthReport(db, NOW, COVERED)).problems).toEqual([]);
+  });
+
+  it("flags the first day in the next 14 that no budget profile covers, and a policy that could not be read", async () => {
+    await healthySite();
+    const gap =
+      "No profile in scripts/budget-policy.json covers 2026-10-29, in 10 days. Add one before then, or from that day the budgets command sets nothing and every bucket fails closed once its window ends.";
+
+    expect((await healthReport(db, NOW, policyUntil("2026-10-29"))).problems).toEqual([gap]);
+    expect((await healthReport(db, NOW, policyUntil("2026-11-03"))).problems).toEqual([]);
+    expect((await healthReport(db, NOW, policyUntil("2026-11-02"))).problems).toEqual([
+      "No profile in scripts/budget-policy.json covers 2026-11-02, in 14 days. Add one before then, or from that day the budgets command sets nothing and every bucket fails closed once its window ends.",
+    ]);
+    expect((await healthReport(db, NOW, null)).problems).toEqual([
+      "The budget policy file could not be read, so the next 14 days' budgets could not be checked.",
+    ]);
   });
 
   it("flags a bucket at 80 percent but not one just under it", async () => {
@@ -95,7 +137,7 @@ describe("healthReport", () => {
     await setBucket(db, { key: "anthropic:day", cap: 1_000, windowEnd: FAR_FUTURE });
     await reserve(db, [{ key: "youtube:day", amount: 80 }, { key: "anthropic:day", amount: 799 }], NOW);
 
-    const { problems } = await healthReport(db, NOW);
+    const { problems } = await healthReport(db, NOW, COVERED);
 
     expect(problems).toEqual(["youtube:day: 80% used (80 of 100)."]);
   });
@@ -105,7 +147,7 @@ describe("healthReport", () => {
     await setBucket(db, { key: "youtube:day", cap: 100, windowEnd: NOW });
     await setBucket(db, { key: "qloo:day:offline", cap: 0, windowEnd: FAR_FUTURE });
 
-    const report = await healthReport(db, NOW);
+    const report = await healthReport(db, NOW, COVERED);
 
     expect(report.buckets?.find((bucket) => bucket.key === "youtube:day")?.windowEnded).toBe(true);
     expect(report.problems).toEqual([
@@ -116,9 +158,9 @@ describe("healthReport", () => {
 
   it("flags live runs off, whether the flag is false or was never set", async () => {
     await setBucket(db, { key: "qloo:day", cap: 300, windowEnd: FAR_FUTURE });
-    const never = await healthReport(db, NOW);
+    const never = await healthReport(db, NOW, COVERED);
     await setFlag(db, "live_runs", false);
-    const off = await healthReport(db, NOW);
+    const off = await healthReport(db, NOW, COVERED);
 
     for (const report of [never, off]) {
       expect(report.liveRuns).toBe(false);
@@ -128,13 +170,13 @@ describe("healthReport", () => {
 
   it("flags an empty budget table and leaves per-second buckets out of the list", async () => {
     await setFlag(db, "live_runs", true);
-    expect((await healthReport(db, NOW)).problems).toEqual([
+    expect((await healthReport(db, NOW, COVERED)).problems).toEqual([
       "No budget buckets are set, so every metered call is refused. Run the budgets command.",
     ]);
 
     await healthySite();
     expect(await reserveQlooCall(db, NOW)).toBe(true);
-    const report = await healthReport(db, new Date(NOW.getTime() + 10_000));
+    const report = await healthReport(db, new Date(NOW.getTime() + 10_000), COVERED);
     expect(report.buckets?.map((bucket) => bucket.key)).toEqual(["qloo:day", "qloo:month"]);
     expect(report.problems).toEqual([]);
   });
@@ -150,14 +192,14 @@ describe("healthReport", () => {
       [expired.id],
     );
 
-    const off = await healthReport(db, NOW);
+    const off = await healthReport(db, NOW, COVERED);
     expect(off.mcp).toBe(false);
     expect(off.agentKeys).toEqual({ live: 1, revoked: 1 });
     expect(off.problems).toEqual([]);
     expect(formatHealth(off)).toContain("  MCP: off, so no agent key is issued and every MCP request is refused");
 
     await setFlag(db, MCP_ENABLED_FLAG, true);
-    const on = await healthReport(db, NOW);
+    const on = await healthReport(db, NOW, COVERED);
     expect(on.mcp).toBe(true);
     const lines = formatHealth(on);
     expect(lines).toContain("  MCP: on");
@@ -178,7 +220,7 @@ describe("healthReport", () => {
       close: async () => {},
     };
 
-    const report = await healthReport(keysFail, NOW);
+    const report = await healthReport(keysFail, NOW, COVERED);
 
     expect(report.agentKeys).toBeNull();
     expect(report.problems).toEqual(["The agent key table could not be read."]);
@@ -190,7 +232,7 @@ describe("healthReport", () => {
     // without leaving this machine.
     const unreachable = createPgDb(`postgres://${MARKER}user:${MARKER}pass@127.0.0.1:1/${MARKER}db`);
     try {
-      const report = await healthReport(unreachable, NOW);
+      const report = await healthReport(unreachable, NOW, COVERED);
 
       expect(report.databaseReachable).toBe(false);
       expect(report.problems).toEqual(["The database could not be reached, so no run can start and no metered call can go out."]);
@@ -213,7 +255,7 @@ describe("healthReport", () => {
       close: async () => {},
     };
 
-    const report = await healthReport(broken, NOW);
+    const report = await healthReport(broken, NOW, COVERED);
 
     expect(report.databaseReachable).toBe(false);
     expect(JSON.stringify(report)).not.toContain(MARKER);

@@ -83,6 +83,9 @@ const MAX_VIDEO_IDS = MAX_ITEMS_LIMIT;
 const PRINTABLE_ASCII = /^[\x21-\x7E]+$/;
 
 const QUOTA_REASONS: ReadonlySet<string> = new Set(["quotaExceeded", "dailyLimitExceeded"]);
+// A short-term rate limit says nothing about the key, so a 403 with one of
+// these gets the code a 429 gets, not YT_AUTH.
+const RATE_LIMIT_REASONS: ReadonlySet<string> = new Set(["rateLimitExceeded", "userRateLimitExceeded"]);
 const ERROR_INFO_TYPE = "type.googleapis.com/google.rpc.ErrorInfo";
 
 const ErrorBody = z
@@ -130,7 +133,9 @@ function codeForFailure(status: number, body: string | undefined): YouTubeErrorC
   if (status === 404) return "YT_NOT_FOUND";
   if (status === 403) {
     const { first } = readReasons(body);
-    return first !== undefined && QUOTA_REASONS.has(first) ? "YT_QUOTA" : "YT_AUTH";
+    if (first !== undefined && QUOTA_REASONS.has(first)) return "YT_QUOTA";
+    if (first !== undefined && RATE_LIMIT_REASONS.has(first)) return "YT_UPSTREAM";
+    return "YT_AUTH";
   }
   if (status === 400) {
     const { first, apiKeyInvalid } = readReasons(body);

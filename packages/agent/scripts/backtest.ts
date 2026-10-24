@@ -1,8 +1,9 @@
 // The offline backtest: does Qloo guest fit predict YouTube views? The
 // method is fixed in docs/backtest-preregistration.md. With no flag it pulls
 // the data for real and analyses it; a dry run checks the pinned show list
-// and prints the plan with no network and no keys; --analyse recomputes
-// every published number from a stored dataset.
+// and prints the plan with no network and no keys; --analyse recomputes the
+// pre-registered results from a stored dataset. The post-hoc checks are
+// recomputed by scripts/backtest-robustness.ts.
 //
 // The live pull spends the offline Qloo share (qloo:day:offline, still inside
 // the shared month and per-second limits) through the same metered client as
@@ -49,6 +50,10 @@ const USAGE = [
 const LIVE_KEYS = ["QLOO_API_KEY", "YOUTUBE_API_KEY", "ANTHROPIC_API_KEY"] as const;
 const OWNER_DB = "OWNER_DATABASE_URL";
 const OFFLINE_QLOO_DAY = "qloo:day:offline";
+// The live server takes 8 of Qloo's 10 calls a second, and an offline script
+// outside the hosted meter takes the other 2. A --dev-db pull meters itself
+// in a throwaway database the server never sees, so it holds itself to 2.
+const DEV_DB_PER_SECOND_CAP = 2;
 const YOUTUBE_DAY = "youtube:day";
 // The backtest's title reads draw on their own token share, so a data pull can
 // never use up the day's tokens that live runs on the site depend on.
@@ -306,11 +311,12 @@ async function runLive(limitShows: number | null, devDb: boolean): Promise<numbe
     // No retries inside the client, so every Qloo attempt takes its own slot
     // from the offline share of the shared meter (C5.1, C5.2).
     const client = createQlooClient({ apiKey: qlooKey, baseUrl: qlooConfig.baseUrl, maxRetries: 0 });
+    const slot = devDb ? { dayKey: OFFLINE_QLOO_DAY, perSecondCap: DEV_DB_PER_SECOND_CAP } : { dayKey: OFFLINE_QLOO_DAY };
     const qloo = createMeteredQloo({
       client,
       db: store,
       baseUrl: qlooConfig.baseUrl,
-      waitForSlot: (target) => waitForQlooSlot(target, { dayKey: OFFLINE_QLOO_DAY }),
+      waitForSlot: (target) => waitForQlooSlot(target, slot),
     });
     const youtube = createYouTubeClient({
       apiKey: youtubeKey,

@@ -9,6 +9,7 @@ import { createQlooClient } from "../qloo/client.js";
 import { createMeteredQloo, type MeteredQloo } from "../qloo/metered.js";
 import type { AgentPort } from "../server/agent-port.js";
 import {
+  claimBrief,
   claimRunStatus,
   createRun,
   finishRun,
@@ -20,7 +21,7 @@ import {
 } from "../server/runs.js";
 import type { Db } from "../store/db.js";
 import { reserve, waitForQlooSlot } from "../store/meter.js";
-import { previewRun } from "./promote.js";
+import { isWritable, readBriefs, type RunBriefs } from "./promote.js";
 
 /** The Qloo day share the seed spends from. Every call also counts against qloo:month and the per-second limit (C5.1). */
 export const SEED_QLOO_DAY = "qloo:day:offline";
@@ -44,11 +45,19 @@ export type SeedAgent = { preview(show: string): Promise<SeedCandidate[]>; runne
 /**
  * How seedShow ended. A failed outcome carries only a fixed upper-case code,
  * never error text (C3.6). A done outcome's pastGuests is read from the run's
- * done event, and is null when that event has none or it cannot be read.
+ * done event, and is null when that event has none or it cannot be read. Its
+ * briefs are where every board guest's brief stood after writeBriefs.
  */
 export type SeedOutcome =
   | { kind: "preview"; candidates: SeedCandidate[] }
-  | { kind: "done"; runId: string; picked: SeedCandidate; guests: number; pastGuests: { checked: boolean; skipped: number } | null }
+  | {
+      kind: "done";
+      runId: string;
+      picked: SeedCandidate;
+      guests: number;
+      pastGuests: { checked: boolean; skipped: number } | null;
+      briefs: RunBriefs;
+    }
   | { kind: "failed"; runId: string | null; code: string };
 
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
@@ -72,6 +81,12 @@ const CandidateRow = z
 // A run holds at most 500 events (appendEvent in server/runs.ts), so one page
 // this size always reaches its done event.
 const RUN_EVENT_PAGE = 500;
+// A brief is at most two drafts of 45 seconds each (agent/brief.ts), and a
+// board at most 10 guests (finish_board), so 3 at a time finish within 6
+// minutes even if every draft runs to its limit, inside the 10 minutes an ops
+// command gets. Few at once, because a rate-limited call still fails its
+// attempt and a guest has only two.
+const BRIEF_WRITERS = 3;
 
 // Read back through a schema like any stored row, so a done event written
 // before past guests were counted, or one that does not fit, reads as null
@@ -194,6 +209,41 @@ export function createSeedAgent(
 }
 
 /**
+ * Operator use, on the owner connection, before a run is promoted (C6.3).
+ * For a done run, claims every board guest's brief that readBriefs marks
+ * writable (never claimed, or failed on its first attempt, whose claim
+ * claimBrief moves back to pending as the website's second attempt would)
+ * with the per-run limit set to the board's size, so no guest is left out by
+ * the website's limit of 5, and calls runner.writeBrief for each claim it
+ * wins, 3 at a time. Spending is whatever the runner's model charges; from
+ * createSeedAgent that is anthropic:day:offline alone, since writing a brief
+ * calls no Qloo tool. A run that is not done, or a runner whose ready is
+ * false, is read and left alone. Every claim and write that throws is
+ * dropped, because the claim row read back afterwards is the outcome, and a
+ * claim the runner left pending stays pending. Returns readBriefs after the
+ * writes. Throws as readBriefs does, so a database that fails on the last
+ * read fails the command.
+ */
+export async function writeBriefs(db: Db, runner: Pick<AgentPort, "ready" | "writeBrief">, runId: string): Promise<RunBriefs> {
+  const before = await readBriefs(db, runId);
+  const queue = before.guests.filter((guest) => isWritable(guest.state));
+  if (before.status !== "done" || runner.ready === false || queue.length === 0) return before;
+  const boardSize = before.guests.length;
+  const writeNext = async (): Promise<void> => {
+    for (let guest = queue.shift(); guest !== undefined; guest = queue.shift()) {
+      try {
+        if ((await claimBrief(db, before.runId, guest.id, boardSize)) === "claimed") await runner.writeBrief(before.runId, guest.id);
+      } catch {
+        // The runner has already stored any known failure as the claim's code
+        // and marked an unknown one UNEXPECTED, so no error text is kept.
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(BRIEF_WRITERS, queue.length) }, writeNext));
+  return readBriefs(db, runId);
+}
+
+/**
  * Builds one showcase run the way a visitor's run is built, without the
  * website door. With `pick` undefined it only previews: it returns the
  * candidates agent.preview finds and writes nothing, or, on any error, a
@@ -202,9 +252,12 @@ export function createSeedAgent(
  * run (createRun's default origin, like the website), runs startRun, and if
  * the run is then awaiting_confirm it takes the stored candidate at rank
  * `pick`, claims the run from awaiting_confirm to running as the confirm
- * route does, runs continueRun on that candidate, and returns done with the
- * pick, the board's guest count and the done event's pastGuests (null when
- * absent or unreadable). Each outcome is read from the run row and its
+ * route does, runs continueRun on that candidate, writes the board's briefs
+ * through writeBriefs with the same runner, and returns done with the pick,
+ * the board's guest count, the done event's pastGuests (null when absent or
+ * unreadable) and the briefs as they then stand; a brief that failed leaves
+ * the outcome done, and promote refuses the run until it is written. Each
+ * outcome is read from the run row and its
  * events, never from what the runner returned or threw. A run that failed in the
  * runner returns its own code. A run left open is closed as failed with
  * SEED_UNEXPECTED_STATUS, and a pick that is not a stored, readable
@@ -219,7 +272,7 @@ export function createSeedAgent(
  * that with ops promote. Throws ServerError("SRV_BAD_INPUT") for a show
  * createRun refuses, ServerError("SRV_UNAVAILABLE") if the database fails,
  * ServerError("SRV_NOT_FOUND") if a run it closes was closed by another
- * writer first, and PromoteError or StoreError from the board count.
+ * writer first, and PromoteError or StoreError from reading the briefs.
  */
 export async function seedShow(db: Db, agent: SeedAgent, show: string, pick: number | undefined): Promise<SeedOutcome> {
   if (pick === undefined) {
@@ -265,8 +318,8 @@ export async function seedShow(db: Db, agent: SeedAgent, show: string, pick: num
   }
   const finished = await getRun(db, runId);
   if (finished?.status === "done") {
-    const { board } = await previewRun(db, runId);
-    return { kind: "done", runId, picked, guests: board.length, pastGuests: await pastGuestsOf(db, runId) };
+    const briefs = await writeBriefs(db, agent.runner, runId);
+    return { kind: "done", runId, picked, guests: briefs.guests.length, pastGuests: await pastGuestsOf(db, runId), briefs };
   }
   if (isOpen(finished)) return closeFailed(db, runId, SEED_UNEXPECTED_STATUS);
   return { kind: "failed", runId, code: finished?.errorCode ?? SEED_UNEXPECTED_STATUS };

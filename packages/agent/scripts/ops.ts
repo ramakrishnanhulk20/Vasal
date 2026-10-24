@@ -33,23 +33,28 @@ import {
   tunnelPortFrom,
 } from "../src/ops/db.js";
 import { formatHealth, healthReport } from "../src/ops/health.js";
-import { loadPolicy, PolicyError } from "../src/ops/policy.js";
+import { loadPolicy, PolicyError, type BudgetPolicy } from "../src/ops/policy.js";
 import {
   checkPosition,
+  formatBriefs,
   formatPreview,
   formatPromoted,
+  isWritable,
   listPromoted,
   previewRun,
   PromoteError,
   promoteRun,
+  readBriefs,
   unpromoteRun,
+  type RunBriefs,
 } from "../src/ops/promote.js";
 import { pruneExpired } from "../src/ops/prune.js";
 import { rollBuckets, type BucketRoll, type BucketState } from "../src/ops/roll.js";
-import { createSeedAgent, seedShow } from "../src/ops/seed.js";
-import { loadAgentSettings } from "../src/server/config.js";
+import { createSeedAgent, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import type { AgentPort } from "../src/server/agent-port.js";
+import { loadAgentSettings, type AgentSettings } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
-import { createRun, finishRun, listShowcase, putBoard, setRunStatus } from "../src/server/runs.js";
+import { createRun, finishRun, listShowcase, markBriefDone, putBoard, putBrief, setRunStatus } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
 import { liveRunsEnabled, setFlag } from "../src/store/flags.js";
@@ -67,7 +72,10 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   budgets                 set today's caps from scripts/budget-policy.json (run daily, after
                           00:00 UTC; each window stays open until 02:00 UTC for a late run)
   prune                   delete expired cache rows, per-second buckets, old visitor and MCP
-                          counters, and agent keys expired over a week that no run points to
+                          counters, and agent keys expired over a week that no run points to,
+                          and close runs left awaiting a confirm over an hour as CONFIRM_EXPIRED
+  nightly                 budgets, then prune, always both; exits 1 if either failed. The
+                          scheduled job runs this
   flag live-runs on|off   switch live runs on the site on or off
   flag mcp on|off         switch the MCP door on or off: key issue and every MCP request
   health                  print the health report
@@ -78,13 +86,18 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
                           print a run's board; with --yes, put it on the home page at position 1 to 12
   seed "<show>" [--pick N]
                           preview the shows that match, writing nothing; with --pick, run the
-                          real agent on candidate N and build a board for promote. It spends
-                          only qloo:day:offline, qloo:month and anthropic:day:offline
+                          real agent on candidate N, build a board and write and print every
+                          guest's brief for promote. It spends only qloo:day:offline,
+                          qloo:month and anthropic:day:offline
+  briefs <runId> [--yes]  list the board guests of a done run that lack a brief; with --yes,
+                          write them with the real agent and print every brief in full. It
+                          spends only anthropic:day:offline
   unpromote <runId>       take a run off the home page
   showcase                list the runs on the home page
   selftest                with --dev only: budgets, health, flag live-runs off, health, then
-                          promote, list and unpromote a synthetic finished run, then flag mcp
-                          on, mcp list, mcp revoke and mcp revoke-all on synthetic keys
+                          briefs with a synthetic writer, promote, list and unpromote a
+                          synthetic finished run, then flag mcp on, mcp list, mcp revoke and
+                          mcp revoke-all on synthetic keys
 
 --dev uses a throwaway in-memory database with the schema applied and live
 runs on. Without it bootstrap needs BOOTSTRAP_DATABASE_URL, and every other
@@ -92,11 +105,11 @@ command except roles without --apply needs OWNER_DATABASE_URL.
 --tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
 database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
 as vasal_owner with VASAL_OWNER_PASSWORD.
---yes is accepted only by promote, --apply only by roles, and --pick only by seed.`;
+--yes is accepted only by promote and briefs, --apply only by roles, and --pick only by seed.`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
-type PlainCommand = "bootstrap" | "migrate" | "budgets" | "prune" | "health" | "showcase" | "selftest";
+type PlainCommand = "bootstrap" | "migrate" | "budgets" | "prune" | "nightly" | "health" | "showcase" | "selftest";
 // One member per name, so a check on the name narrows the whole command.
 type Command =
   | { [Name in PlainCommand]: { name: Name } }[PlainCommand]
@@ -105,6 +118,7 @@ type Command =
   | { name: "mcp"; action: "list" | "revoke-all" }
   | { name: "mcp"; action: "revoke"; tokenId: string }
   | { name: "promote"; runId: string; position: number; yes: boolean }
+  | { name: "briefs"; runId: string; yes: boolean }
   | { name: "unpromote"; runId: string }
   | { name: "seed"; show: string; pick: number | undefined };
 
@@ -194,6 +208,11 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     if (rest.length !== 2 || runId === undefined || position === undefined) return undefined;
     return { name, runId, position: positionFrom(position), yes };
   }
+  if (name === "briefs") {
+    const [runId] = rest;
+    if (rest.length !== 1 || runId === undefined) return undefined;
+    return { name, runId, yes };
+  }
   if (yes) return undefined;
   if (name === "unpromote") {
     const [runId] = rest;
@@ -217,6 +236,7 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     name === "migrate" ||
     name === "budgets" ||
     name === "prune" ||
+    name === "nightly" ||
     name === "health" ||
     name === "showcase" ||
     name === "selftest"
@@ -272,7 +292,36 @@ async function runPrune(db: Db): Promise<boolean> {
   console.log(
     `Pruned ${grouped.format(counts.mcpTokens)} agent keys expired over a week, ${grouped.format(counts.mcpTokenDaily)} old agent key counters and ${grouped.format(counts.mcpKeyIssue)} old key-issue counters.`,
   );
+  console.log(`Closed ${grouped.format(counts.confirmExpired)} runs left awaiting a confirm over an hour, as failed with CONFIRM_EXPIRED.`);
   return true;
+}
+
+async function passed(step: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await step();
+  } catch (error) {
+    console.error(messageOf(error));
+    return false;
+  }
+}
+
+/**
+ * The scheduled job: budgets, then prune, each run whatever the other did, so
+ * a night no profile covers (budgets fails) still prunes. A step that throws
+ * prints the same fixed line main would print for it. Prints both reports
+ * and one closing line, and resolves true only when both steps passed; main
+ * turns that into exit 0 or 1.
+ */
+export async function runNightly(db: Db): Promise<boolean> {
+  console.log("$ ops budgets");
+  const budgets = await passed(() => runBudgets(db));
+  console.log("");
+  console.log("$ ops prune");
+  const prune = await passed(() => runPrune(db));
+  console.log("");
+  const word = (ok: boolean) => (ok ? "passed" : "failed");
+  console.log(`Nightly: budgets ${word(budgets)}, prune ${word(prune)}.`);
+  return budgets && prune;
 }
 
 async function runFlag(db: Db, which: Switch, on: boolean): Promise<boolean> {
@@ -321,8 +370,18 @@ async function runMcpRevokeAll(db: Db): Promise<boolean> {
   return true;
 }
 
+// health never throws, so a policy file it cannot read is passed on as null
+// and reported as a problem.
+async function policyOrNull(): Promise<BudgetPolicy | null> {
+  try {
+    return await loadPolicy(POLICY_FILE);
+  } catch {
+    return null;
+  }
+}
+
 async function runHealth(db: Db): Promise<{ ok: boolean; problems: string[] }> {
-  const report = await healthReport(db, new Date());
+  const report = await healthReport(db, new Date(), await policyOrNull());
   for (const line of formatHealth(report)) console.log(line);
   return { ok: report.problems.length === 0, problems: report.problems };
 }
@@ -399,23 +458,22 @@ const MAX_PRINTED_NAME_CHARS = 120;
 const printableName = (text: string): string =>
   [...text.replace(/[\p{Cc}\p{Cf}]/gu, "")].slice(0, MAX_PRINTED_NAME_CHARS).join("");
 
-async function runSeed(db: Db, show: string, pick: number | undefined): Promise<boolean> {
+// seed and briefs build the same agent, so a brief from either one is
+// written by the same runner and charges the same offline share.
+function seedAgentFromEnv(db: Db, command: "seed" | "briefs"): { agent: SeedAgent; settings: AgentSettings } | null {
   let qloo: QlooConfig;
   try {
     qloo = loadQlooConfig();
   } catch (error) {
     // loadQlooConfig's messages name a variable, never its value.
     console.log(error instanceof Error ? error.message : "The Qloo settings could not be read.");
-    return false;
+    return null;
   }
   const settings = loadAgentSettings(process.env);
   if (qloo.apiKey === undefined || settings.anthropicApiKey === null) {
-    console.log("seed needs QLOO_API_KEY and ANTHROPIC_API_KEY in the environment or the repo-root .env.");
-    return false;
+    console.log(`${command} needs QLOO_API_KEY and ANTHROPIC_API_KEY in the environment or the repo-root .env.`);
+    return null;
   }
-  console.log(
-    `Seeding with ${settings.model}, effort ${settings.effort}, trends ${settings.trends ? "on" : "off"}. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.`,
-  );
   const agent = createSeedAgent(db, {
     qlooApiKey: qloo.apiKey,
     qlooBaseUrl: qloo.baseUrl,
@@ -424,6 +482,46 @@ async function runSeed(db: Db, show: string, pick: number | undefined): Promise<
     effort: settings.effort,
     trends: settings.trends,
   });
+  return { agent, settings };
+}
+
+const briefsDone = (briefs: RunBriefs) => briefs.status === "done" && briefs.guests.every((guest) => guest.state.kind === "written");
+
+// Without a writer it only lists. With one it writes what it can and prints
+// every brief in full, because promotion follows the operator reading them
+// (C6.3). `writer` lets the self-test stand in for the model; without it the
+// real seed agent is built only once there is something to write.
+async function runBriefs(db: Db, runId: string, yes: boolean, writer?: Pick<AgentPort, "ready" | "writeBrief">): Promise<boolean> {
+  const before = await readBriefs(db, runId);
+  const missing = before.guests.filter((guest) => isWritable(guest.state)).length;
+  if (!yes) {
+    for (const line of formatBriefs(before, { full: false })) console.log(line);
+    if (before.status !== "done") return false;
+    if (missing > 0) console.log(`Run again with --yes to write ${missing === 1 ? "it" : `these ${missing}`}. Model tokens charge anthropic:day:offline.`);
+    return before.guests.every((guest) => guest.state.kind === "written" || isWritable(guest.state));
+  }
+  let briefs = before;
+  if (before.status === "done" && missing > 0) {
+    let runner = writer;
+    if (runner === undefined) {
+      const built = seedAgentFromEnv(db, "briefs");
+      if (built === null) return false;
+      console.log(`Writing ${missing} ${missing === 1 ? "brief" : "briefs"} with ${built.settings.model}. Model tokens charge anthropic:day:offline.`);
+      runner = built.agent.runner;
+    }
+    briefs = await writeBriefs(db, runner, runId);
+  }
+  for (const line of formatBriefs(briefs, { full: true })) console.log(line);
+  return briefsDone(briefs);
+}
+
+async function runSeed(db: Db, show: string, pick: number | undefined): Promise<boolean> {
+  const built = seedAgentFromEnv(db, "seed");
+  if (built === null) return false;
+  const { agent, settings } = built;
+  console.log(
+    `Seeding with ${settings.model}, effort ${settings.effort}, trends ${settings.trends ? "on" : "off"}. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.`,
+  );
   const outcome = await seedShow(db, agent, show, pick);
 
   if (outcome.kind === "preview") {
@@ -451,8 +549,14 @@ async function runSeed(db: Db, show: string, pick: number | undefined): Promise<
         : "Past guests were not checked: the show's feed could not be read.",
     );
   }
-  // The same board and refusal runPromote prints without --yes, then the
-  // command that promotes it.
+  // Every brief the briefs command would print, then the same board and
+  // refusal runPromote prints without --yes, then the command that promotes it.
+  console.log("");
+  for (const line of formatBriefs(outcome.briefs, { full: true })) console.log(line);
+  if (outcome.briefs.guests.some((guest) => isWritable(guest.state))) {
+    console.log(`Write the rest: npx tsx scripts/ops.ts briefs ${outcome.runId} --yes`);
+  }
+  console.log("");
   const preview = await previewRun(db, outcome.runId);
   for (const line of formatPreview(preview)) console.log(line);
   if (preview.refusal !== null) return false;
@@ -493,9 +597,36 @@ async function finishedSyntheticRun(db: Db): Promise<string> {
   return runId;
 }
 
+// Stored and closed the way the agent runner stores and closes a brief, so
+// the self-test spends no model tokens and holds no model text.
+const SELFTEST_BRIEF = {
+  why: "A synthetic reason for the self-test.",
+  angle: "A synthetic angle for the self-test.",
+  questions: ["One?", "Two?", "Three?", "Four?", "Five?"],
+  pitch_subject: "A synthetic pitch",
+  pitch_body: "A synthetic pitch body.",
+  removed: { links: 0, emails: 0 },
+};
+
+const syntheticWriter = (db: Db): Pick<AgentPort, "writeBrief"> => ({
+  writeBrief: async (runId, guestId) => {
+    await putBrief(db, runId, guestId, SELFTEST_BRIEF);
+    await markBriefDone(db, runId, guestId);
+  },
+});
+
 async function selftestShowcase(db: Db): Promise<string[]> {
   const failures: string[] = [];
   const runId = await finishedSyntheticRun(db);
+  console.log(`$ ops briefs ${runId}   (on this throwaway database)`);
+  if (!(await runBriefs(db, runId, false))) failures.push("briefs did not list the synthetic run's 3 missing briefs as writable");
+  console.log("");
+  console.log(`$ ops briefs ${runId} --yes   (on this throwaway database, with a synthetic writer in place of the model)`);
+  const briefs = await printed(() => runBriefs(db, runId, true, syntheticWriter(db)));
+  if (!briefs.result || !briefs.text.includes("3 of 3 guests have a written brief") || !briefs.text.includes("Pitch subject: A synthetic pitch")) {
+    failures.push("briefs did not write and print the synthetic run's 3 briefs");
+  }
+  console.log("");
   console.log(`$ ops --dev promote ${runId} 1`);
   if (!(await runPromote(db, runId, 1, false))) failures.push("the preview refused the synthetic run");
   if ((await listPromoted(db)).length !== 0) failures.push("the preview changed the showcase");
@@ -599,7 +730,7 @@ async function runSelftest(db: Db): Promise<boolean> {
   console.log("");
   if (failures.length === 0) {
     console.log(
-      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, a synthetic finished run went on the home page and came off again, and MCP switched on, listed two synthetic keys with no hash, revoked one, then all, and switched off.",
+      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, a synthetic finished run got its 3 briefs written and printed, went on the home page and came off again, and MCP switched on, listed two synthetic keys with no hash, revoked one, then all, and switched off.",
     );
     return true;
   }
@@ -652,6 +783,10 @@ async function main(): Promise<number> {
     console.error("seed builds showcase runs on the hosted database, so it never runs with --dev.");
     return 2;
   }
+  if (dev && command.name === "briefs") {
+    console.error("briefs writes showcase briefs on the hosted database, so it never runs with --dev.");
+    return 2;
+  }
 
   const connection = tunnelPort === undefined ? {} : { tunnelPort };
   let db: Db | undefined;
@@ -672,6 +807,8 @@ async function main(): Promise<number> {
         return (await runBudgets(db)) ? 0 : 1;
       case "prune":
         return (await runPrune(db)) ? 0 : 1;
+      case "nightly":
+        return (await runNightly(db)) ? 0 : 1;
       case "flag":
         return (await runFlag(db, command.flag, command.on)) ? 0 : 1;
       case "mcp":
@@ -682,6 +819,8 @@ async function main(): Promise<number> {
         return (await runHealth(db)).ok ? 0 : 1;
       case "promote":
         return (await runPromote(db, command.runId, command.position, command.yes)) ? 0 : 1;
+      case "briefs":
+        return (await runBriefs(db, command.runId, command.yes)) ? 0 : 1;
       case "unpromote":
         return (await runUnpromote(db, command.runId)) ? 0 : 1;
       case "showcase":

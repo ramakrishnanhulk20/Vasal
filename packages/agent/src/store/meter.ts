@@ -70,11 +70,20 @@ function totalsOf(items: unknown): Map<string, number> {
   return totals;
 }
 
+const NO_CEILINGS: ReadonlyMap<string, number> = new Map();
+
 // One SELECT ... ORDER BY ... FOR UPDATE takes the row locks in sorted order,
 // because Postgres sorts before it locks. Every caller therefore queues on the
 // same first row and two reservations can never wait on each other. COLLATE
 // "C" makes the order plain byte order, whatever the database locale.
-async function reserveWithin(tx: Db, totals: Map<string, number>, now: Date): Promise<Outcome> {
+// `ceilings` lowers a bucket's cap for this caller only and is checked under
+// the same lock; the stored cap, which every other caller sees, is unchanged.
+async function reserveWithin(
+  tx: Db,
+  totals: Map<string, number>,
+  now: Date,
+  ceilings: ReadonlyMap<string, number> = NO_CEILINGS,
+): Promise<Outcome> {
   const entries = [...totals];
   const keys = entries.map(([key]) => key);
   const { rows } = await tx.query(
@@ -93,7 +102,11 @@ async function reserveWithin(tx: Db, totals: Map<string, number>, now: Date): Pr
   const refused = entries
     .filter(([key, amount]) => {
       const bucket = buckets.get(key);
-      return !bucket || bucket.window_end.getTime() <= now.getTime() || bucket.used + amount > bucket.cap;
+      return (
+        !bucket ||
+        bucket.window_end.getTime() <= now.getTime() ||
+        bucket.used + amount > Math.min(bucket.cap, ceilings.get(key) ?? bucket.cap)
+      );
     })
     .map(([key]) => key);
   if (refused.length > 0) return { ok: false, refused };
@@ -197,7 +210,23 @@ function checkExtraKeys(extraKeys: unknown, dayKey: string): string[] {
   return keys;
 }
 
-async function tryQlooCall(db: Db, now: Date, dayKey: string, extraKeys: readonly string[]): Promise<Outcome> {
+// A caller's own ceiling on the current second's count, from 1 up to the
+// shared cap. It can only hold that caller back, never raise the shared cap.
+function checkPerSecondCap(perSecondCap: unknown): number {
+  if (perSecondCap === undefined) return QLOO_PER_SECOND_CAP;
+  if (typeof perSecondCap !== "number" || !Number.isInteger(perSecondCap) || perSecondCap < 1 || perSecondCap > QLOO_PER_SECOND_CAP) {
+    throw badInput();
+  }
+  return perSecondCap;
+}
+
+async function tryQlooCall(
+  db: Db,
+  now: Date,
+  dayKey: string,
+  extraKeys: readonly string[],
+  perSecondCap: number = QLOO_PER_SECOND_CAP,
+): Promise<Outcome> {
   checkInstant(now);
   const second = secondKeyOf(now);
   return db.transaction(async (tx) => {
@@ -219,6 +248,7 @@ async function tryQlooCall(db: Db, now: Date, dayKey: string, extraKeys: readonl
         ...extraKeys.map((key): [string, number] => [key, 1]),
       ]),
       now,
+      new Map([[second, perSecondCap]]),
     );
   });
 }
@@ -232,9 +262,9 @@ async function tryQlooCall(db: Db, now: Date, dayKey: string, extraKeys: readonl
  * adds at most 2 more buckets of the form qloo:month:<word> or
  * qloo:day:<word>, reserved in the same all-or-nothing transaction; MCP
  * passes ["qloo:month:mcp"] so its month stays under the shared ceiling
- * (D3.3). The per-second bucket is created on demand with cap 4 inside the
- * same transaction, so every process sharing the database shares one
- * per-second limit (C5.1, C5.2). Returns false if any bucket is full,
+ * (D3.3). The per-second bucket is created on demand with cap
+ * QLOO_PER_SECOND_CAP (8) inside the same transaction, so every process
+ * sharing the database shares one per-second limit (C5.1, C5.2). Returns false if any bucket is full,
  * missing or expired, and then nothing is added anywhere. Throws
  * StoreError("STORE_BAD_INPUT") for an invalid `now`, a dayKey that is not
  * "qloo:day" or "qloo:day:" followed by more, or extraKeys that are not an
@@ -257,11 +287,17 @@ export async function reserveQlooCall(
  * reserved. Returns false at once if the day, month or an extra bucket
  * refuses, and false when waiting longer would pass maxWaitMs (default
  * 3000). `dayKey` and `extraKeys` pick the buckets exactly as in
- * reserveQlooCall. Time is measured as the larger of clock time and time
- * slept, so the loop ends even if an injected clock never moves. Throws
+ * reserveQlooCall. `perSecondCap` (default QLOO_PER_SECOND_CAP) is this
+ * caller's own ceiling on the current second: it gets a slot only while the
+ * second holds fewer calls than that, counting every caller that shares the
+ * database, and waits for the next second otherwise. The stored per-second
+ * cap is not changed, so other callers keep the full QLOO_PER_SECOND_CAP.
+ * Time is measured as the larger of clock time and time slept, so the loop
+ * ends even if an injected clock never moves. Throws
  * StoreError("STORE_BAD_INPUT") for a maxWaitMs outside 0 to 60000, a bad
- * dayKey or bad extraKeys, and StoreError("STORE_UNAVAILABLE") if the
- * database fails.
+ * dayKey or bad extraKeys, or a perSecondCap that is not a whole number from
+ * 1 to QLOO_PER_SECOND_CAP, before any bucket is touched, and
+ * StoreError("STORE_UNAVAILABLE") if the database fails.
  */
 export async function waitForQlooSlot(
   db: Db,
@@ -271,12 +307,14 @@ export async function waitForQlooSlot(
     now?: () => Date;
     dayKey?: string;
     extraKeys?: string[];
+    perSecondCap?: number;
   } = {},
 ): Promise<boolean> {
   const maxWaitMs = opts.maxWaitMs ?? 3_000;
   if (!Number.isFinite(maxWaitMs) || maxWaitMs < 0 || maxWaitMs > MAX_WAIT_LIMIT_MS) throw badInput();
   const dayKey = checkDayKey(opts.dayKey);
   const extraKeys = checkExtraKeys(opts.extraKeys, dayKey);
+  const perSecondCap = checkPerSecondCap(opts.perSecondCap);
   const sleep = opts.sleep ?? ((ms: number) => delay(ms));
   const clock = opts.now ?? (() => new Date());
 
@@ -284,7 +322,7 @@ export async function waitForQlooSlot(
   let slept = 0;
   for (;;) {
     const now = checkInstant(clock());
-    const outcome = await tryQlooCall(db, now, dayKey, extraKeys);
+    const outcome = await tryQlooCall(db, now, dayKey, extraKeys, perSecondCap);
     if (outcome.ok) return true;
     if (!outcome.refused.every((key) => key.startsWith(QLOO_SECOND_PREFIX))) return false;
 

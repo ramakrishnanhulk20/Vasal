@@ -26,9 +26,11 @@ const DEFAULT_MAX_CALLS = 450;
 const LIST_TAKE = 20;
 const TOP_PEOPLE = 3;
 const TREND_WEEKS = 12;
-// Keeps the probe at 4 requests a second or fewer, under Qloo's limit, so
-// retries stay rare and the quota goes to answers.
-const MIN_GAP_MS = 250;
+// Each request starts at least 500 ms after the last, so the probe sends 2
+// a second or fewer. The live server takes 8 of Qloo's 10 a second, and an
+// offline script outside the hosted meter takes the other 2. Client retries
+// and the harness's own calls do not wait for this gap.
+const MIN_GAP_MS = 500;
 // qloo_recommend with an id signal makes one /entities lookup and one
 // /v2/insights call inside the harness, each with up to 3 attempts.
 const HARNESS_RECOMMEND_RESERVE = 6;

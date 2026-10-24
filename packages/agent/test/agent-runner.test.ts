@@ -6,8 +6,9 @@
 // stored board back through listShowcase so the two schemas agree. It also
 // covers which surface's buckets a run spends from, through the real meter
 // functions main.ts wires in, that a run with trends off spends no trend
-// call, and that a past guest the feed names never reaches the board. It
-// does not cover the other HTTP routes
+// call, and that a past guest the feed names, a host any of the show's names
+// holds, a person the fit answer says has died, and a find_person pick under
+// the fit floor never reach the board. It does not cover the other HTTP routes
 // (server-app), the real network, the real model, main.ts itself (the live
 // dev smoke starts it), or races between database connections (PGlite has
 // one).
@@ -35,6 +36,7 @@ import {
   listEventsAfter,
   listShowcase,
   putBoard,
+  putCandidates,
   setRunStatus,
   type RunInput,
   type RunSurface,
@@ -96,6 +98,46 @@ async function setup(
 }
 
 const confirmFirst = (runId: string) => confirmFirstIn(db, runId);
+
+const labelsIn = (events: Array<{ event: string; data: unknown }>): string[] =>
+  events.flatMap((event) => (event.event === "step" ? [(event.data as { label: string }).label] : []));
+
+const feedOf = (channelTitle: string, items: string[]) =>
+  `<?xml version="1.0"?><rss><channel><title>${channelTitle}</title>${items.join("")}</channel></rss>`;
+
+// The first finish_board still names every pick; the retry leaves out
+// `left`, so the board is kept clean by the tools, not by the model.
+function retryingWithout(left: number) {
+  const { model: scripted, turns } = fakeModel(BRIEF);
+  let finishes = 0;
+  const model: ModelClient = {
+    ...scripted,
+    async turn(params, options) {
+      const reply = await scripted.turn(params, options);
+      const content = reply.content.map((block) => {
+        if (block.type !== "tool_use" || block.name !== "finish_board") return block;
+        finishes += 1;
+        const picks = PICKS.filter((n) => n !== left).map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
+        return finishes === 1 ? block : { ...block, input: { picks } };
+      });
+      return { ...reply, content };
+    },
+  };
+  return { model, turns, finishes: () => finishes };
+}
+
+// The shared fake Qloo with one answer rewritten by `edit`.
+function editedQloo(edit: (op: QlooOperation, data: unknown) => unknown) {
+  const { qloo: plain, ops } = fakeQloo();
+  const qloo: MeteredQloo = {
+    async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
+      const { data } = await plain.call<unknown>(op);
+      return { data: edit(op, data) as T, fromCache: false };
+    },
+    stats: plain.stats,
+  };
+  return { qloo, ops };
+}
 
 const BRIEF = {
   why: "{{guest}} has {{fit}} with {{show}} listeners. See https://evil.example now.",
@@ -238,13 +280,18 @@ describe("continueRun (C1.5, C6.4)", () => {
     expect(turns[0]!.tools.some((tool) => /fetch|url|feed/i.test(tool.name))).toBe(false);
 
     const events = await listEventsAfter(db, runId, 0);
+    // The done event keeps the shape the seed command reads (src/ops/seed.ts).
     expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 3, pastGuests: { checked: true, skipped: 0 } } });
-    const boardEvent = events.find((event) => event.event === "board")?.data as { guests: Array<Record<string, unknown>> };
+    const boardEvent = events.find((event) => event.event === "board")?.data as { guests: Array<Record<string, unknown>>; pastGuests: unknown };
     expect(boardEvent.guests.map((guest) => [guest["name"], guest["fitRank"]])).toEqual([
       ["Synthetic Person 2", 1],
       ["Synthetic Person 3", 2],
       ["Synthetic Person 1", 3],
     ]);
+    expect(boardEvent.pastGuests).toEqual({ checked: true, skipped: 0, titles: 2, since: "2026-10" });
+    expect(labelsIn(events)).toEqual(
+      expect.arrayContaining(["Read 2 episode titles back to Oct 2026 from the show's feed", "Scored 3 guests against this show's listeners"]),
+    );
   });
 
   it("stores and streams board names, tags and the show name with no tag, control or invisible character (C3.7)", async () => {
@@ -319,23 +366,7 @@ describe("continueRun (C1.5, C6.4)", () => {
       return `<item><title>${title}</title><pubDate>${new Date(Date.UTC(2026, 9, 12) - week * 7 * 86_400_000).toUTCString()}</pubDate></item>`;
     });
     const feed = `<?xml version="1.0"?><rss><channel><title>Synthetic Show</title>${items.join("")}</channel></rss>`;
-    // The first finish_board still names the past guest; the retry picks the
-    // rest, so the board is kept clean by the tools, not by the model.
-    const { model: scripted, turns } = fakeModel(BRIEF);
-    let finishes = 0;
-    const model: ModelClient = {
-      ...scripted,
-      async turn(params, options) {
-        const reply = await scripted.turn(params, options);
-        const content = reply.content.map((block) => {
-          if (block.type !== "tool_use" || block.name !== "finish_board") return block;
-          finishes += 1;
-          const picks = [2, 3, 4].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
-          return finishes === 1 ? block : { ...block, input: { picks } };
-        });
-        return { ...reply, content };
-      },
-    };
+    const { model, turns, finishes } = retryingWithout(1);
     const input: RunInput = { show: "Synthetic Show", exclude: [] };
     const runId = await createRun(db, input, NOW);
     const agent = createAgentRunner({ db, ...sameForBoth(model, fakeQloo().qloo), feeds: fakeFeeds({ feed }).feeds, trends: true, now: () => NOW });
@@ -348,12 +379,14 @@ describe("continueRun (C1.5, C6.4)", () => {
     expect(board.map((entry) => entry.name)).toEqual([2, 3, 4].map((n) => `Synthetic Person ${n}`));
     const events = await listEventsAfter(db, runId, 0);
     expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 3, pastGuests: { checked: true, skipped: 1 } } });
-    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { checked: true, skipped: 1 } });
-    const labels = events.flatMap((event) => (event.event === "step" ? [(event.data as { label: string }).label] : []));
-    expect(labels).toContain("Read 40 recent episode titles from the show's feed");
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({
+      pastGuests: { checked: true, skipped: 1, titles: 45, since: "2025-12" },
+    });
+    const labels = labelsIn(events);
+    expect(labels).toContain("Read 45 episode titles back to Dec 2025 from the show's feed");
     expect(labels).toContain("Found 3 people this show's listeners love, leaving out 1 past guest");
     expect(labels).toContain("Sent some picks back to be fixed");
-    expect(finishes).toBe(2);
+    expect(finishes()).toBe(2);
     expect(JSON.stringify(turns)).not.toContain("Synthetic Person 1");
   });
 
@@ -365,7 +398,139 @@ describe("continueRun (C1.5, C6.4)", () => {
 
     const events = await listEventsAfter(db, runId, 0);
     expect(events.at(-1)).toEqual({ seq: events.length, event: "done", data: { guests: 4, pastGuests: { checked: false, skipped: 0 } } });
-    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { checked: false, skipped: 0 } });
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({
+      pastGuests: { checked: false, skipped: 0, titles: 0, since: null },
+    });
+  });
+
+  it("a feed that gives no episode titles leaves past guests unchecked and says so (R2-4)", async () => {
+    const { runId, input, agent, turns } = await setup({ feed: feedOf("Synthetic Show", []) });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.find((event) => event.event === "step")?.data).toEqual({
+      tool: "feed",
+      ok: false,
+      label: "The show's feed gave no episode titles, so past guests are not checked",
+    });
+    expect(events.at(-1)?.data).toEqual({ guests: 4, pastGuests: { checked: false, skipped: 0 } });
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({
+      pastGuests: { checked: false, skipped: 0, titles: 0, since: null },
+    });
+    expect(turns[0]!.system).toContain("The show's feed could not be read, so past guests could not be checked.");
+  });
+
+  it("labels an undated feed with its count and no month", async () => {
+    const { runId, input, agent } = await setup({ feed: feedOf("Synthetic Show", ["<item><title>One</title></item><item><title>Two</title></item>"]) });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    const events = await listEventsAfter(db, runId, 0);
+    expect(labelsIn(events)).toContain("Read 2 episode titles from the show's feed");
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { checked: true, titles: 2, since: null } });
+  });
+
+  it("never puts a host on the board when any name the show goes by holds them (R2-3)", async () => {
+    const HOST = "X with Ann Lee";
+    for (const source of ["name", "publisher", "qlooName", "channel title"] as const) {
+      const input: RunInput = { show: "Synthetic Show", exclude: [] };
+      const runId = await createRun(db, input, NOW);
+      await setRunStatus(db, runId, "running", undefined, NOW);
+      const [candidateId] = await putCandidates(db, runId, [
+        {
+          appleId: "1001",
+          name: source === "name" ? HOST : "Synthetic Show 1",
+          publisher: source === "publisher" ? HOST : "Synthetic Publisher 1",
+          feedHandleSource: "directory",
+          feedUrl: "https://feeds.example/show-1.xml",
+          qlooId: PODCAST_ID,
+          qlooName: source === "qlooName" ? HOST : "Synthetic Show 1",
+        },
+      ]);
+      const feed = feedOf(source === "channel title" ? HOST : "Synthetic Show", ["<item><title>Episode one</title></item>"]);
+      const { qloo } = editedQloo((op, data) =>
+        op.op === "insights" && op.resultEntities === undefined
+          ? (data as Array<{ entity_id: string }>).map((entity) => (entity.entity_id === personId(1) ? { ...entity, name: "Ann Lee" } : entity))
+          : data,
+      );
+      const agent = createAgentRunner({ db, ...sameForBoth(retryingWithout(1).model, qloo), feeds: fakeFeeds({ feed }).feeds, trends: true, now: () => NOW });
+
+      await agent.continueRun(runId, candidateId!);
+
+      expect((await getRun(db, runId))?.status, source).toBe("done");
+      const board = (await listBoard(db, runId)).map((item) => item.data as { name: string });
+      expect(board.map((entry) => entry.name), source).toEqual([2, 3, 4].map((n) => `Synthetic Person ${n}`));
+      expect((await listEventsAfter(db, runId, 0)).at(-1)?.data, source).toEqual({ guests: 3, pastGuests: { checked: true, skipped: 1 } });
+    }
+  });
+
+  it("drops a pick whose fit answer carries a death date, and spends no fill call on them", async () => {
+    const { qloo, ops } = editedQloo((op, data) =>
+      op.op === "insights" && op.resultEntities !== undefined
+        ? (data as Array<{ entity_id: string }>).map((entity) =>
+            entity.entity_id === personId(2) ? { ...entity, properties: { date_of_death: "2020-01-01" } } : entity,
+          )
+        : data,
+    );
+    const input: RunInput = { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    expect((await getRun(db, runId))?.status).toBe("done");
+    const board = (await listBoard(db, runId)).map((item) => item.data as { personId: string });
+    expect(board.map((entry) => entry.personId)).toEqual([3, 1, 4].map(personId));
+    const fitCall = ops.findIndex((op) => op.op === "insights" && op.resultEntities !== undefined);
+    expect(ops.slice(fitCall + 1).some((op) => JSON.stringify(op).includes(personId(2)))).toBe(false);
+    expect(labelsIn(await listEventsAfter(db, runId, 0))).toContain("Scored 2 guests against this show's listeners");
+  });
+
+  it("keeps a pick only find_person returned when its fit reaches the floor, and fills it, and drops one below with no fill (G18)", async () => {
+    for (const [affinity, expected] of [
+      [0.8, [9, 2, 3, 1]],
+      [0.3, [2, 3, 1]],
+    ] as const) {
+      const found = personId(9);
+      const { qloo, ops } = editedQloo((op, data) => {
+        if (op.op === "search" && op.types.includes("urn:entity:person")) return [{ entity_id: found, name: "Synthetic Found 9", popularity: 0.4 }];
+        if (op.op === "insights" && op.resultEntities?.includes(found)) {
+          return [...(data as unknown[]), { entity_id: found, name: "ignored", query: { affinity } }];
+        }
+        return data;
+      });
+      const { model: scripted } = fakeModel(BRIEF);
+      const model: ModelClient = {
+        ...scripted,
+        async turn(params, options) {
+          const reply = await scripted.turn(params, options);
+          const content = reply.content.map((block) => {
+            if (block.type !== "tool_use") return block;
+            if (block.name === "recent_episode_titles") return { ...block, name: "find_person", input: { name: "Synthetic Found" } };
+            if (block.name !== "finish_board") return block;
+            const picks = [1, 2, 3, 9].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
+            return { ...block, input: { picks } };
+          });
+          return { ...reply, content };
+        },
+      };
+      const input: RunInput = { show: "Synthetic Show", exclude: [] };
+      const runId = await createRun(db, input, NOW);
+      const agent = createAgentRunner({ db, ...sameForBoth(model, qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
+      await agent.startRun(runId, input);
+
+      await agent.continueRun(runId, await confirmFirst(runId));
+
+      expect((await getRun(db, runId))?.status, String(affinity)).toBe("done");
+      const board = (await listBoard(db, runId)).map((item) => item.data as { personId: string });
+      expect(board.map((entry) => entry.personId), String(affinity)).toEqual(expected.map(personId));
+      const filled = ops.filter((op) => op.op !== "insights" && op.op !== "search" && JSON.stringify(op).includes(found));
+      expect(filled.length > 0, String(affinity)).toBe(affinity >= 0.5);
+    }
   });
 
   it("gives a person Qloo returns no fit for fit 0 and fitKnown false", async () => {

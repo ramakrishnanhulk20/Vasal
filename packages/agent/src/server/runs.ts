@@ -933,7 +933,7 @@ const boardGuest = z.strictObject({
   fit: z.number(),
   fitKnown: z.boolean(),
   fitRank: z.number().int().min(1),
-  reach: z.enum(["household name", "well known", "bookable"]),
+  reach: z.enum(["household name", "well known", "bookable", "unknown"]),
   rising: z.strictObject({ state: z.enum(["rising", "steady", "falling", "unknown"]), points: z.number().nullable() }),
   bringsNew: z.strictObject({ segment: z.string().max(100), label: z.string().max(100), gap: z.number() }).nullable(),
   sharedTags: z.array(z.string().max(200)).max(5),
@@ -954,6 +954,19 @@ export type ShowcaseGuest = {
   sharedTags: string[];
 };
 export type ShowcaseRun = { runId: string; position: number; showName: string; finishedAt: Date; guests: ShowcaseGuest[] };
+/** What the run page shows for one board guest, and nothing else (D5.5). */
+export type PublicBoardGuest = {
+  id: string;
+  name: string;
+  fit: number;
+  fitKnown: boolean;
+  fitRank: number;
+  reach: string;
+  rising: string;
+  bringsNew: string | null;
+  sharedTags: string[];
+  angle: string;
+};
 
 /**
  * Parses one stored board row's data, read as text, into the guest the agent
@@ -963,6 +976,35 @@ export type ShowcaseRun = { runId: string; position: number; showName: string; f
 export function parseBoardGuest(text: unknown): StoredBoardGuest | null {
   const parsed = storedBoardGuest.safeParse(text);
   return parsed.success ? parsed.data : null;
+}
+
+const listedBoardRow = z.object({ id: z.string().refine(isId), data: boardGuest });
+
+/**
+ * The public view of one row from listBoard ({ id, data }): its server id and
+ * the fields the page draws, picked by name so a stored field stays private
+ * unless it is added here. personId (a Qloo entity id), rising.points,
+ * bringsNew's segment and gap, and showName never leave the server (D5.5).
+ * `data` must pass the same schema the runner and the showcase read it with;
+ * a row that fails, or an id that is not a lower-case UUID, gives null and is
+ * not shown (C6.5). Pure; never throws.
+ */
+export function publicBoardGuest(row: unknown): PublicBoardGuest | null {
+  const parsed = listedBoardRow.safeParse(row);
+  if (!parsed.success) return null;
+  const { id, data } = parsed.data;
+  return {
+    id,
+    name: data.name,
+    fit: data.fit,
+    fitKnown: data.fitKnown,
+    fitRank: data.fitRank,
+    reach: data.reach,
+    rising: data.rising.state,
+    bringsNew: data.bringsNew?.label ?? null,
+    sharedTags: [...data.sharedTags],
+    angle: data.angle,
+  };
 }
 
 /**

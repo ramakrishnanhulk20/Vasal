@@ -10,6 +10,7 @@ export type PruneCounts = {
   mcpTokens: number;
   mcpTokenDaily: number;
   mcpKeyIssue: number;
+  confirmExpired: number;
 };
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -23,6 +24,16 @@ const DAILY_COUNTER_KEEP_MS = 2 * DAY_MS;
 // the list while looking into anything it did.
 const EXPIRED_TOKEN_KEEP_MS = 7 * DAY_MS;
 
+// The confirm route closes a run that waited 30 minutes, but only when a
+// confirm arrives. This closes the rest, so awaiting_confirm always ends
+// (C6.4), and the hour leaves the route's own window to the route.
+const CONFIRM_KEEP_MS = 60 * 60 * 1_000;
+// The code the confirm route closes a run it found too old with (app.ts).
+const CONFIRM_EXPIRED = "CONFIRM_EXPIRED";
+// appendEvent's cap in server/runs.ts. It keeps the last slot for a done or
+// failed event, so a run still waiting always has room for this one.
+const MAX_EVENTS_PER_RUN = 500;
+
 const removed = z.object({ removed: z.number().int().min(0) });
 
 async function deleteCounted(db: Db, text: string, params: unknown[]): Promise<number> {
@@ -30,6 +41,41 @@ async function deleteCounted(db: Db, text: string, params: unknown[]): Promise<n
   const parsed = removed.safeParse(rows[0]);
   if (!parsed.success) throw new StoreError("STORE_UNAVAILABLE");
   return parsed.data.removed;
+}
+
+// One statement, the same shape as failInterruptedRuns in server/runs.ts: the
+// status moves only WHERE the run is still awaiting_confirm, so a confirm that
+// claims the run first wins and the run is skipped here, and the failed event
+// takes its run ids straight from that UPDATE, so a run is never closed
+// without it.
+async function closeUnconfirmed(db: Db, now: Date): Promise<number> {
+  return deleteCounted(
+    db,
+    `WITH expired AS (
+       UPDATE runs SET status = 'failed', error_code = $1, finished_at = $2::timestamptz
+       WHERE status = 'awaiting_confirm' AND created_at < $3::timestamptz
+       RETURNING id
+     ),
+     numbered AS (
+       SELECT expired.id,
+              coalesce((SELECT max(e.seq) FROM run_events e WHERE e.run_id = expired.id), 0) AS last
+       FROM expired
+     ),
+     noted AS (
+       INSERT INTO run_events (run_id, seq, event, data, created_at)
+       SELECT numbered.id, numbered.last + 1, 'failed', $4::text::json, $2::timestamptz
+       FROM numbered WHERE numbered.last < $5
+       RETURNING run_id
+     )
+     SELECT count(*)::int AS removed FROM expired`,
+    [
+      CONFIRM_EXPIRED,
+      now.toISOString(),
+      new Date(now.getTime() - CONFIRM_KEEP_MS).toISOString(),
+      JSON.stringify({ code: CONFIRM_EXPIRED }),
+      MAX_EVENTS_PER_RUN,
+    ],
+  );
 }
 
 /**
@@ -46,8 +92,13 @@ async function deleteCounted(db: Db, text: string, params: unknown[]): Promise<n
  *   points to, with their remaining counter rows by cascade (D6.2). A key a
  *   run points to is kept, expired and unusable, because runs are never
  *   deleted and each MCP run keeps the record of which key made it.
- * Day and month buckets are never deleted; an ended one is reset by the
- * budget roll instead. Returns how many rows each step removed.
+ * It also closes every run still awaiting_confirm that was created more than
+ * an hour before `now`, as failed with CONFIRM_EXPIRED and finished_at
+ * `now`, appending a failed event { code: "CONFIRM_EXPIRED" } to each in the
+ * same statement, the way the confirm route closes one (C6.4); nothing is
+ * spent and no slot is touched. Day and month buckets are never deleted; an
+ * ended one is reset by the budget roll instead. Returns how many rows each
+ * step removed, and in confirmExpired how many runs it closed.
  *
  * Needs DELETE, which the app role vasal_app does not hold, so it must run
  * on the owner connection. Throws StoreError("STORE_BAD_INPUT") for an
@@ -97,6 +148,7 @@ export async function pruneExpired(db: Db, now: Date): Promise<PruneCounts> {
        SELECT count(*)::int AS removed FROM gone`,
       [tokenCutoff.toISOString()],
     );
-    return { cacheRows, secondBuckets, visitorCounters, mcpTokens, mcpTokenDaily, mcpKeyIssue };
+    const confirmExpired = await closeUnconfirmed(tx, now);
+    return { cacheRows, secondBuckets, visitorCounters, mcpTokens, mcpTokenDaily, mcpKeyIssue, confirmExpired };
   });
 }

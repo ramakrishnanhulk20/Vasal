@@ -1,15 +1,17 @@
 // Covers the research tools against a fake metered Qloo: the fixed tool list,
 // every refusal that must happen before any Qloo call, the request each tool
 // builds, size caps on what goes back to the model, step summaries that
-// carry no ids or upstream text, the trends switch, and past guests left out
-// of people lists. It does not cover
+// carry no ids or upstream text, the trends switch, past guests left out
+// of people lists, and shared tags dropped for their words or length before
+// they are stored. It does not cover
 // the model loop or the Anthropic client (next work order), the real cache
 // and meter (see
 // qloo-metered.test.ts), or real Qloo response shapes. All data is synthetic.
 import { describe, expect, it } from "vitest";
+import { buildBoard } from "../src/agent/board.js";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { stepFor } from "../src/agent/loop.js";
-import { SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { ACCUSATIONS_RULE, isShowableTag, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 import { PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
@@ -144,6 +146,15 @@ describe("researchTools", () => {
 
     expect(off.map((tool) => tool.name)).not.toContain("trend_of");
     expect(off).toEqual(researchTools(ON).filter((tool) => tool.name !== "trend_of"));
+  });
+
+  // Whether past guests were left out depends on the feed, so only the
+  // research prompt, which knows, says anything about them.
+  it("describes recent_episode_titles without claiming past guests are left out", () => {
+    const titles = researchTools(ON).find((tool) => tool.name === "recent_episode_titles");
+
+    expect(titles?.description).toBe("Titles of the show's recent episodes, so you can see what the show covers. Call it once.");
+    expect(JSON.stringify(researchTools(ON))).not.toContain("Past guests");
   });
 });
 
@@ -567,6 +578,44 @@ describe("shared_taste matching", () => {
     ]);
   });
 
+  it("drops a sensitive or identity tag from what it stores and returns (C3.10)", async () => {
+    const { stored, shown, summary } = await tastesFor({
+      tags: [idTag("Black Culture", 0.9), idTag("Comedy", 0.7), idTag("LGBTQ Voices", 0.6)],
+      a: side("Women", "Engaging", "Blackjack"),
+      b: side("women", "Engaging", "Blackjack"),
+    });
+
+    expect(stored).toEqual([
+      { name: "Comedy", score: 0.7 },
+      { name: "Engaging", score: null },
+      { name: "Blackjack", score: null },
+    ]);
+    expect(shown).toEqual(["Comedy", "Engaging", "Blackjack"]);
+    expect(summary).toBe("found 3 shared tastes");
+  });
+
+  it("drops a tag longer than the board's 40-character chip instead of letting the board cut it", async () => {
+    const long = "Card Rooms, Casino Nights, and Live Blackjack";
+    const short = "Late Night Card Games and Bets";
+    const atCap = "Card Rooms, Casino Nights and Live Poker";
+    const overCap = "Card Rooms, Casino Nights, and Live Poker";
+    expect([long, short, atCap, overCap].map((name) => [...name].length)).toEqual([45, 30, 40, 41]);
+    // Its words are fine, so only its length can be what drops it.
+    expect(isShowableTag(long)).toBe(true);
+
+    const { stored, shown } = await tastesFor({
+      tags: [idTag(long, 0.9), idTag(short, 0.8), idTag(atCap, 0.7), idTag(overCap, 0.6)],
+      a: [],
+      b: [],
+    });
+
+    expect(stored).toEqual([
+      { name: short, score: 0.8 },
+      { name: atCap, score: 0.7 },
+    ]);
+    expect(shown).toEqual([short, atCap]);
+  });
+
   it("gives the id matches only when either side's list is empty", async () => {
     const both = side("Synthetic Alpha", "Synthetic Beta");
     for (const [a, b] of [
@@ -637,7 +686,7 @@ describe("finish_board", () => {
     expect(JSON.parse(outcome.content)).toEqual({
       error: "PICKS_REJECTED",
       rejected: [
-        { index: 1, reason: "digits", hint: "Write no digits: say numbers in words or leave them out. The app shows numbers itself." },
+        { index: 1, reason: "digits", hint: "Leave numbers out, in digits and in words. The app shows numbers itself." },
         { index: 2, reason: "unknown_person", hint: "Use a personId exactly as a tool returned it in this run." },
         { index: 3, reason: "duplicate", hint: "Pick each person once." },
       ],
@@ -677,6 +726,32 @@ describe("finish_board", () => {
       expect(PICK_HINTS.sensitive_trait).toBe(SENSITIVE_TRAITS_RULE);
       expect(ctx.steps.at(-1)).toEqual({ tool: "finish_board", ok: false, summary: "rejected 1 of 3 picks" });
       expect(stepFor(ctx, "finish_board", input, outcome)).toEqual({ tool: "finish_board", ok: false, label: "Sent some picks back to be fixed" });
+    }
+  });
+
+  it("sends back a figure in words with the numbers hint and an accusation with its hint", async () => {
+    const input = {
+      picks: [
+        { personId: personId(1), angle: "Their fans already love this show." },
+        { personId: personId(2), angle: "His three million fans would follow him here." },
+        { personId: personId(3), angle: "The story behind the lawsuit that followed." },
+      ],
+    };
+
+    for (const opts of [ON, OFF]) {
+      const { ctx, qloo } = await withPeople();
+      const outcome = await runTool(ctx, qloo, "finish_board", input, TODAY, opts);
+
+      expect(outcome.finished).toBeUndefined();
+      expect(JSON.parse(outcome.content)).toEqual({
+        error: "PICKS_REJECTED",
+        rejected: [
+          { index: 1, reason: "digits", hint: "Leave numbers out, in digits and in words. The app shows numbers itself." },
+          { index: 2, reason: "accusation", hint: ACCUSATIONS_RULE },
+        ],
+      });
+      expect(PICK_HINTS.accusation).toBe(ACCUSATIONS_RULE);
+      expect(ctx.steps.at(-1)).toEqual({ tool: "finish_board", ok: false, summary: "rejected 2 of 3 picks" });
     }
   });
 
@@ -721,8 +796,85 @@ describe("finish_board", () => {
 
 describe("past guests (C2.1, C2.2)", () => {
   const PAST_EPISODE = `Synthetic Person 2 ${MARKER} on a past episode`;
-  const withFeed = (pastGuestTitles: string[] | null): RunContext =>
-    createRunContext({ show: SHOW, episodeTitles: [], exclusions: [], pastGuestTitles });
+  const withFeed = (titles: string[] | null, showRunners: string[] = []): RunContext =>
+    createRunContext({
+      show: SHOW,
+      episodeTitles: [],
+      exclusions: [],
+      pastGuestEpisodes: titles === null ? null : titles.map((title) => ({ title, publishedAt: null })),
+      showRunners,
+    });
+
+  it("counts the titles checked and the oldest dated month, and a feed with no title is not checked", () => {
+    const dated = createRunContext({
+      show: SHOW,
+      episodeTitles: [],
+      exclusions: [],
+      pastGuestEpisodes: [
+        { title: "Newest", publishedAt: "2026-10-12T08:00:00.000Z" },
+        { title: "Oldest dated", publishedAt: "2019-03-04T08:00:00.000Z" },
+        { title: "Undated", publishedAt: null },
+        { title: "", publishedAt: "2001-01-01T00:00:00.000Z" },
+      ],
+    });
+
+    expect(dated.pastGuests).toMatchObject({ checked: true, titles: 3, since: "2019-03" });
+    expect(withFeed(["Undated one", "Undated two"]).pastGuests).toMatchObject({ checked: true, titles: 2, since: null });
+    for (const empty of [[], ["", "   "], null]) {
+      expect(withFeed(empty).pastGuests, JSON.stringify(empty)).toMatchObject({ checked: false, titles: 0, since: null });
+    }
+    expect(newContext().pastGuests).toMatchObject({ checked: false, titles: 0, since: null });
+  });
+
+  it("leaves out the people who run the show even when the feed could not be read", async () => {
+    const ctx = withFeed(null, [`The Synthetic Hour with Synthetic Person 2 ${MARKER}`, "Synthetic Publisher"]);
+    const { qloo } = fakeQloo();
+
+    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+
+    expect((JSON.parse(outcome.content) as { people: Array<{ personId: string }> }).people.map((person) => person.personId)).toEqual([
+      personId(1),
+      personId(3),
+    ]);
+    expect(ctx.pastGuests.checked).toBe(false);
+    expect([...ctx.pastGuests.skipped]).toEqual([personId(2)]);
+  });
+
+  it("refuses an id dropped as dead or as a past guest for the rest of the run, whatever a later answer says (G16)", async () => {
+    const ctx = withFeed([PAST_EPISODE]);
+    const first = synthPeople(3).map((person, n) => (n === 0 ? { ...person, properties: { date_of_death: "1901-02-03" } } : person));
+    // The same ids again, alive, under names no title holds.
+    const later = synthPeople(2).map((person, n) => ({ ...person, name: `Synthetic Renamed ${n + 1}` }));
+    const { qloo } = fakeQloo((op) => (op.op === "search" ? later : first));
+
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Renamed" }, TODAY, ON);
+
+    expect(JSON.parse(found.content)).toEqual({ people: [], skippedPastGuests: 1 });
+    expect([...ctx.dropped].sort()).toEqual([personId(1), personId(2)]);
+    expect([...ctx.people.keys()]).toEqual([personId(3)]);
+    expect(buildBoard(ctx, VALID_PICKS).map((entry) => entry.personId)).toEqual([personId(3)]);
+  });
+
+  it("marks people a people_for_show answer returned, and never someone only find_person returned", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo();
+
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+
+    expect([...ctx.listedForShow]).toEqual([1, 2, 3].map(personId));
+    expect(ctx.people.has(personId(50))).toBe(true);
+  });
+
+  it("reports reach as unknown for a person with no popularity", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo(() => synthPeople(1).map(({ popularity: _popularity, ...person }) => person));
+
+    const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+
+    expect((JSON.parse(outcome.content) as { people: Array<{ reach: string }> }).people[0]?.reach).toBe("unknown");
+  });
 
   it("people_for_show leaves out a past guest and says how many", async () => {
     const ctx = withFeed([PAST_EPISODE]);

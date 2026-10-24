@@ -416,6 +416,18 @@ describe("createYouTubeClient", () => {
     }
   });
 
+  it("maps a 403 rate limit to YT_UPSTREAM, the code a 429 gets, not YT_AUTH, and sends it once", async () => {
+    for (const value of ["rateLimitExceeded", "userRateLimitExceeded"]) {
+      const { fetchImpl, captured } = fakeFetch(
+        inOrder(() => json(403, { error: { code: 403, message: "synthetic upstream text", errors: [{ domain: "usageLimits", reason: value }] } })),
+      );
+      const error = await failureOf(client(fetchImpl).channelUploads(CHANNEL));
+      expect(error.code, value).toBe("YT_UPSTREAM");
+      expect(error.message, value).not.toContain("synthetic upstream text");
+      expect(captured, value).toHaveLength(1);
+    }
+  });
+
   it("succeeds when 503 comes twice and then 200, waiting 500 ms then 1500 ms", async () => {
     const { fetchImpl, captured } = fakeFetch(inOrder(() => json(503, {}), () => json(503, {}), () => json(200, channelBody())));
     const sleep = vi.fn(async (_ms: number) => undefined);

@@ -28,12 +28,12 @@ import { reserve, waitForQlooSlot } from "../store/meter.js";
 import { cleanText } from "../text/normalize.js";
 import { buildBoard, type BoardEntry } from "./board.js";
 import { writeBrief as writeGuestBrief } from "./brief.js";
-import { createRunContext, type RunContext } from "./context.js";
+import { createRunContext, type PastGuestCheck, type RunContext } from "./context.js";
 import { AgentError } from "./errors.js";
 import { DEFAULT_LIMITS, runResearch, stepFor, type StepEvent } from "./loop.js";
 import type { ModelClient } from "./model.js";
 import { resolveShow } from "./resolve.js";
-import { runTool, type ToolName } from "./tools.js";
+import { dropPerson, hasDied, runTool, type ToolName } from "./tools.js";
 
 export type AgentFeeds = {
   searchShows: (term: string) => Promise<ShowCandidate[]>;
@@ -71,7 +71,7 @@ const BoardRow = z
     fit: z.number(),
     fitKnown: z.boolean(),
     fitRank: z.number().int().min(1),
-    reach: z.enum(["household name", "well known", "bookable"]),
+    reach: z.enum(["household name", "well known", "bookable", "unknown"]),
     rising: z.object({ state: z.enum(["rising", "steady", "falling", "unknown"]), points: z.number().nullable() }).strict(),
     bringsNew: z.object({ segment: z.string().max(100), label: z.string().max(100), gap: z.number() }).strict().nullable(),
     sharedTags: z.array(z.string().max(200)).max(5),
@@ -82,6 +82,28 @@ const BoardRow = z
 
 const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+
+// Fixed English names, so the label never depends on the server's locale
+// and no feed text reaches it.
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+
+function monthYear(since: string): string | null {
+  const [year, month] = since.split("-");
+  const name = MONTHS[Number(month) - 1];
+  return year === undefined || name === undefined ? null : `${name} ${year}`;
+}
+
+// How far the past-guest check reached, in counts and a month written by
+// code, so the run never says "checked" without saying how much (G17).
+function feedStep(check: PastGuestCheck): StepEvent {
+  if (!check.checked) return { tool: "feed", ok: false, label: "The show's feed gave no episode titles, so past guests are not checked" };
+  const back = check.since === null ? null : monthYear(check.since);
+  return {
+    tool: "feed",
+    ok: true,
+    label: `Read ${plural(check.titles, "episode title", "episode titles")}${back === null ? "" : ` back to ${back}`} from the show's feed`,
+  };
+}
 
 type SurfaceBudget = { qlooDayKey: string; qlooExtraKeys: readonly string[]; modelKey: string };
 
@@ -141,18 +163,24 @@ function knownCode(error: unknown): string | null {
  * (C6.2). It fetches the candidate's feed only through a FeedHandles handle
  * issued for this run, and the model has no fetch tool at all (C1.5); on any
  * FeedError it carries on with no episode titles and says so in a step. The
- * model is shown the newest 40 titles, and every title the feed gave is used
- * to leave past guests out of every tool result (isPastGuest). It then runs
- * the research loop, fetches every pick's fit in one metered Qloo
- * call so every fit on the board is comparable, fills missing audience,
- * trend and shared-taste data for the picks left after exclusions through
- * runTool (so the per-tool caps hold), builds the board in code, and stores
- * it with a "board" event and a done event. Both carry pastGuests
- * { checked, skipped }: checked is false when the feed could not be read, and
- * skipped counts the people left out as past guests. Fewer than 3 guests fails with
- * AGENT_BOARD_TOO_SMALL; nothing is padded. With `trends` false the research
- * loop is never offered trend_of and the fill skips it, so no trend call is
- * spent and every guest's rising state is "unknown".
+ * model is shown the newest 40 titles, and every title the feed gave, plus
+ * the show's directory name, publisher, Qloo name and feed title, is used to
+ * leave past guests and hosts out of every tool result (isPastGuest). The
+ * feed step says how many titles were read and the month of the oldest
+ * dated one, or that the feed gave none. It then runs the research loop,
+ * fetches every pick's fit in one metered Qloo call so every fit on the
+ * board is comparable (dropping any pick that answer says has died), fills
+ * missing audience, trend and shared-taste data only for the picks that
+ * survive exclusions and the find_person fit floor through runTool (so the
+ * per-tool caps hold), builds the board in code, and stores it with a
+ * "board" event and a done event. The board event carries pastGuests
+ * { checked, skipped, titles, since } and the done event { checked, skipped }:
+ * checked is false when the feed gave no title to check, skipped counts the
+ * people left out as past guests, titles how many titles were checked and
+ * since the oldest dated one's month ("YYYY-MM") or null. Fewer than 3
+ * guests fails with AGENT_BOARD_TOO_SMALL; nothing is padded. With `trends`
+ * false the research loop is never offered trend_of and the fill skips it,
+ * so no trend call is spent and every guest's rising state is "unknown".
  *
  * writeBrief reads the guest from the stored board (C6.2), writes the brief,
  * logs any removed links in a step, stores the brief, marks the guest's
@@ -209,15 +237,10 @@ export function createAgentRunner(deps: {
     }
   };
 
-  // recent is what the model may read; all is every title the parser kept,
-  // because a guest from years back is still a past guest. null means past
-  // guests cannot be checked, which the run reports instead of implying
-  // there were none.
-  const feedTitles = async (
-    runId: string,
-    feedUrl: string | null,
-    source: "directory" | "visitor",
-  ): Promise<{ recent: string[]; all: string[] } | null> => {
+  // Every episode the parser kept, because a guest from years back is still
+  // a past guest. null means past guests cannot be checked, which the run
+  // reports instead of implying there were none.
+  const readFeed = async (runId: string, feedUrl: string | null, source: "directory" | "visitor"): Promise<ParsedFeed | null> => {
     const url = feedUrl === null ? null : URL.parse(feedUrl);
     if (url === null) {
       await step(runId, { tool: "feed", ok: false, label: "This show lists no feed, so past guests are not checked" });
@@ -225,33 +248,25 @@ export function createAgentRunner(deps: {
     }
     const handles = new FeedHandles();
     const handle = handles.issue(url, source);
-    let all: string[];
     try {
       const { body } = await feeds.safeFetch(handles.resolve(handle));
-      all = feeds
-        .parseFeed(body)
-        .episodes.map((episode) => episode.title)
-        .filter((title) => title !== "");
+      return feeds.parseFeed(body);
     } catch (error) {
       if (!(error instanceof FeedError)) throw error;
       await step(runId, { tool: "feed", ok: false, label: "Could not read the show's feed, so past guests are not checked" });
       return null;
     }
-    const recent = all.slice(0, MAX_EPISODE_TITLES);
-    await step(runId, {
-      tool: "feed",
-      ok: true,
-      label: `Read ${plural(recent.length, "recent episode title", "recent episode titles")} from the show's feed`,
-    });
-    return { recent, all };
   };
 
   // One request for every pick, so all fits share one signal and one scale.
   // The answer replaces any affinity seen during research; a pick it leaves
-  // out has no fit (fit 0, fitKnown false), never a guessed one.
-  const scoreFit = async (qloo: MeteredQloo, ctx: RunContext, picks: ReadonlyArray<{ personId: string }>): Promise<void> => {
-    const ids = [...new Set(picks.map((pick) => pick.personId))].filter((id) => ctx.people.has(id)).slice(0, MAX_FIT_IDS);
-    if (ids.length === 0) return;
+  // out has no fit (fit 0, fitKnown false), never a guessed one. Returns the
+  // ids that got a usable fit.
+  const scoreFit = async (qloo: MeteredQloo, ctx: RunContext, picks: ReadonlyArray<{ personId: string }>): Promise<ReadonlySet<string>> => {
+    const ids = [...new Set(picks.map((pick) => pick.personId))]
+      .filter((id) => ctx.people.has(id) && !ctx.dropped.has(id))
+      .slice(0, MAX_FIT_IDS);
+    if (ids.length === 0) return new Set();
     const { data } = await qloo.call<QlooEntity[]>({
       op: "insights",
       filterType: "urn:entity:person",
@@ -263,16 +278,27 @@ export function createAgentRunner(deps: {
     const wanted = new Set(ids);
     const scored = new Map<string, { affinity: number; popularity: number | null }>();
     for (const entity of data as QlooEntity[]) {
+      if (!wanted.has(entity.entity_id)) continue;
+      // Once find_person goes through Qloo's harness its results carry no
+      // death date, so for a found person this answer is the one place it
+      // is seen. Any row with one drops the person, wherever it falls.
+      if (hasDied(entity)) {
+        dropPerson(ctx, entity.entity_id);
+        continue;
+      }
       const affinity = entity.query?.affinity ?? entity.properties?.affinity;
-      if (!wanted.has(entity.entity_id) || scored.has(entity.entity_id) || !isFiniteNumber(affinity)) continue;
+      if (scored.has(entity.entity_id) || !isFiniteNumber(affinity)) continue;
       scored.set(entity.entity_id, { affinity, popularity: isFiniteNumber(entity.popularity) ? entity.popularity : null });
     }
+    const usable = new Set<string>();
     for (const id of ids) {
       const known = ctx.people.get(id);
-      if (known === undefined) continue;
+      if (known === undefined || ctx.dropped.has(id)) continue;
       const score = scored.get(id);
+      if (score !== undefined) usable.add(id);
       ctx.people.set(id, { ...known, affinity: score?.affinity ?? null, popularity: known.popularity ?? score?.popularity ?? null });
     }
+    return usable;
   };
 
   const fillMissing = async (
@@ -284,6 +310,7 @@ export function createAgentRunner(deps: {
   ): Promise<void> => {
     const today = clock();
     for (const personId of personIds) {
+      if (ctx.dropped.has(personId)) continue;
       for (const tool of fillTools) {
         const present =
           tool === "audience_of" ? ctx.personDemographics.has(personId) : tool === "trend_of" ? ctx.trends.has(personId) : ctx.compares.has(personId);
@@ -330,15 +357,22 @@ export function createAgentRunner(deps: {
         if (!candidate.success) throw new AgentError("SHOW_NOT_FOUND");
         const show = candidate.data;
 
-        const titles = await feedTitles(runId, show.feedUrl, show.feedHandleSource);
+        const feed = await readFeed(runId, show.feedUrl, show.feedHandleSource);
         // The Qloo name, not the directory's or the visitor's text, is what
-        // the model is told (C2.7).
+        // the model is told (C2.7). Every name the show goes by joins the
+        // past-guest check, because a host is named there and rarely in an
+        // episode title.
         const ctx = createRunContext({
           show: { qlooId: show.qlooId, name: show.qlooName },
-          episodeTitles: titles?.recent ?? [],
+          episodeTitles: (feed?.episodes ?? [])
+            .map((episode) => episode.title)
+            .filter((title) => title !== "")
+            .slice(0, MAX_EPISODE_TITLES),
           exclusions: run.input.exclude,
-          pastGuestTitles: titles?.all ?? null,
+          pastGuestEpisodes: feed?.episodes ?? null,
+          showRunners: [show.name, show.publisher, show.qlooName, ...(feed === null ? [] : [feed.title])],
         });
+        if (feed !== null) await step(runId, feedStep(ctx.pastGuests));
         const startedAt = clock().getTime();
         const overTime = () => clock().getTime() - startedAt >= DEFAULT_LIMITS.maxWallMs;
 
@@ -353,11 +387,16 @@ export function createAgentRunner(deps: {
 
         // Exclusions do not depend on the data fetched below, so a board that
         // is already too small fails before any more Qloo calls are spent.
+        // The fit floor waits, because a find_person pick has no fit until
+        // the fit call below.
+        if (buildBoard(ctx, picks, { applyFitFloor: false }).length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
+        if (overTime()) throw new AgentError("AGENT_LIMIT");
+        const scored = await scoreFit(qloo, ctx, picks);
+        await step(runId, { tool: "fit", ok: true, label: `Scored ${plural(scored.size, "guest", "guests")} against this show's listeners` });
+        // Built again once every pick has its fit, so a pick the floor or a
+        // death date removes is never sent for more data.
         const kept = buildBoard(ctx, picks).map((entry) => entry.personId);
         if (kept.length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
-        if (overTime()) throw new AgentError("AGENT_LIMIT");
-        await scoreFit(qloo, ctx, picks);
-        await step(runId, { tool: "fit", ok: true, label: `Scored ${plural(kept.length, "guest", "guests")} against this show's listeners` });
         await fillMissing(qloo, runId, ctx, kept, overTime);
 
         // buildBoard has cleaned every guest name, tag and angle. The show
@@ -381,7 +420,10 @@ export function createAgentRunner(deps: {
           rising: entry.rising.state,
         }));
         const pastGuests = { checked: ctx.pastGuests.checked, skipped: ctx.pastGuests.skipped.size };
-        await appendEvent(db, runId, "board", { guests, pastGuests }, clock());
+        const coverage = { titles: ctx.pastGuests.titles, since: ctx.pastGuests.since };
+        await appendEvent(db, runId, "board", { guests, pastGuests: { ...pastGuests, ...coverage } }, clock());
+        // The done event keeps exactly { checked, skipped }: the seed command
+        // reads it with a strict schema (src/ops/seed.ts).
         await finishRun(db, runId, "done", { name: "done", data: { guests: board.length, pastGuests } }, undefined, clock());
       });
     },

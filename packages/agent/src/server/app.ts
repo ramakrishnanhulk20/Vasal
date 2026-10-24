@@ -7,6 +7,7 @@ import { z } from "zod";
 import { kolamFor, type Kolam } from "../kolam/kolam.js";
 import { createMcpRoute } from "../mcp/server.js";
 import { visitorKey } from "../net/visitor-key.js";
+import { isPromoted } from "../ops/promote.js";
 import type { Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { liveRunsEnabled } from "../store/flags.js";
@@ -21,6 +22,7 @@ import {
   claimBrief,
   claimRunStatus,
   createRun,
+  finishRun,
   getBoardGuest,
   getBrief,
   getBriefClaim,
@@ -30,9 +32,11 @@ import {
   listCandidates,
   listEventsAfter,
   listShowcase,
-  parseBoardGuest,
+  publicBoardGuest,
   setRunStatus,
+  type PublicBoardGuest,
   type RunInput,
+  type RunRecord,
 } from "./runs.js";
 import { formatSseFrame, parseLastEventId, SSE_PING } from "./sse.js";
 import { TURNSTILE_ACTIONS } from "./turnstile.js";
@@ -55,7 +59,17 @@ const MAX_EXCLUSIONS = 25;
 const MAX_EXCLUSION_LENGTH = 100;
 const MAX_TOKEN_LENGTH = 2_048;
 const MAX_BRIEFS_PER_RUN = 5;
+// Long past the time a visitor needs to pick a show; a run older than this
+// is closed at its next confirm instead of continuing on a stale pick.
+const CONFIRM_TTL_MS = 30 * 60 * 1_000;
+const CONFIRM_EXPIRED = "CONFIRM_EXPIRED";
 const MAX_STREAMS_PER_RUN = 3;
+// Two tabs on each of three runs. Without it one visitor could hold every
+// place the site-wide cap leaves.
+const MAX_STREAMS_PER_VISITOR = 6;
+// Not 64 hex characters, so it can never equal a visitorKey. Every stream
+// whose caller has no address shares this one visitor's places.
+const UNIDENTIFIED_VISITOR = "unidentified";
 // Each open stream polls the database twice every streamPollMs, so this cap
 // bounds the polling load one process can be made to carry.
 const DEFAULT_MAX_OPEN_STREAMS = 100;
@@ -122,25 +136,32 @@ function isRunPath(path: string): boolean {
   return path === "/runs" || path.startsWith("/runs/");
 }
 
+// The website's spending doors act only on website runs. An MCP run spends
+// from its key's own caps, so it gets the same 404 as a run that does not
+// exist and the caller learns nothing about it (D4.1).
+function isWebRun(run: RunRecord | null): run is RunRecord {
+  return run !== null && run.surface === "web";
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// The server-issued id is written last so stored data can never replace it.
-// Data that is not an object counts as missing (C6.5).
-function withIds(items: Array<{ id: string; data: unknown }>): Array<Record<string, unknown>> {
-  return items.flatMap((item) => (isPlainObject(item.data) ? [{ ...item.data, id: item.id }] : []));
+// Only rows the runner's own schema reads back are shown (C6.5), as the
+// fields the page needs and nothing else (D5.5).
+function publicBoard(items: Array<{ id: string; data: unknown }>): PublicBoardGuest[] {
+  return items.flatMap((item) => {
+    const guest = publicBoardGuest(item);
+    return guest === null ? [] : [guest];
+  });
 }
 
-// Only rows the runner's own schema reads back are drawn (C6.5), and only
-// their server id, rank and tag count reach the drawing, never their text (C3.9).
-function boardKolam(runId: string, board: Array<{ id: string; data: unknown }>): Kolam | null {
+// Drawn from exactly the guests shown, and only from their server id, rank
+// and tag count, never their text (C3.9).
+function boardKolam(runId: string, board: PublicBoardGuest[]): Kolam | null {
   return kolamFor(
     runId,
-    board.flatMap((item) => {
-      const row = parseBoardGuest(JSON.stringify(item.data));
-      return row === null ? [] : [{ guestId: item.id, fitRank: row.fitRank, tagCount: row.sharedTags.length }];
-    }),
+    board.map((guest) => ({ guestId: guest.id, fitRank: guest.fitRank, tagCount: guest.sharedTags.length })),
   );
 }
 
@@ -167,24 +188,35 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * method gives 404 NOT_FOUND, and there is no way to list visitor runs
  * (C6.1). GET /showcase lists only the runs the operator promoted (C6.3),
  * from storage alone, cacheable for 60 seconds and open to indexing.
- * GET /runs/:id for a done run, and each showcase run, carry a kolam drawn
- * from board numbers and guest ids only (kolam/kolam.ts, C3.9), or null.
- * Confirm and brief act only on ids the server issued for that run (C6.2).
+ * GET /runs/:id shows a done run's board as publicBoardGuest rows only, so
+ * no Qloo entity id or internal number reaches the page and a row that fails
+ * the runner's schema is left out (D5.5, C6.5). It, and each showcase run,
+ * carry a kolam drawn from those rows' numbers and guest ids only
+ * (kolam/kolam.ts, C3.9), or null.
+ * Confirm and brief act only on website runs, and give an MCP run the same
+ * 404 NOT_FOUND as an unknown one before any claim, cap or agent call
+ * (D4.1). They act only on ids the server issued for that run (C6.2). A
+ * confirm on a run that has waited more than 30 minutes since it was created
+ * closes it as failed with CONFIRM_EXPIRED and gives 410 CONFIRM_EXPIRED.
  * Each guest's brief is claimed once, at most 5 claims per run, and a brief
  * that failed may be asked for once more; after a second failure the POST
  * gives 409 { error: "BRIEF_FAILED", code } (C5.8), even with live runs
  * off, which refuse only a brief that would call the model. An agent that
  * is not ready gets that same brief 503 AGENT_NOT_READY, before any claim,
- * so a server with no keys spends no guest's attempts. GET
+ * so a server with no keys spends no guest's attempts. On a promoted run the
+ * POST never claims: a stored brief is answered 200 and a missing one 409
+ * BRIEF_NOT_READY, whether live runs are on or off (C6.3). GET
  * /runs/:id/briefs/:guestId reports { status: "done", brief },
  * { status: "pending" }, { status: "failed", code } or { status: "none" }
  * from storage alone. The event stream writes only formatSseFrame
- * frames and pings (C3.3), allows 3 open streams per run and
+ * frames and pings (C3.3), allows 3 open streams per run, 6 per visitor and
  * maxOpenStreams (100 by default) in all, in this process, and ends at a
- * done or failed event, a finished and drained run, or streamLifetimeMs;
- * pings follow the `now` clock, checked once per poll. The total is checked
- * first, and a full one gives 503 STREAMS_FULL with Retry-After: 5; a full
- * run gives 429 TOO_MANY_STREAMS. The page then reads GET /runs/:id instead.
+ * done or failed event, a finished and drained run, a run awaiting its
+ * confirm once its candidates frame is out, or streamLifetimeMs; pings
+ * follow the `now` clock, checked once per poll. The total is checked
+ * first, then the visitor's count, and a full one gives 503 STREAMS_FULL
+ * with Retry-After: 5; a full run gives 429 TOO_MANY_STREAMS. The page then
+ * reads GET /runs/:id instead.
  * Every POST that can spend must pass the Origin and Content-Type check, the
  * 8 KiB body cap and a strict body schema before anything else runs (C5.5,
  * C8.1), and a GET or HEAD never spends (C5.4). POST /runs also needs a
@@ -204,6 +236,9 @@ export function createApp(deps: AppDeps): Hono {
   const lifetimeMs = wholeNumber(deps.streamLifetimeMs, DEFAULT_STREAM_LIFETIME_MS, DEFAULT_STREAM_LIFETIME_MS);
   const maxOpenStreams = wholeNumber(deps.maxOpenStreams, DEFAULT_MAX_OPEN_STREAMS, MAX_OPEN_STREAMS);
   const openStreams = new Map<string, number>();
+  // Holds a key only while that visitor has a stream open, so it never holds
+  // more entries than there are open streams.
+  const visitorStreams = new Map<string, number>();
   let totalStreams = 0;
   const app = new Hono();
 
@@ -229,6 +264,13 @@ export function createApp(deps: AppDeps): Hono {
     }
   };
 
+  // Run starts and streams find the caller's address the same way, so
+  // visitorKey turns it into the same visitor for both (C5.3).
+  const addressOf = (c: Context): string | null => {
+    const headerValue = config.clientIpHeader === null ? null : (c.req.header(config.clientIpHeader) ?? null);
+    return clientAddressFrom(headerValue, socketOf(c), config.clientIpHeader);
+  };
+
   const isHuman = async (token: string, address: string): Promise<boolean> => {
     try {
       return (await deps.verifyTurnstile(token, address, TURNSTILE_ACTIONS.runStart)) === true;
@@ -247,6 +289,24 @@ export function createApp(deps: AppDeps): Hono {
       throw error;
     }
     await appendEvent(db, runId, "failed", { code }, now());
+  };
+
+  // A run nobody confirmed in time is closed, so awaiting_confirm always ends
+  // (C6.4). Moving it off awaiting_confirm first is the lock a confirm also
+  // takes, so a confirm that won a moment earlier is never ended under it.
+  // finishRun then writes the status and failed event the way the runner
+  // ends a failed run. Nothing is spent and no slot is taken.
+  const expireRun = async (c: Context, runId: string): Promise<Response> => {
+    if (!(await claimRunStatus(db, runId, "awaiting_confirm", "running", now()))) return refuse(c, 409, "NOT_AWAITING");
+    try {
+      await finishRun(db, runId, "failed", { name: "failed", data: { code: CONFIRM_EXPIRED } }, CONFIRM_EXPIRED, now());
+    } catch (error) {
+      // No agent holds this run, so it must not stay running if the one
+      // transaction failed.
+      await failRun(runId, CONFIRM_EXPIRED).catch((failure: unknown) => logFailure(patternOf(c, "unmatched"), failure));
+      throw error;
+    }
+    return refuse(c, 410, CONFIRM_EXPIRED);
   };
 
   // The request has already been answered when this runs. A run that stops
@@ -285,9 +345,10 @@ export function createApp(deps: AppDeps): Hono {
     return parsed.success ? parsed.data : null;
   };
 
-  // The caller has already counted this stream in openStreams and the total;
-  // shutdown gives both places back exactly once, whichever way it ends.
-  const eventStream = (runId: string, afterSeq: number, signal: AbortSignal): ReadableStream<Uint8Array> => {
+  // The caller has already counted this stream in openStreams, visitorStreams
+  // and the total; shutdown gives all three places back exactly once,
+  // whichever way it ends.
+  const eventStream = (runId: string, visitor: string, afterSeq: number, signal: AbortSignal): ReadableStream<Uint8Array> => {
     const encoder = new TextEncoder();
     let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
     let closed = false;
@@ -303,6 +364,9 @@ export function createApp(deps: AppDeps): Hono {
       const open = (openStreams.get(runId) ?? 1) - 1;
       if (open > 0) openStreams.set(runId, open);
       else openStreams.delete(runId);
+      const held = (visitorStreams.get(visitor) ?? 1) - 1;
+      if (held > 0) visitorStreams.set(visitor, held);
+      else visitorStreams.delete(visitor);
       totalStreams -= 1;
       if (closeBody) {
         try {
@@ -345,6 +409,12 @@ export function createApp(deps: AppDeps): Hono {
           if (event.event === "done" || event.event === "failed") return;
         }
         if (events.length === EVENT_PAGE) continue;
+        // The runner appends the candidates event before it moves the run to
+        // awaiting_confirm, and the status was read before these events, so
+        // the candidates frame has now gone out, or Last-Event-ID shows the
+        // caller already had it. Nothing more comes until someone confirms,
+        // which may be never, so the place is given back now (C5.8).
+        if (run?.status === "awaiting_confirm") return;
         if (run === null || run.status === "done" || run.status === "failed") {
           if (drainedAfterFinish) return;
           drainedAfterFinish = true;
@@ -422,8 +492,7 @@ export function createApp(deps: AppDeps): Hono {
     if (body === null) return refuse(c, 400, "BAD_INPUT");
     if (!(await liveRunsEnabled(db))) return refuse(c, 503, "LIVE_RUNS_OFF");
 
-    const headerValue = config.clientIpHeader === null ? null : (c.req.header(config.clientIpHeader) ?? null);
-    const address = clientAddressFrom(headerValue, socketOf(c), config.clientIpHeader);
+    const address = addressOf(c);
     if (address === null) return refuse(c, 400, "NO_CLIENT_ADDRESS");
     if (!(await isHuman(body.turnstileToken, address))) return refuse(c, 403, "HUMAN_CHECK_FAILED");
     const visitor = visitorKey(address, config.visitorHashSecret);
@@ -457,7 +526,10 @@ export function createApp(deps: AppDeps): Hono {
   app.get("/runs/:id", async (c) => {
     const run = await getRun(db, c.req.param("id"));
     if (run === null) return refuse(c, 404, "NOT_FOUND");
-    const [candidates, board] = await Promise.all([listCandidates(db, run.id), listBoard(db, run.id)]);
+    const [candidates, stored] = await Promise.all([listCandidates(db, run.id), listBoard(db, run.id)]);
+    // Only a finished run shows its board, so a run that stopped early is
+    // never shown with partial results (C6.4).
+    const board = run.status === "done" ? publicBoard(stored) : [];
     return c.json({
       id: run.id,
       status: run.status,
@@ -465,13 +537,24 @@ export function createApp(deps: AppDeps): Hono {
       finishedAt: run.finishedAt,
       errorCode: run.errorCode,
       candidates: publicCandidates(candidates),
-      // Only a finished run shows its board, so a run that stopped early is
-      // never shown with partial results (C6.4).
-      board: run.status === "done" ? withIds(board) : [],
+      board,
       kolam: run.status === "done" ? boardKolam(run.id, board) : null,
     });
   });
 
+  /**
+   * The run's event stream. It ends at a done or failed event, at a finished
+   * and drained run, at streamLifetimeMs, and once the run is awaiting_confirm
+   * and its candidates frame has gone out (or Last-Event-ID shows the caller
+   * already had it). The page closes its EventSource on the candidates frame
+   * and opens a new stream, with Last-Event-ID, after its confirm is
+   * accepted; a stream opened while the run still waits ends at once. Places
+   * are capped at 3 per run, 6 per visitor and maxOpenStreams in all. The
+   * visitor is found from the address the way POST /runs finds it, and
+   * callers with no readable address share one visitor's 6. A full total or
+   * visitor gives 503 STREAMS_FULL with Retry-After: 5, a full run 429
+   * TOO_MANY_STREAMS.
+   */
   app.get("/runs/:id/events", async (c) => {
     const run = await getRun(db, c.req.param("id"));
     if (run === null) return refuse(c, 404, "NOT_FOUND");
@@ -479,21 +562,32 @@ export function createApp(deps: AppDeps): Hono {
     // the run's places until its lifetime ran out.
     if (c.req.method === "HEAD") return c.body(null, 200, SSE_HEADERS);
 
-    if (totalStreams >= maxOpenStreams) return refuse(c, 503, "STREAMS_FULL", { "Retry-After": STREAMS_FULL_RETRY_SECONDS });
+    const full = (): Response => refuse(c, 503, "STREAMS_FULL", { "Retry-After": STREAMS_FULL_RETRY_SECONDS });
+    if (totalStreams >= maxOpenStreams) return full();
+    // A read is not refused for a missing address, but every caller without
+    // one shares a single visitor's places, so leaving it out never buys more.
+    const address = addressOf(c);
+    const visitor = (address === null ? null : visitorKey(address, config.visitorHashSecret)) ?? UNIDENTIFIED_VISITOR;
+    const mine = visitorStreams.get(visitor) ?? 0;
+    if (mine >= MAX_STREAMS_PER_VISITOR) return full();
     const open = openStreams.get(run.id) ?? 0;
     if (open >= MAX_STREAMS_PER_RUN) return refuse(c, 429, "TOO_MANY_STREAMS");
     openStreams.set(run.id, open + 1);
+    visitorStreams.set(visitor, mine + 1);
     totalStreams += 1;
     const afterSeq = parseLastEventId(c.req.header("last-event-id"));
-    return c.body(eventStream(run.id, afterSeq, c.req.raw.signal), 200, SSE_HEADERS);
+    return c.body(eventStream(run.id, visitor, afterSeq, c.req.raw.signal), 200, SSE_HEADERS);
   });
 
   app.post("/runs/:id/confirm", sameSiteJson, smallBody, async (c) => {
     const body = await readBody(c, confirmBody);
     if (body === null) return refuse(c, 400, "BAD_INPUT");
     const run = await getRun(db, c.req.param("id"));
-    if (run === null) return refuse(c, 404, "NOT_FOUND");
+    if (!isWebRun(run)) return refuse(c, 404, "NOT_FOUND");
     if ((await getCandidate(db, run.id, body.candidateId)) === null) return refuse(c, 404, "UNKNOWN_CANDIDATE");
+    if (run.status === "awaiting_confirm" && now().getTime() - run.createdAt.getTime() > CONFIRM_TTL_MS) {
+      return expireRun(c, run.id);
+    }
     // Continuing is where a run spends most of its Qloo calls and model
     // tokens, so it obeys the kill switch and takes an in-flight slot just as
     // a start does (C5.7, C5.8). A run refused here stays awaiting_confirm.
@@ -522,13 +616,17 @@ export function createApp(deps: AppDeps): Hono {
     const body = await readBody(c, briefBody);
     if (body === null) return refuse(c, 400, "BAD_INPUT");
     const run = await getRun(db, c.req.param("id"));
-    if (run === null) return refuse(c, 404, "NOT_FOUND");
+    if (!isWebRun(run)) return refuse(c, 404, "NOT_FOUND");
     if (run.status !== "done") return refuse(c, 409, "NOT_READY");
     const { guestId } = body;
     if ((await getBoardGuest(db, run.id, guestId)) === null) return refuse(c, 404, "UNKNOWN_GUEST");
 
     const brief = await getBrief(db, run.id, guestId);
     if (brief !== null) return c.json({ brief }, 200);
+    // The operator writes and reads a showcase run's briefs before promoting
+    // it (ops briefs), so no visitor ever writes the one every later visitor
+    // reads (C6.3). Checked before the kill switch and any claim.
+    if (await isPromoted(db, run.id)) return refuse(c, 409, "BRIEF_NOT_READY");
     // Only new model spend stops when live runs are off (C5.7), so a stored
     // brief, a brief that failed for good and one already being written are
     // all answered from storage first. claimBrief below stays the only gate

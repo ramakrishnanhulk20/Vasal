@@ -68,7 +68,7 @@ describe("rollBuckets", () => {
   it("sets every bucket of the covering profile with its cap and window end", async () => {
     const outcome = await rollAt("2026-10-19T15:30:00.000Z");
 
-    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-10-01", to: "2026-11-01" });
+    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-10-01", to: "2026-10-30" });
     const byKey = rolled(outcome);
     expect(Object.keys(byKey).sort()).toEqual([
       "anthropic:day",
@@ -134,10 +134,10 @@ describe("rollBuckets", () => {
     const outcome = await rollAt("2026-11-01T00:00:00.000Z");
     const next = rolled(outcome);
 
-    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-11-01", to: "2026-12-01" });
+    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-11-01", to: "2026-11-06" });
     expect(next["qloo:month"]?.changed).toEqual(["cap", "window"]);
     expect(await usage(db, "qloo:month")).toEqual({ cap: 32_000, used: 0, windowEnd: at("2026-12-01T02:00:00.000Z") });
-    expect(await usage(db, "qloo:day")).toEqual({ cap: 1_400, used: 0, windowEnd: at("2026-11-02T02:00:00.000Z") });
+    expect(await usage(db, "qloo:day")).toEqual({ cap: 3_000, used: 0, windowEnd: at("2026-11-02T02:00:00.000Z") });
     expect(await usage(db, "qloo:day:offline")).toEqual({ cap: 300, used: 0, windowEnd: at("2026-11-02T02:00:00.000Z") });
   });
 
@@ -215,7 +215,7 @@ describe("rollBuckets", () => {
   it("lets health call a window ended exactly when the meter starts refusing it", async () => {
     await rollAt("2026-10-19T15:30:00.000Z");
     const dayOf = async (iso: string) => {
-      const report = await healthReport(db, at(iso));
+      const report = await healthReport(db, at(iso), policy);
       return { ended: report.buckets?.find((bucket) => bucket.key === "qloo:day")?.windowEnded, problems: report.problems };
     };
 
@@ -231,7 +231,7 @@ describe("rollBuckets", () => {
   });
 
   it("sets nothing and says so when no profile covers now", async () => {
-    expect(await rollAt("2026-12-01T00:00:00.000Z")).toEqual({ covered: false });
+    expect(await rollAt("2027-02-01T00:00:00.000Z")).toEqual({ covered: false });
     expect(await rollAt("2026-09-30T23:59:59.999Z")).toEqual({ covered: false });
     expect(await bucketCount()).toBe(0);
   });

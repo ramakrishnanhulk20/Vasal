@@ -1,22 +1,36 @@
 // Covers the operator's showcase commands in src/ops/promote.ts on PGlite,
-// which runs as its owner: the preview, promotion and its refusals, moving a
-// run, unpromoting, the list, and the terminal formatting. It does not cover
-// the app role being refused writes (server-runs.test.ts), two operators
-// promoting at once on hosted Postgres (PGlite has one connection, so the
-// table lock never waits), or the argument parsing and exit codes of
-// scripts/ops.ts (its --dev selftest runs those).
+// which runs as its owner: the preview, promotion and its refusals including
+// a missing brief, moving a run, unpromoting, the list, isPromoted, reading a
+// run's briefs, and the terminal formatting. It does not cover the app role
+// being refused writes (server-runs.test.ts), two operators promoting at once
+// on hosted Postgres (PGlite has one connection, so the table lock never
+// waits), or the argument parsing and exit codes of scripts/ops.ts (its
+// --dev selftest runs those).
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  formatBriefs,
   formatPreview,
   formatPromoted,
+  isPromoted,
   listPromoted,
   previewRun,
   PromoteError,
   promoteRun,
+  readBriefs,
   unpromoteRun,
 } from "../src/ops/promote.js";
-import { createRun, listShowcase, putBoard, setRunStatus, type RunStatus } from "../src/server/runs.js";
+import {
+  claimBrief,
+  createRun,
+  listShowcase,
+  markBriefFailed,
+  putBoard,
+  putBrief,
+  setRunStatus,
+  type RunStatus,
+} from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
+import { storeBriefs, syntheticBrief } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
 const NOW = new Date("2026-10-19T12:00:00.000Z");
@@ -47,10 +61,16 @@ const guest = (n: number, overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-async function runWith(status: RunStatus, guests: unknown[]): Promise<{ runId: string; guestIds: string[] }> {
+// Every guest gets a brief unless `briefs` says how many of the first ones do.
+async function runWith(
+  status: RunStatus,
+  guests: unknown[],
+  opts: { briefs?: number } = {},
+): Promise<{ runId: string; guestIds: string[] }> {
   const runId = await createRun(db, { show: "Synthetic Show", exclude: [] }, NOW);
   await setRunStatus(db, runId, "running", undefined, NOW);
   const guestIds = await putBoard(db, runId, guests);
+  await storeBriefs(db, runId, guestIds.slice(0, opts.briefs ?? guestIds.length));
   if (status === "done" || status === "failed") {
     await setRunStatus(db, runId, status, status === "failed" ? "QLOO_LIMIT" : undefined, NOW);
   }
@@ -145,6 +165,30 @@ describe("promoteRun (C6.3)", () => {
     expect(await showcaseRows()).toEqual([{ runId, position: 1 }]);
   });
 
+  it("refuses a run until every board guest has a brief that reads back, and names that in the preview", async () => {
+    const { runId, guestIds } = await runWith("done", [guest(1), guest(2), guest(3)], { briefs: 1 });
+    expect(await putBrief(db, runId, guestIds[1]!, { text: "not a brief" })).toBe(true);
+
+    expect((await previewRun(db, runId)).refusal).toBe("PROMOTE_BRIEFS_MISSING");
+    expect(await refusalOf(promoteRun(db, runId, 1))).toBe("PROMOTE_BRIEFS_MISSING");
+    expect(await showcaseRows()).toEqual([]);
+    const lines = formatPreview(await previewRun(db, runId));
+    expect(lines.filter((line) => line.startsWith("       brief: "))).toEqual([
+      "       brief: written",
+      "       brief: not written",
+      "       brief: not written",
+    ]);
+    expect(lines.at(-1)).toBe(
+      "  This run cannot go on the home page. Every board guest needs a written brief first: run ops briefs on this run with --yes, read every brief it prints, then promote.",
+    );
+
+    const fixed = await runWith("done", [guest(1), guest(2), guest(3)], { briefs: 2 });
+    expect(await refusalOf(promoteRun(db, fixed.runId, 1))).toBe("PROMOTE_BRIEFS_MISSING");
+    await putBrief(db, fixed.runId, fixed.guestIds[2]!, syntheticBrief(3));
+    await promoteRun(db, fixed.runId, 1);
+    expect(await showcaseRows()).toEqual([{ runId: fixed.runId, position: 1 }]);
+  });
+
   it("refuses a position another run holds and leaves that run where it is", async () => {
     const first = await runWith("done", [guest(1), guest(2), guest(3)]);
     const second = await runWith("done", [guest(4), guest(5), guest(6)]);
@@ -173,7 +217,9 @@ describe("unpromoteRun and listPromoted", () => {
     ]);
     for (const run of promoted) expect(Number.isFinite(run.promotedAt.getTime())).toBe(true);
 
+    expect(await isPromoted(db, second.runId)).toBe(true);
     expect(await unpromoteRun(db, second.runId)).toBe(2);
+    expect(await isPromoted(db, second.runId)).toBe(false);
     expect((await listPromoted(db)).map((run) => run.runId)).toEqual([first.runId]);
     expect((await listShowcase(db)).map((run) => run.runId)).toEqual([first.runId]);
     expect(await refusalOf(unpromoteRun(db, second.runId))).toBe("PROMOTE_NOT_PROMOTED");
@@ -212,5 +258,53 @@ describe("terminal formatting", () => {
       `    4. ${small.runId}  not shown: the run is not done or its top guests do not read back cleanly`,
     ]);
     expect(formatPromoted([], [])).toEqual(["Nothing is promoted, so the home page shows no example runs."]);
+  });
+
+  it("prints every brief in full with its labels, and why each missing one is missing, with control characters replaced", async () => {
+    const hostile = "Guest\u001b[2J‮evil";
+    const { runId, guestIds } = await runWith("done", [guest(1, { name: hostile }), guest(2), guest(3), guest(4), guest(5)], { briefs: 0 });
+    const [written, none, retry, failed, pending] = guestIds as [string, string, string, string, string];
+    await putBrief(db, runId, written, {
+      ...syntheticBrief(1),
+      why: "Why text\u001b]0;owned\u0007",
+      pitch_body: "Line one\nLine two",
+      removed: { links: 1, emails: 0 },
+    });
+    await claimBrief(db, runId, retry, 5, NOW);
+    await markBriefFailed(db, runId, retry, "MODEL_TIMEOUT");
+    await claimBrief(db, runId, failed, 5, NOW);
+    await markBriefFailed(db, runId, failed, "MODEL_TIMEOUT");
+    await claimBrief(db, runId, failed, 5, NOW);
+    await markBriefFailed(db, runId, failed, "AGENT_BAD_PROSE");
+    await claimBrief(db, runId, pending, 5, NOW);
+    const briefs = await readBriefs(db, runId);
+    expect(briefs.guests.find((entry) => entry.id === none)?.state).toEqual({ kind: "none" });
+
+    const full = formatBriefs(briefs, { full: true });
+    const listed = formatBriefs(briefs, { full: false });
+
+    expect(full).toEqual([
+      `Briefs for run ${runId}, Synthetic Show: 1 of 5 guests have a written brief.`,
+      "     1. Guest�[2J�evil",
+      "        Why: Why text�]0;owned�",
+      "        Angle: A synthetic angle.",
+      "        Questions:",
+      "          1. One?",
+      "          2. Two?",
+      "          3. Three?",
+      "          4. Four?",
+      "          5. Five?",
+      "        Pitch subject: A synthetic pitch",
+      "        Pitch body:",
+      "          Line one",
+      "          Line two",
+      "        Removed from the draft: 1 link and 0 email addresses.",
+      "     2. Synthetic Guest 2: no brief yet.",
+      "     3. Synthetic Guest 3: failed once with MODEL_TIMEOUT, so it has one attempt left.",
+      "     4. Synthetic Guest 4: failed on both attempts, last with AGENT_BAD_PROSE, so this run can never get its brief.",
+      "     5. Synthetic Guest 5: a writer holds its claim. If nothing is writing it, a restart of the agent server frees it.",
+    ]);
+    expect(listed).toEqual([full[0], ...full.slice(-4)]);
+    expect(full.join("\n")).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/u);
   });
 });

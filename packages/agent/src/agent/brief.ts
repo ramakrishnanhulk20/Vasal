@@ -44,10 +44,13 @@ const RISING_WORDS: Record<BoardEntry["rising"]["state"], string> = {
 // wrapped in words that make nonsense of it ("Booking X is well known, so a
 // stretch to book"), so the model may only place this as a sentence of its
 // own. The stored board keeps the bare labels; only the brief uses these.
+// With no popularity behind it, the sentence says only that, so missing data
+// never reads as an easy booking (G15).
 const REACH_SENTENCES: Record<BoardEntry["reach"], (guest: string) => string> = {
   "household name": (guest) => `${guest} is a household name, so booking will be a long shot`,
   "well known": (guest) => `${guest} is well known, so booking will take some work`,
   bookable: (guest) => `${guest} is within reach, so booking is realistic`,
+  unknown: () => "Qloo has no reach data for this guest",
 };
 const REACH_TOKEN = "{{reach}}";
 const HOST_ONLY: ReadonlySet<string> = new Set(["reach", "brings"]);
@@ -91,8 +94,11 @@ function factsFor(guest: BoardEntry, tags: readonly string[]): string {
     },
     reach: {
       placeholder: REACH_TOKEN,
-      meaning:
-        "a finished sentence, already naming the guest, on how hard this guest is to book. Use it as a sentence of its own: start a sentence with {{reach}} and put a full stop straight after it",
+      meaning: `${
+        guest.reach === "unknown"
+          ? "a finished sentence saying Qloo has no data on how hard this guest is to book"
+          : "a finished sentence, already naming the guest, on how hard this guest is to book"
+      }. Use it as a sentence of its own: start a sentence with {{reach}} and put a full stop straight after it`,
       value: REACH_SENTENCES[guest.reach]("{{guest}}"),
     },
     rising:
@@ -185,7 +191,8 @@ async function draftOnce(model: ModelClient, user: string, allowed: readonly str
  *
  * Placeholders are then filled by code: the fit as a whole percent such as
  * "86% fit", the reach as a whole sentence naming the guest (for example
- * "Blink-182 is within reach, so booking is realistic"), the names as Qloo
+ * "Blink-182 is within reach, so booking is realistic", or "Qloo has no
+ * reach data for this guest" when reach is unknown), the names as Qloo
  * and the directory gave them. A draft that uses {{reach}} anywhere but as a
  * sentence of its own, opening a sentence and followed by its full stop,
  * fails and is written again.

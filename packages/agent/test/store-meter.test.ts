@@ -256,6 +256,48 @@ describe("waitForQlooSlot", () => {
     expect(sleeps).toEqual([900, 900, 900]);
     expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP);
   });
+
+  it("holds a caller to its perSecondCap of 2: the third call in a second waits into the next one", async () => {
+    await openQlooBuckets(100, 1_000);
+    const time = fakeTime(NOW);
+    const two = { now: time.now, sleep: time.sleep, perSecondCap: 2 };
+
+    expect(await waitForQlooSlot(db, two)).toBe(true);
+    expect(await waitForQlooSlot(db, two)).toBe(true);
+    expect(time.sleeps).toEqual([]);
+    expect(await waitForQlooSlot(db, two)).toBe(true);
+    expect(time.sleeps).toEqual([900]);
+    expect(await usedOf("qloo:day")).toBe(3);
+  });
+
+  it("changes only the capped caller: others still get the full cap in that second, and it yields to calls they made", async () => {
+    await openQlooBuckets(100, 1_000);
+    const capped = { now: () => NOW, sleep: async () => {}, maxWaitMs: 0, perSecondCap: 2 };
+
+    expect(await waitForQlooSlot(db, capped)).toBe(true);
+    expect(await waitForQlooSlot(db, capped)).toBe(true);
+    expect(await waitForQlooSlot(db, capped)).toBe(false);
+    const others: boolean[] = [];
+    for (let k = 0; k < QLOO_PER_SECOND_CAP - 1; k += 1) others.push(await reserveQlooCall(db, NOW));
+    expect(others).toEqual([...Array<boolean>(QLOO_PER_SECOND_CAP - 2).fill(true), false]);
+
+    const next = new Date(NOW.getTime() + 1_000);
+    expect(await reserveQlooCall(db, next)).toBe(true);
+    expect(await reserveQlooCall(db, next)).toBe(true);
+    expect(await waitForQlooSlot(db, { ...capped, now: () => next })).toBe(false);
+    expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP + 2);
+  });
+
+  it("refuses a perSecondCap outside 1 to QLOO_PER_SECOND_CAP before touching any bucket, and accepts both ends", async () => {
+    await openQlooBuckets(100, 1_000);
+
+    for (const perSecondCap of [0, -1, 1.5, QLOO_PER_SECOND_CAP + 1, Number.NaN, Number.POSITIVE_INFINITY, "2" as unknown as number]) {
+      expect(await codeOf(waitForQlooSlot(db, { now: () => NOW, perSecondCap })), String(perSecondCap)).toBe("STORE_BAD_INPUT");
+    }
+    expect(await usedOf("qloo:month")).toBe(0);
+    expect(await waitForQlooSlot(db, { now: () => NOW, perSecondCap: 1 })).toBe(true);
+    expect(await waitForQlooSlot(db, { now: () => NOW, perSecondCap: QLOO_PER_SECOND_CAP })).toBe(true);
+  });
 });
 
 describe("offline Qloo share (dayKey)", () => {

@@ -39,7 +39,9 @@ The effect is small. A correlation of 0.14 means fit tilts the odds. It does not
 - **19 Oct 2026, 05:41 UTC:** the method and the show list were committed ([52e208f](https://github.com/ramakrishnanhulk20/Vasal/commit/52e208f)). Our Qloo key did not exist yet.
 - **19 Oct, 10:25 UTC:** each show's YouTube channel was pinned ([4a2a8ca](https://github.com/ramakrishnanhulk20/Vasal/commit/4a2a8ca)).
 - **21 Oct, 10:16 UTC:** three fixes to the title reader went into the change log ([40547e0](https://github.com/ramakrishnanhulk20/Vasal/commit/40547e0)). They were found by a pre-flight that looked only at 12 episode titles.
-- **21 Oct, 10:52 UTC:** the pull started, and it was analysed as it finished.
+- **21 Oct, 10:16 UTC:** pull 1 started. About 30 minutes later it stopped with an error, because a scheduled YouTube premiere had no duration yet. It wrote no dataset, and no number on this page comes from it.
+- **21 Oct, 10:52 UTC:** pull 2 started, with a fix that reads a missing duration as unknown. The fix was not yet committed. Pull 2 is the dataset 20261021T105230Z, and it was analysed as it finished.
+- **21 Oct, 15:07 UTC:** the fix was committed ([d16c6d9](https://github.com/ramakrishnanhulk20/Vasal/commit/d16c6d9)). The pre-registration's [change log](backtest-preregistration.md#change-log) gained an entry for both pulls on 24 Oct.
 
 ## The sample
 
@@ -79,6 +81,16 @@ We reran the same analysis without all 70 Fact Check episodes and the 2 travel s
 
 Both are still supported.
 
+## Repeat guests: a check added after publication
+
+This check is post-hoc. It was added on 24 Oct, after this page was published, at a reviewer's request. It is not part of the pre-registered result.
+
+Some guests appear on the same show more than once. The 755 episodes have 603 distinct guests, counting each show's guests separately. The intervals above resample episodes, so a guest's episodes count as independent, which can make an interval too narrow. Two checks on the same dataset:
+- **Resampling guests instead of episodes,** with all of a guest's episodes drawn together (2,000 resamples, seed 20261024): H1's interval is 0.065 to 0.211, and H2's is 0.020 to 0.167.
+- **One row per guest,** using the mean adjusted views of that guest's episodes: H1 is 0.153 and H2 is 0.111, over 603 guests.
+
+Both guest-level intervals stay above 0, so both verdicts stand. H2's lower end, 0.020, is close to 0.
+
 ## What this does not show
 
 - **Causation.** Qloo learns from what audiences consume together, so a hit episode may itself strengthen the link between a guest and a show. Controlling for fame does not remove that.
@@ -92,6 +104,8 @@ The dataset holds Qloo responses, and Qloo's terms keep those out of public repo
 
 - `npm run backtest -w packages/agent -- --dry-run` prints the plan and every rule, with no keys needed.
 - With QLOO_API_KEY, ANTHROPIC_API_KEY and YOUTUBE_API_KEY in `.env`, `npm run backtest -w packages/agent -- --dev-db` pulls and analyses. It costs about 900 Qloo calls and well under a dollar of model use.
-- `npm run backtest -w packages/agent -- --analyse <dataset.json>` recomputes every number from a stored dataset.
+- `npm run backtest -w packages/agent -- --analyse <dataset.json>` recomputes the pre-registered results from a stored dataset: both hypotheses with their intervals, the by-show correlations, the 1.55 ratio, and the sample and drop counts.
+- `npm run backtest:robustness -w packages/agent -- <dataset.json>` recomputes the two post-hoc checks from the same dataset: the rerun without misread rows, and the repeat-guest check.
+- The precision figure, 44 of 50, is a hand check, so no script recomputes it. The labelled rows are not published, because they are YouTube titles read through YouTube's API, and we keep data from Qloo's and YouTube's APIs out of the public repo.
 
 A fresh pull will come out slightly different, because view counts keep moving.
