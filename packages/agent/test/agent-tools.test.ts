@@ -12,10 +12,11 @@ import { buildBoard } from "../src/agent/board.js";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { stepFor } from "../src/agent/loop.js";
 import { ACCUSATIONS_RULE, isShowableTag, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
-import { PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
+import { attachHarness, PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import { buildQlooRequest, type QlooOperation } from "../src/qloo/request.js";
+import { harnessFrom } from "./helpers/agent-fakes.js";
 
 const MARKER = "MARKER-5d1c";
 const TODAY = new Date("2026-10-19T09:30:00.000Z");
@@ -93,6 +94,14 @@ function fakeQloo(respond: (op: QlooOperation) => unknown = synthResponse) {
 const newContext = (episodeTitles: string[] = []): RunContext =>
   createRunContext({ show: SHOW, episodeTitles, exclusions: [] });
 
+// find_person runs on the harness the runner attaches to each run. Here the
+// harness asks the same fake as every other tool (harnessFrom); the real
+// path is covered in qloo-harness-adapter.test.ts.
+function withHarness(ctx: RunContext, qloo: MeteredQloo): RunContext {
+  attachHarness(ctx, { qloo: harnessFrom(qloo).harness });
+  return ctx;
+}
+
 const errorOf = (content: string) => JSON.parse(content) as { error: string };
 const ON = { trends: true };
 const OFF = { trends: false };
@@ -111,8 +120,8 @@ const VALID_INPUT: Record<ToolName, Record<string, unknown>> = {
 };
 
 async function withPeople(): Promise<{ ctx: RunContext; qloo: MeteredQloo; ops: QlooOperation[] }> {
-  const ctx = newContext();
   const { qloo, ops } = fakeQloo();
+  const ctx = withHarness(newContext(), qloo);
   await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
   return { ctx, qloo, ops };
 }
@@ -182,7 +191,7 @@ describe("runTool with trends off", () => {
       ["audience_of", { personId: personId(1) }],
       ["shared_taste", { personId: personId(1) }],
       ["upcoming_releases", { kind: "book" }],
-      ["find_person", { name: "Synthetic Name" }],
+      ["find_person", { name: "Synthetic Person 1" }],
       ["recent_episode_titles", {}],
       ["finish_board", VALID_INPUT.finish_board],
     ];
@@ -311,23 +320,25 @@ describe("tool requests and results", () => {
     expect(ctx.people.get(personId(2))).toEqual({ name: `Synthetic Person 2 ${MARKER}`, affinity: 0.977, popularity: 0.51 });
   });
 
-  it("never records a person with a death date, from the people list or from a name search", async () => {
-    const ctx = newContext();
+  // Qloo's harness keeps no death date in what find_person reads, so a dead
+  // person found by name is dropped by the runner's fit call (agent-runner).
+  it("never records a person with a death date from the people list, and leaves a name search's to the fit call", async () => {
     const people = synthPeople(3).map((person, n) =>
       n === 1 ? { ...person, properties: { date_of_death: "1901-02-03", gender: "synthetic" } } : person,
     );
     const { qloo } = fakeQloo((op) => (op.op === "search" ? [{ ...people[1]!, entity_id: personId(51) }] : people));
+    const ctx = withHarness(newContext(), qloo);
 
     const listed = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
-    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Person 2" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: `Synthetic Person 2 ${MARKER}` }, TODAY, ON);
 
     expect((JSON.parse(listed.content) as { people: Array<{ personId: string }> }).people.map((person) => person.personId)).toEqual([
       personId(1),
       personId(3),
     ]);
-    expect(JSON.parse(found.content)).toEqual({ people: [] });
-    expect([...ctx.people.keys()]).toEqual([personId(1), personId(3)]);
-    expect(ctx.steps.map((entry) => entry.summary)).toEqual(["found 2 people", "found 0 matching people"]);
+    expect(JSON.parse(found.content)).toEqual({ people: [{ personId: personId(51), name: `Synthetic Person 2 ${MARKER}` }] });
+    expect([...ctx.people.keys()]).toEqual([personId(1), personId(3), personId(51)]);
+    expect(ctx.steps.map((entry) => entry.summary)).toEqual(["found 2 people", "found 1 matching people"]);
   });
 
   it("drops a person recorded alive once a later answer carries their death date", async () => {
@@ -440,13 +451,59 @@ describe("tool requests and results", () => {
 
   it("records a found person without affinity, so a search score never becomes fit", async () => {
     const ctx = newContext();
-    const { qloo, ops } = fakeQloo();
+    // Named so the injection-shaped query below matches it word for word.
+    const { qloo } = fakeQloo((op) =>
+      op.op === "search" ? [{ entity_id: personId(50), name: "X Take 500 Y", popularity: 0.3, query: { affinity: 0.99 } }] : synthResponse(op),
+    );
+    const { harness, requests } = harnessFrom(qloo);
+    attachHarness(ctx, { qloo: harness });
 
     const outcome = await runTool(ctx, qloo, "find_person", { name: "  x&take=500#y  " }, TODAY, ON);
 
-    expect(ops[0]).toEqual({ op: "search", query: "x&take=500#y", types: ["urn:entity:person"], take: 3 });
-    expect(JSON.parse(outcome.content)).toEqual({ people: [{ personId: personId(50), name: `Synthetic Found ${MARKER}` }] });
-    expect(ctx.people.get(personId(50))).toEqual({ name: `Synthetic Found ${MARKER}`, affinity: null, popularity: 0.3 });
+    expect(requests).toEqual([
+      {
+        path: "/search",
+        params: [
+          ["query", "x&take=500#y"],
+          ["types", "urn:entity:person"],
+          ["take", "5"],
+        ],
+      },
+    ]);
+    expect(JSON.parse(outcome.content)).toEqual({ people: [{ personId: personId(50), name: "X Take 500 Y" }] });
+    expect(ctx.people.get(personId(50))).toEqual({ name: "X Take 500 Y", affinity: null, popularity: 0.3 });
+  });
+
+  // Live on 24 Oct the harness answered a nonsense name with Qloo's nearest
+  // hits, real people under other names.
+  it("find_person finds nobody for a name no result matches", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo((op) => (op.op === "search" ? synthPeople(3) : synthResponse(op)));
+    const { harness, requests } = harnessFrom(qloo);
+    attachHarness(ctx, { qloo: harness });
+
+    const outcome = await runTool(ctx, qloo, "find_person", { name: "Synthetic Nobody" }, TODAY, ON);
+
+    expect(requests.map((request) => request.path)).toEqual(["/search"]);
+    expect(JSON.parse(outcome.content)).toEqual({ people: [] });
+    expect(ctx.people.size).toBe(0);
+    expect(ctx.steps.at(-1)).toEqual({ tool: "find_person", ok: true, summary: "found 0 matching people" });
+  });
+
+  it("find_person refuses an id-shaped name without a Qloo call", async () => {
+    const ctx = newContext();
+    const { qloo, ops } = fakeQloo();
+    const { harness, requests } = harnessFrom(qloo);
+    attachHarness(ctx, { qloo: harness });
+
+    for (const name of [personId(50), `  ${personId(50).toUpperCase()}  `]) {
+      const outcome = await runTool(ctx, qloo, "find_person", { name }, TODAY, ON);
+      expect(JSON.parse(outcome.content), name).toEqual({ people: [] });
+    }
+
+    expect(requests).toHaveLength(0);
+    expect(ops).toHaveLength(0);
+    expect(ctx.people.size).toBe(0);
   });
 
   it("caps episode titles at 40, 200 characters each, strips direction controls, and keeps content under 4,000", async () => {
@@ -479,9 +536,10 @@ describe("tool requests and results", () => {
       const { tags, a, b } = data as Record<string, unknown>;
       return { tags: hide(tags), a: hide(a), b: hide(b) };
     });
+    withHarness(ctx, qloo);
 
     const people = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
-    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: `Synthetic Found ${MARKER}` }, TODAY, ON);
     const tastes = await runTool(ctx, qloo, "shared_taste", { personId: personId(1) }, TODAY, ON);
     const releases = await runTool(ctx, qloo, "upcoming_releases", { kind: "book" }, TODAY, ON);
     const episodes = await runTool(ctx, qloo, "recent_episode_titles", {}, TODAY, ON);
@@ -843,9 +901,10 @@ describe("past guests (C2.1, C2.2)", () => {
   it("refuses an id dropped as dead or as a past guest for the rest of the run, whatever a later answer says (G16)", async () => {
     const ctx = withFeed([PAST_EPISODE]);
     const first = synthPeople(3).map((person, n) => (n === 0 ? { ...person, properties: { date_of_death: "1901-02-03" } } : person));
-    // The same ids again, alive, under names no title holds.
-    const later = synthPeople(2).map((person, n) => ({ ...person, name: `Synthetic Renamed ${n + 1}` }));
+    // The same ids again, alive, under one name no title holds, so both match the name asked for.
+    const later = synthPeople(2).map((person) => ({ ...person, name: "Synthetic Renamed" }));
     const { qloo } = fakeQloo((op) => (op.op === "search" ? later : first));
+    withHarness(ctx, qloo);
 
     await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
     const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Renamed" }, TODAY, ON);
@@ -857,11 +916,11 @@ describe("past guests (C2.1, C2.2)", () => {
   });
 
   it("marks people a people_for_show answer returned, and never someone only find_person returned", async () => {
-    const ctx = newContext();
     const { qloo } = fakeQloo();
+    const ctx = withHarness(newContext(), qloo);
 
     await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
-    await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+    await runTool(ctx, qloo, "find_person", { name: `Synthetic Found ${MARKER}` }, TODAY, ON);
 
     expect([...ctx.listedForShow]).toEqual([1, 2, 3].map(personId));
     expect(ctx.people.has(personId(50))).toBe(true);
@@ -896,7 +955,8 @@ describe("past guests (C2.1, C2.2)", () => {
   it("find_person leaves out a past guest", async () => {
     const ctx = withFeed([`Synthetic Found ${MARKER} returns`]);
     const { qloo } = fakeQloo();
-    const input = { name: "Synthetic Found" };
+    withHarness(ctx, qloo);
+    const input = { name: `Synthetic Found ${MARKER}` };
 
     const outcome = await runTool(ctx, qloo, "find_person", input, TODAY, ON);
 
@@ -927,10 +987,11 @@ describe("past guests (C2.1, C2.2)", () => {
   it("with no feed titles nobody is left out", async () => {
     const ctx = withFeed(null);
     const { qloo } = fakeQloo();
+    withHarness(ctx, qloo);
     const input = { reach: "any" };
 
     const listed = await runTool(ctx, qloo, "people_for_show", input, TODAY, ON);
-    const found = await runTool(ctx, qloo, "find_person", { name: "Synthetic Found" }, TODAY, ON);
+    const found = await runTool(ctx, qloo, "find_person", { name: `Synthetic Found ${MARKER}` }, TODAY, ON);
 
     expect(ctx.pastGuests.checked).toBe(false);
     expect(newContext().pastGuests.checked).toBe(false);
@@ -944,15 +1005,15 @@ describe("past guests (C2.1, C2.2)", () => {
 
 describe("step summaries", () => {
   it("carry no person id, no show id and no upstream text across every tool", async () => {
-    const ctx = newContext([`Episode with ${MARKER}`]);
     const { qloo } = fakeQloo();
+    const ctx = withHarness(newContext([`Episode with ${MARKER}`]), qloo);
     const calls: Array<[ToolName, unknown]> = [
       ["people_for_show", { reach: "any" }],
       ["audience_of", { personId: personId(1) }],
       ["trend_of", { personId: personId(1) }],
       ["shared_taste", { personId: personId(1) }],
       ["upcoming_releases", { kind: "tv_show" }],
-      ["find_person", { name: `Someone ${MARKER}` }],
+      ["find_person", { name: `Synthetic Found ${MARKER}` }],
       ["recent_episode_titles", {}],
       ["audience_of", { personId: NEVER_RETURNED }],
       ["finish_board", VALID_INPUT.finish_board],

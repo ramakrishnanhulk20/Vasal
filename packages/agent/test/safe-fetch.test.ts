@@ -17,7 +17,7 @@ import { ipv4First, safeFetch } from "../src/net/safe-fetch.js";
 type CountingServer = { server: http.Server; connections: number };
 
 const SMALL_FEED = "<rss><channel><title>Loopback</title></channel></rss>";
-const BOMB_INFLATED_BYTES = 11 * 1024 * 1024;
+const BOMB_INFLATED_BYTES = 33 * 1024 * 1024;
 const bomb = zlib.gzipSync(Buffer.alloc(BOMB_INFLATED_BYTES), { level: 9 });
 const chunk = Buffer.alloc(64 * 1024, 120);
 
@@ -318,10 +318,10 @@ describe("C1.4 every fetch is bounded", () => {
     expect(Date.now() - started).toBeLessThan(10_000);
   });
 
-  it("stops a 10 KB gzip body that inflates past the default 10 MB cap", async () => {
+  it("stops a small gzip body that inflates past the default 32 MB cap", async () => {
     expect(bomb.length).toBeGreaterThan(8 * 1024);
-    expect(bomb.length).toBeLessThan(16 * 1024);
-    expect(BOMB_INFLATED_BYTES).toBeGreaterThan(10 * 1024 * 1024);
+    expect(bomb.length).toBeLessThan(64 * 1024);
+    expect(BOMB_INFLATED_BYTES).toBeGreaterThan(32 * 1024 * 1024);
     const err = await failure(safeFetch(new URL("http://127.0.0.1/bomb"), { addressCheck: allowLoopback }));
     expect(err.code).toBe("FEED_TOO_LARGE");
   });

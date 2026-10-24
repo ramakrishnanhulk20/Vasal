@@ -50,7 +50,7 @@ import {
 } from "../src/ops/promote.js";
 import { pruneExpired } from "../src/ops/prune.js";
 import { rollBuckets, type BucketRoll, type BucketState } from "../src/ops/roll.js";
-import { createSeedAgent, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import { addGuesses, createSeedAgent, planGuesses, seedShow, writeBriefs, type GuessesRefusal, type SeedAgent } from "../src/ops/seed.js";
 import type { AgentPort } from "../src/server/agent-port.js";
 import { loadAgentSettings, type AgentSettings } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
@@ -92,6 +92,10 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   briefs <runId> [--yes]  list the board guests of a done run that lack a brief; with --yes,
                           write them with the real agent and print every brief in full. It
                           spends only anthropic:day:offline
+  guesses <runId> [--yes] say whether a done run lacks its Without Qloo flip; with --yes, ask the
+                          real model for guests with no Qloo data, score them with Qloo and add
+                          the flip. It spends only qloo:day:offline, qloo:month and
+                          anthropic:day:offline
   unpromote <runId>       take a run off the home page
   showcase                list the runs on the home page
   selftest                with --dev only: budgets, health, flag live-runs off, health, then
@@ -105,7 +109,7 @@ command except roles without --apply needs OWNER_DATABASE_URL.
 --tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
 database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
 as vasal_owner with VASAL_OWNER_PASSWORD.
---yes is accepted only by promote and briefs, --apply only by roles, and --pick only by seed.`;
+--yes is accepted only by promote, briefs and guesses, --apply only by roles, and --pick only by seed.`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
@@ -119,6 +123,7 @@ type Command =
   | { name: "mcp"; action: "revoke"; tokenId: string }
   | { name: "promote"; runId: string; position: number; yes: boolean }
   | { name: "briefs"; runId: string; yes: boolean }
+  | { name: "guesses"; runId: string; yes: boolean }
   | { name: "unpromote"; runId: string }
   | { name: "seed"; show: string; pick: number | undefined };
 
@@ -209,6 +214,11 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     return { name, runId, position: positionFrom(position), yes };
   }
   if (name === "briefs") {
+    const [runId] = rest;
+    if (rest.length !== 1 || runId === undefined) return undefined;
+    return { name, runId, yes };
+  }
+  if (name === "guesses") {
     const [runId] = rest;
     if (rest.length !== 1 || runId === undefined) return undefined;
     return { name, runId, yes };
@@ -458,9 +468,10 @@ const MAX_PRINTED_NAME_CHARS = 120;
 const printableName = (text: string): string =>
   [...text.replace(/[\p{Cc}\p{Cf}]/gu, "")].slice(0, MAX_PRINTED_NAME_CHARS).join("");
 
-// seed and briefs build the same agent, so a brief from either one is
-// written by the same runner and charges the same offline share.
-function seedAgentFromEnv(db: Db, command: "seed" | "briefs"): { agent: SeedAgent; settings: AgentSettings } | null {
+// seed, briefs and guesses build the same agent, so a brief or a flip from
+// any of them is made by the same runner parts and charges the same offline
+// share.
+function seedAgentFromEnv(db: Db, command: "seed" | "briefs" | "guesses"): { agent: SeedAgent; settings: AgentSettings } | null {
   let qloo: QlooConfig;
   try {
     qloo = loadQlooConfig();
@@ -513,6 +524,58 @@ async function runBriefs(db: Db, runId: string, yes: boolean, writer?: Pick<Agen
   }
   for (const line of formatBriefs(briefs, { full: true })) console.log(line);
   return briefsDone(briefs);
+}
+
+const GUESSES_REFUSED: Record<GuessesRefusal, string> = {
+  GUESSES_NOT_DONE: "is not a done run, so it has no board to set the flip beside",
+  GUESSES_NO_BOARD: "has no board that reads back whole, so there is nothing to set the flip beside",
+  GUESSES_NO_SHOW: "has no one stored show its board was built for, so the flip cannot be asked for",
+};
+
+const fitText = (fit: number | null) => (fit === null ? "fit unknown" : `fit ${fit.toFixed(2)}`);
+
+// Without --yes it only reads storage and builds no agent, so it cannot
+// spend. Qloo names reach the terminal only through printableName (C3.6).
+async function runGuesses(db: Db, runId: string, yes: boolean): Promise<boolean> {
+  const plan = await planGuesses(db, runId);
+  const id = printableName(runId);
+  if (plan.kind === "has") {
+    console.log(`Run ${id} already has its Without Qloo flip, so nothing was done.`);
+    return true;
+  }
+  if (plan.kind === "refused") {
+    console.log(`Run ${id} ${GUESSES_REFUSED[plan.code]}. Nothing was done.`);
+    return false;
+  }
+  const spend = "1 model call, up to 8 Qloo searches and 1 insights call. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.";
+  if (!yes) {
+    console.log(`Run ${id} (${printableName(plan.showName)}, ${plan.guests} guests) has no Without Qloo flip yet.`);
+    console.log(`Run again with --yes to add it: ${spend}`);
+    return true;
+  }
+  const built = seedAgentFromEnv(db, "guesses");
+  if (built === null) return false;
+  console.log(`Asking ${built.settings.model} for guests for ${printableName(plan.showName)} with no Qloo data: ${spend}`);
+  const outcome = await addGuesses(db, built.agent, runId);
+  if (outcome.kind === "has") {
+    console.log(`Run ${id} already has its Without Qloo flip, so nothing was done.`);
+    return true;
+  }
+  if (outcome.kind === "refused") {
+    console.log(`Run ${id} ${GUESSES_REFUSED[outcome.code]}. Nothing was done.`);
+    return false;
+  }
+  if (outcome.flip.status === "unavailable") {
+    console.log(`The flip for run ${id} came back unavailable, and the run page now says so. Run the command again to try once more.`);
+    return false;
+  }
+  const { guesses, unresolved } = outcome.flip;
+  console.log(`Added the Without Qloo flip to run ${id}: ${guesses.length} guesses Qloo matched and scored, ${unresolved} it could not match.`);
+  for (const guess of guesses) {
+    const flags = [guess.pastGuest ? "past guest" : "", guess.onBoard ? "on the board" : ""].filter((flag) => flag !== "");
+    console.log(`  ${printableName(guess.name)}: ${fitText(guess.fit)}, ${guess.reach}${flags.length > 0 ? `, ${flags.join(", ")}` : ""}`);
+  }
+  return true;
 }
 
 async function runSeed(db: Db, show: string, pick: number | undefined): Promise<boolean> {
@@ -787,6 +850,10 @@ async function main(): Promise<number> {
     console.error("briefs writes showcase briefs on the hosted database, so it never runs with --dev.");
     return 2;
   }
+  if (dev && command.name === "guesses") {
+    console.error("guesses adds the flip to showcase runs on the hosted database, so it never runs with --dev.");
+    return 2;
+  }
 
   const connection = tunnelPort === undefined ? {} : { tunnelPort };
   let db: Db | undefined;
@@ -821,6 +888,8 @@ async function main(): Promise<number> {
         return (await runPromote(db, command.runId, command.position, command.yes)) ? 0 : 1;
       case "briefs":
         return (await runBriefs(db, command.runId, command.yes)) ? 0 : 1;
+      case "guesses":
+        return (await runGuesses(db, command.runId, command.yes)) ? 0 : 1;
       case "unpromote":
         return (await runUnpromote(db, command.runId)) ? 0 : 1;
       case "showcase":

@@ -1,18 +1,25 @@
 // Covers the operator's seed in src/ops/seed.ts on PGlite: which buckets its
 // meter charges, the preview, a picked run end to end through the real agent
 // runner with the shared fakes, its briefs and the briefs command's writer,
-// the closes for a missing pick and a missing show, and the seed and briefs
+// the closes for a missing pick and a missing show, the guesses backfill that
+// adds the Without Qloo flip to a done run, and the seed, briefs and guesses
 // arguments of scripts/ops.ts. It does not cover createSeedAgent's real
 // Qloo, Anthropic, directory or feed calls (the operator's first live seed
-// does), runSeed's and runBriefs's printed reports, or a deploy's restart
-// sweep failing a seed run or a brief mid-way.
+// does), runSeed's, runBriefs's and runGuesses's printed reports, or a
+// deploy's restart sweep failing a seed run or a brief mid-way.
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ZodType } from "zod";
 import { readArgs } from "../scripts/ops.js";
+import { AgentError } from "../src/agent/errors.js";
+import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
+import { WITHOUT_QLOO_SYSTEM } from "../src/agent/prompts.js";
 import { loadPolicy } from "../src/ops/policy.js";
 import { previewRun, readBriefs } from "../src/ops/promote.js";
 import { rollBuckets } from "../src/ops/roll.js";
-import { seedAgentFrom, seedMeterHooks, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import { addGuesses, planGuesses, seedAgentFrom, seedMeterHooks, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import type { MeteredQloo } from "../src/qloo/metered.js";
+import type { QlooOperation } from "../src/qloo/request.js";
 import {
   claimBrief,
   createRun,
@@ -20,15 +27,17 @@ import {
   getBrief,
   getBriefClaim,
   getRun,
+  getWithoutQloo,
   listBoard,
   listEventsAfter,
   markBriefFailed,
   putBoard,
+  putCandidates,
   setRunStatus,
 } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { usage } from "../src/store/meter.js";
-import { fakeFeeds, fakeModel, fakeQloo } from "./helpers/agent-fakes.js";
+import { fakeFeeds, fakeModel, fakeQloo, harnessFrom } from "./helpers/agent-fakes.js";
 import { BRIEF_DRAFT } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
@@ -47,7 +56,8 @@ afterEach(async () => {
 });
 
 function fakeSeedAgent(feeds = fakeFeeds().feeds): SeedAgent {
-  return seedAgentFrom(db, { qloo: fakeQloo().qloo, model: fakeModel(BRIEF_DRAFT).model, feeds, trends: false });
+  const { qloo } = fakeQloo();
+  return seedAgentFrom(db, { qloo, harness: harnessFrom(qloo).harness, model: fakeModel(BRIEF_DRAFT).model, feeds, trends: false });
 }
 
 // Seven guests in the runner's board shape, two more than a visitor's run
@@ -123,6 +133,9 @@ describe("seed", () => {
     expect(outcome.pastGuests).toEqual({ checked: true, skipped: 0 });
     expect(outcome.briefs.guests.map((guest) => guest.state.kind)).toEqual(Array.from({ length: outcome.guests }, () => "written"));
     expect((await previewRun(db, outcome.runId)).refusal).toBeNull();
+    // The runner adds the flip as part of the run, right before its done event.
+    const events = (await listEventsAfter(db, outcome.runId, 0)).map((event) => event.event);
+    expect(events.indexOf("without_qloo")).toBe(events.indexOf("done") - 1);
   });
 
   it("writeBriefs writes all 7 briefs of a done 7-guest board, past the website's 5, and retries a claim that failed once", async () => {
@@ -180,6 +193,136 @@ describe("seed", () => {
   });
 });
 
+describe("guesses (the Without Qloo backfill)", () => {
+  const OUTSIDER = "00000000-0000-4000-8000-000000000899";
+  const FEED = `<?xml version="1.0"?><rss><channel><title>${SHOW}</title><item><title>Talking with Synthetic Outsider</title></item></channel></rss>`;
+
+  // A done run stored the way the runner stores one, before the flip existed.
+  async function doneRunWithoutFlip(): Promise<string> {
+    const runId = await createRun(db, { show: SHOW, exclude: [] });
+    await setRunStatus(db, runId, "running");
+    await putCandidates(db, runId, [
+      {
+        appleId: "1001",
+        name: "Synthetic Show Directory Name",
+        publisher: "Synthetic Publisher",
+        feedHandleSource: "directory",
+        feedUrl: "https://feeds.example/show-1.xml",
+        qlooId: "00000000-0000-4000-8000-000000000500",
+        qlooName: SHOW,
+      },
+    ]);
+    await putBoard(db, runId, SEVEN_GUESTS);
+    await finishRun(db, runId, "done", { name: "done", data: { guests: 7 } });
+    return runId;
+  }
+
+  function guessingAgent(guests: unknown) {
+    const { model: scripted } = fakeModel(BRIEF_DRAFT);
+    const asked: string[] = [];
+    const model: ModelClient = {
+      ...scripted,
+      async structured<T>(params: { system: string; user: string; schema: ZodType<T>; maxTokens: number }, options?: ModelCallOptions): Promise<T> {
+        if (params.system !== WITHOUT_QLOO_SYSTEM) return scripted.structured(params, options);
+        asked.push(params.user);
+        const parsed = params.schema.safeParse({ guests });
+        if (!parsed.success) throw new AgentError("AGENT_BAD_PROSE");
+        return parsed.data;
+      },
+    };
+    const ops: QlooOperation[] = [];
+    const people: Record<string, unknown[]> = {
+      "Synthetic Guest 1": [{ entity_id: SEVEN_GUESTS[0]!.personId, name: "Synthetic Guest 1" }],
+      "Synthetic Outsider": [{ entity_id: OUTSIDER, name: "Synthetic Outsider", popularity: 0.3 }],
+    };
+    const fits: Record<string, number> = { [SEVEN_GUESTS[0]!.personId]: 0.6, [OUTSIDER]: 0.2 };
+    const qloo: MeteredQloo = {
+      async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
+        ops.push(op);
+        if (op.op === "search") return { data: (people[op.query] ?? []) as T, fromCache: false };
+        if (op.op === "insights") {
+          const rows = (op.resultEntities ?? []).map((wanted) => ({ entity_id: wanted, name: "ignored", query: { affinity: fits[wanted] } }));
+          return { data: rows as T, fromCache: false };
+        }
+        throw new Error(`no fake answer for ${op.op}`);
+      },
+      stats: () => ({ calls: ops.length, cacheHits: 0 }),
+    };
+    const { feeds, fetched } = fakeFeeds({ feed: FEED });
+    const agent: SeedAgent = seedAgentFrom(db, { qloo, harness: harnessFrom(qloo).harness, model, feeds, trends: false });
+    return { agent, asked, ops, fetched };
+  }
+
+  it("adds the flip to a done run that has none, from its stored show, its feed and its board, and does nothing once it has one", async () => {
+    const runId = await doneRunWithoutFlip();
+    const { agent, asked, ops, fetched } = guessingAgent(["Synthetic Guest 1", "Synthetic Outsider"]);
+
+    // The plan takes no agent, so the command without --yes cannot spend.
+    expect(await planGuesses(db, runId)).toEqual({ kind: "ready", runId, showName: SHOW, guests: 7 });
+
+    const added = await addGuesses(db, agent, runId);
+
+    const flip = {
+      status: "done",
+      guesses: [
+        { name: "Synthetic Guest 1", fit: 0.6, fitKnown: true, reach: "unknown", pastGuest: false, onBoard: true },
+        { name: "Synthetic Outsider", fit: 0.2, fitKnown: true, reach: "bookable", pastGuest: true, onBoard: false },
+      ],
+      unresolved: 0,
+    };
+    expect(added).toEqual({ kind: "added", runId, flip });
+    expect(await getWithoutQloo(db, runId)).toEqual(flip);
+    expect((await listEventsAfter(db, runId, 0)).at(-1)).toMatchObject({ event: "without_qloo", data: flip });
+    expect(fetched.map((url) => url.href)).toEqual(["https://feeds.example/show-1.xml"]);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('Show: "Synthetic Show"');
+    expect(asked[0]).toContain('Publisher: "Synthetic Publisher"');
+    expect(ops.map((op) => op.op)).toEqual(["search", "search", "insights"]);
+    expect((await getRun(db, runId))?.status).toBe("done");
+
+    const eventsBefore = await listEventsAfter(db, runId, 0);
+    expect(await planGuesses(db, runId)).toEqual({ kind: "has", runId });
+    expect(await addGuesses(db, agent, runId)).toEqual({ kind: "has", runId });
+    expect(await listEventsAfter(db, runId, 0)).toEqual(eventsBefore);
+    expect(asked).toHaveLength(1);
+    expect(ops).toHaveLength(3);
+    expect(fetched).toHaveLength(1);
+  });
+
+  it("stores an unavailable flip when the model fails, which a later run of the command may replace", async () => {
+    const runId = await doneRunWithoutFlip();
+
+    expect(await addGuesses(db, guessingAgent([]).agent, runId)).toEqual({ kind: "added", runId, flip: { status: "unavailable" } });
+    expect(await planGuesses(db, runId)).toMatchObject({ kind: "ready" });
+    expect(await addGuesses(db, guessingAgent(["Synthetic Outsider"]).agent, runId)).toMatchObject({ kind: "added", flip: { status: "done" } });
+    expect(await planGuesses(db, runId)).toEqual({ kind: "has", runId });
+  });
+
+  it("refuses a run that is not done, has no board, or whose show cannot be found, spending nothing", async () => {
+    const open = await createRun(db, { show: SHOW, exclude: [] });
+    const empty = await createRun(db, { show: SHOW, exclude: [] });
+    await setRunStatus(db, empty, "running");
+    await finishRun(db, empty, "done", { name: "done", data: { guests: 0 } });
+    const lost = await createRun(db, { show: SHOW, exclude: [] });
+    await setRunStatus(db, lost, "running");
+    await putBoard(db, lost, SEVEN_GUESTS);
+    await finishRun(db, lost, "done", { name: "done", data: { guests: 7 } });
+    const { agent, asked, ops } = guessingAgent(["Synthetic Outsider"]);
+
+    for (const [runId, code] of [
+      [open, "GUESSES_NOT_DONE"],
+      [crypto.randomUUID(), "GUESSES_NOT_DONE"],
+      [empty, "GUESSES_NO_BOARD"],
+      [lost, "GUESSES_NO_SHOW"],
+    ] as const) {
+      expect(await planGuesses(db, runId), code).toEqual({ kind: "refused", runId, code });
+      expect(await addGuesses(db, agent, runId), code).toEqual({ kind: "refused", runId, code });
+    }
+    expect(asked).toEqual([]);
+    expect(ops).toEqual([]);
+  });
+});
+
 describe("ops.ts seed arguments", () => {
   it("readArgs accepts and refuses seed arguments", () => {
     expect(readArgs(["seed", "X"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "seed", show: "X", pick: undefined } });
@@ -216,6 +359,20 @@ describe("ops.ts seed arguments", () => {
     });
 
     for (const argv of [["briefs"], ["briefs", runId, "extra"], ["briefs", runId, "--apply"], ["briefs", runId, "--pick", "1"]]) {
+      expect(readArgs(argv), argv.join(" ")).toBeUndefined();
+    }
+  });
+
+  it("readArgs accepts guesses with a run id and an optional --yes, and refuses anything else", () => {
+    const runId = "00000000-0000-4000-8000-000000000700";
+    expect(readArgs(["guesses", runId])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "guesses", runId, yes: false } });
+    expect(readArgs(["--tunnel", "55432", "guesses", runId, "--yes"])).toEqual({
+      dev: false,
+      tunnelPort: 55432,
+      command: { name: "guesses", runId, yes: true },
+    });
+
+    for (const argv of [["guesses"], ["guesses", runId, "extra"], ["guesses", runId, "--apply"], ["guesses", runId, "--pick", "1"]]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
   });

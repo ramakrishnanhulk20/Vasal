@@ -1,13 +1,17 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import { createDirectQlooWorkflowExecutor, createNativeQlooResolutionProvider, type QlooWorkflowExecutor } from "@qloo/qloo-harness";
 import { z } from "zod";
+import type { QlooCallOptions } from "../qloo/client.js";
 import { QlooError } from "../qloo/errors.js";
-import type { MeteredQloo } from "../qloo/metered.js";
+import { createMeteredHarnessClient, NO_OP_OBSERVER } from "../qloo/harness-adapter.js";
+import type { MeteredQloo, MeteredRawQloo } from "../qloo/metered.js";
 import type { EntityType, QlooOperation } from "../qloo/request.js";
-import type { QlooCompareResult, QlooDemographic, QlooEntity, QlooTrendRow } from "../qloo/schemas.js";
+import { NORMALISED_SCHEMAS, type QlooCompareResult, type QlooDemographic, type QlooEntity, type QlooTrendRow } from "../qloo/schemas.js";
+import { StoreError } from "../store/errors.js";
 import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
-import { isPastGuest } from "./past-guests.js";
+import { isPastGuest, sameName } from "./past-guests.js";
 import { ACCUSATIONS_RULE, checkProse, isShowableTag, type ProseCheck, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "./prose.js";
 
 export type ToolName =
@@ -34,8 +38,11 @@ export const TOOL_LIMITS: Record<ToolName, number> = Object.freeze({
 
 export type ToolOutcome = { content: string; isError: boolean; finished?: Array<{ personId: string; angle: string }> };
 
-/** Run-wide tool settings. With trends false, trend_of is never offered or run, and angles may not call anyone rising. */
-export type ToolOptions = { trends: boolean };
+/**
+ * Run-wide tool settings. With trends false, trend_of is never offered or run, and angles may not call anyone rising.
+ * `signal`, when given, goes with every Qloo call a tool makes and fires at the run's deadline.
+ */
+export type ToolOptions = { trends: boolean; signal?: AbortSignal };
 
 const MAX_CONTENT_CHARS = 4_000;
 const MAX_NAME_CHARS = 120;
@@ -232,6 +239,17 @@ export function researchTools(opts: ToolOptions): Anthropic.Tool[] {
 }
 
 const isToolName = (name: string): name is ToolName => Object.hasOwn(TOOL_LIMITS, name);
+
+// Bound once in runTool rather than passed at each call site, so a handler
+// added later cannot make a Qloo call that outlives the run (C2.4).
+function withSignal(qloo: MeteredQloo, signal: AbortSignal): MeteredQloo {
+  return {
+    call: <T>(op: QlooOperation, options: QlooCallOptions = {}) =>
+      qloo.call<T>(op, { ...options, signal: options.signal === undefined ? signal : AbortSignal.any([signal, options.signal]) }),
+    stats: () => qloo.stats(),
+  };
+}
+
 const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const round2 = (value: number) => Math.round(value * 100) / 100 || 0;
 const isoDate = (date: Date) => date.toISOString().slice(0, 10);
@@ -529,16 +547,92 @@ const upcomingReleases: Handler<"upcoming_releases"> = async (ctx, qloo, input, 
   return { content: listContent("titles", titles), isError: false };
 };
 
-const findPerson: Handler<"find_person"> = async (ctx, qloo, input) => {
-  const { data } = await qloo.call<QlooEntity[]>({
-    op: "search",
-    query: input.name,
-    types: ["urn:entity:person"],
-    take: FIND_TAKE,
-  });
-  // A search score says how well a name matched, not how well a person fits
-  // the show, so it is never recorded as affinity.
-  const answer = listOf<QlooEntity>(data);
+// One executor per run, so the harness's name resolver and its cache last
+// exactly as long as the run that owns them.
+const HARNESS_RUNS = new WeakMap<RunContext, QlooWorkflowExecutor>();
+
+/**
+ * Gives one run's find_person Qloo's own harness: its describe workflow and
+ * native name resolver, built here once for the run and run in this process.
+ * Every HTTP request it makes goes through createMeteredHarnessClient over
+ * `deps.qloo`, the run's metered raw path, with `deps.signal` (when given)
+ * ending each request when it fires. Its observer is NO_OP_OBSERVER, so it
+ * writes no file. Call it once per run, before research.
+ */
+export function attachHarness(ctx: RunContext, deps: { qloo: MeteredRawQloo; signal?: AbortSignal }): void {
+  const client = createMeteredHarnessClient(deps);
+  HARNESS_RUNS.set(ctx, createDirectQlooWorkflowExecutor(client, NO_OP_OBSERVER, createNativeQlooResolutionProvider(client)));
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const itemsOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+
+// The harness's answer is read like any Qloo answer: each person must pass
+// the same entity schema a search result does, and one that does not is
+// skipped.
+function asPerson(value: unknown): QlooEntity | null {
+  const checked = NORMALISED_SCHEMAS.search.safeParse([value]);
+  return checked.success ? (checked.data[0] ?? null) : null;
+}
+
+// "ok" is one picked person, hydrated from /entities. "needs_input" holds the
+// candidates the name could mean, keyed `id` rather than `entity_id`. Any
+// other status, or a shape that does not fit, gives nobody.
+function describedPeople(result: Readonly<Record<string, unknown>>): QlooEntity[] {
+  const found =
+    result["status"] === "ok"
+      ? itemsOf(result["results"]).map(asPerson)
+      : result["status"] === "needs_input"
+        ? itemsOf(isRecord(result["resolution"]) ? result["resolution"]["issues"] : undefined)
+            .flatMap((issue) => itemsOf(isRecord(issue) ? issue["candidates"] : undefined))
+            .map((candidate) =>
+              isRecord(candidate) ? asPerson({ entity_id: candidate["id"], name: candidate["name"], popularity: candidate["popularity"] }) : null,
+            )
+        : [];
+  return found.filter((entity): entity is QlooEntity => entity !== null);
+}
+
+// The harness wraps whatever its client threw. Our own errors come back out,
+// so a refused budget or a timeout reads as it does on every other tool and a
+// database failure still fails the run (C5.7). Anything the harness raised
+// itself carries the harness's words, so it becomes a fixed code (C3.6).
+function harnessFailure(error: unknown): Error {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    if (current instanceof QlooError || current instanceof StoreError) return current;
+    current = current.cause;
+  }
+  return new QlooError("QLOO_UPSTREAM");
+}
+
+// A Qloo id typed as a name takes the harness's identifier path, an
+// /entities lookup with no type filter, which can return a non-person.
+const ID_SHAPED = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const findPerson: Handler<"find_person"> = async (ctx, _qloo, input, _today, opts) => {
+  const executor = HARNESS_RUNS.get(ctx);
+  if (executor === undefined) throw new Error("find_person needs attachHarness for this run.");
+  if (ID_SHAPED.test(input.name.trim())) {
+    step(ctx, "find_person", true, "found 0 matching people");
+    return { content: listContent("people", []), isError: false };
+  }
+  let result: Readonly<Record<string, unknown>>;
+  try {
+    const context = opts.signal === undefined ? {} : { signal: opts.signal };
+    result = (await executor.execute("describe", { entity: input.name, type: "person" }, context)).result;
+  } catch (error) {
+    throw harnessFailure(error);
+  }
+  // The harness keeps no death date, so a dead person found here is dropped
+  // by the runner's fit call instead (scoreFit). A match score says how well
+  // a name matched, not how well a person fits the show, so it is never
+  // recorded as affinity.
+  // The harness answers a name it cannot match with Qloo's nearest search
+  // hits, which for nonsense included "Donald Trump" (live, 24 Oct). Only a
+  // person whose name matches the one asked for counts as found.
+  const answer = describedPeople(result)
+    .filter((entity) => sameName(input.name, entity.name))
+    .slice(0, FIND_TAKE);
   const people = uniqueById(answer.map((entity) => recordPerson(ctx, entity, null)));
   step(ctx, "find_person", true, `found ${people.length} matching people`);
   return { content: listContent("people", people, pastGuestsLeftOut(ctx, answer)), isError: false };
@@ -632,11 +726,16 @@ async function dispatch<K extends ToolName>(
  * the same way before checkProse. A QlooError becomes an error outcome whose
  * content is only its code, never a message, URL or key (C2.6). Each call adds
  * one step summary of fixed words and counts, with no ids and no upstream
- * text, so it is safe to stream.
+ * text, so it is safe to stream. With opts.signal every Qloo call the tool
+ * makes carries it, so one still running when it fires is cut off and comes
+ * back as a QLOO_TIMEOUT error outcome (C2.4).
  *
- * Throws RangeError for an invalid `today`, and rethrows anything that is not
- * a QlooError, such as StoreError when the database fails, so the run loop
- * fails the run instead of carrying on (C5.7, C6.4).
+ * find_person runs on the harness attachHarness gave this run.
+ *
+ * Throws RangeError for an invalid `today`, Error for find_person in a run
+ * with no harness attached, and rethrows anything that is not a QlooError,
+ * such as StoreError when the database fails, so the run loop fails the run
+ * instead of carrying on (C5.7, C6.4).
  */
 export async function runTool(
   ctx: RunContext,
@@ -655,7 +754,7 @@ export async function runTool(
   if (name === "trend_of" && !opts.trends) return refusal(ctx, name, "NO_TREND_DATA", "refused: trend data is not available");
 
   try {
-    return await dispatch(name, ctx, qloo, input, today, opts);
+    return await dispatch(name, ctx, opts.signal === undefined ? qloo : withSignal(qloo, opts.signal), input, today, opts);
   } catch (error) {
     if (error instanceof QlooError) return refusal(ctx, name, error.code, `failed: ${error.code}`);
     throw error;

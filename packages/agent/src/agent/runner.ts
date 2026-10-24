@@ -4,7 +4,7 @@ import { FeedHandles } from "../feeds/handles.js";
 import type { ShowCandidate } from "../feeds/lookup.js";
 import type { ParsedFeed } from "../feeds/rss.js";
 import { QlooError } from "../qloo/errors.js";
-import type { MeteredQloo } from "../qloo/metered.js";
+import type { MeteredQloo, MeteredRawQloo } from "../qloo/metered.js";
 import type { QlooEntity } from "../qloo/schemas.js";
 import type { AgentPort } from "../server/agent-port.js";
 import { ServerError } from "../server/errors.js";
@@ -33,15 +33,21 @@ import { AgentError } from "./errors.js";
 import { DEFAULT_LIMITS, runResearch, stepFor, type StepEvent } from "./loop.js";
 import type { ModelClient } from "./model.js";
 import { resolveShow } from "./resolve.js";
-import { dropPerson, hasDied, runTool, type ToolName } from "./tools.js";
+import { attachHarness, dropPerson, hasDied, runTool, type ToolName } from "./tools.js";
+import { guessWithoutQloo, publisherForPrompt, WITHOUT_QLOO_UNAVAILABLE, type WithoutQlooEvent } from "./without-qloo.js";
 
 export type AgentFeeds = {
   searchShows: (term: string) => Promise<ShowCandidate[]>;
   lookupShow: (appleId: string) => Promise<ShowCandidate | null>;
-  safeFetch: (url: URL) => Promise<{ body: string }>;
+  safeFetch: (url: URL, opts?: { totalTimeoutMs?: number }) => Promise<{ body: string }>;
   parseFeed: (xml: string) => ParsedFeed;
 };
 
+/**
+ * safeFetch's own default. A confirmed run's feed read gets this or the time
+ * the run has left, whichever is shorter; the ops backfill gets all of it.
+ */
+export const FEED_TIMEOUT_MS = 15_000;
 const MIN_BOARD = 3;
 const UNEXPECTED = "UNEXPECTED";
 const MAX_FIT_IDS = 25;
@@ -128,12 +134,13 @@ function budgetOf(surface: unknown): SurfaceBudget {
 /**
  * The Qloo meter for one surface: waitForQlooSlot with that surface's day
  * bucket and extra buckets from SURFACE_BUDGETS. Passed to createMeteredQloo
- * as its waitForSlot. Throws ServerError("SRV_BAD_INPUT") for any surface
- * other than "web" or "mcp", and whatever waitForQlooSlot throws.
+ * as its waitForSlot, with the call's signal, which ends the wait when it
+ * fires. Throws ServerError("SRV_BAD_INPUT") for any surface other than
+ * "web" or "mcp", and whatever waitForQlooSlot throws.
  */
-export async function waitForSurfaceQlooSlot(db: Db, surface: RunSurface): Promise<boolean> {
+export async function waitForSurfaceQlooSlot(db: Db, surface: RunSurface, signal?: AbortSignal): Promise<boolean> {
   const budget = budgetOf(surface);
-  return waitForQlooSlot(db, { dayKey: budget.qlooDayKey, extraKeys: [...budget.qlooExtraKeys] });
+  return waitForQlooSlot(db, { dayKey: budget.qlooDayKey, extraKeys: [...budget.qlooExtraKeys], ...(signal === undefined ? {} : { signal }) });
 }
 
 /**
@@ -148,6 +155,57 @@ export async function reserveSurfaceTokens(db: Db, surface: RunSurface, amount: 
 
 function knownCode(error: unknown): string | null {
   return error instanceof AgentError || error instanceof QlooError || error instanceof FeedError ? error.code : null;
+}
+
+/**
+ * Reads a show's feed once, through a FeedHandles handle issued here for
+ * `url` and `source`, with safeFetch's totalTimeoutMs, and parses it. Every
+ * episode the parser kept comes back, because a guest from years back is
+ * still a past guest. Gives null on any FeedError, so the caller reports past
+ * guests as not checked rather than implying there were none, and rethrows
+ * anything else. continueRun and the ops backfill both read feeds this way.
+ */
+export async function fetchShowFeed(
+  feeds: AgentFeeds,
+  url: URL,
+  source: "directory" | "visitor",
+  totalTimeoutMs: number,
+): Promise<ParsedFeed | null> {
+  const handles = new FeedHandles();
+  const handle = handles.issue(url, source);
+  try {
+    const { body } = await feeds.safeFetch(handles.resolve(handle), { totalTimeoutMs });
+    return feeds.parseFeed(body);
+  } catch (error) {
+    if (!(error instanceof FeedError)) throw error;
+    return null;
+  }
+}
+
+/**
+ * The run context for one confirmed show and its feed (null when it could
+ * not be read), built the one way continueRun and the ops backfill share.
+ * The model is told the Qloo name, not the directory's or the visitor's text
+ * (C2.7), and sees the newest 40 non-blank episode titles. Every episode the
+ * feed gave, and every name the show goes by (directory name, publisher, Qloo
+ * name, feed title), join the past-guest check, because a host is named there
+ * and rarely in an episode title.
+ */
+export function runContextFor(
+  show: { qlooId: string; qlooName: string; name: string; publisher: string },
+  feed: ParsedFeed | null,
+  exclusions: readonly string[],
+): RunContext {
+  return createRunContext({
+    show: { qlooId: show.qlooId, name: show.qlooName },
+    episodeTitles: (feed?.episodes ?? [])
+      .map((episode) => episode.title)
+      .filter((title) => title !== "")
+      .slice(0, MAX_EPISODE_TITLES),
+    exclusions,
+    pastGuestEpisodes: feed?.episodes ?? null,
+    showRunners: [show.name, show.publisher, show.qlooName, ...(feed === null ? [] : [feed.title])],
+  });
 }
 
 /**
@@ -173,7 +231,14 @@ function knownCode(error: unknown): string | null {
  * missing audience, trend and shared-taste data only for the picks that
  * survive exclusions and the find_person fit floor through runTool (so the
  * per-tool caps hold), builds the board in code, and stores it with a
- * "board" event and a done event. The board event carries pastGuests
+ * "board" event and a done event. Between the two it adds the "Without Qloo"
+ * flip (guessWithoutQloo) with the run's own model and Qloo client and the
+ * run's deadline signal, given the publisher only for a directory show
+ * (publisherForPrompt): a step "Asked the same model without Qloo, and scored
+ * its N guesses" and a "without_qloo" event holding the result, or, on any
+ * error or once the deadline has passed, only a "without_qloo" event
+ * { status: "unavailable" }. The flip never fails the run; a ServerError from
+ * storing it loses only the flip. The board event carries pastGuests
  * { checked, skipped, titles, since } and the done event { checked, skipped }:
  * checked is false when the feed gave no title to check, skipped counts the
  * people left out as past guests, titles how many titles were checked and
@@ -182,6 +247,13 @@ function knownCode(error: unknown): string | null {
  * false the research loop is never offered trend_of and the fill skips it,
  * so no trend call is spent and every guest's rising state is "unknown".
  *
+ * continueRun's time cap (DEFAULT_LIMITS.maxWallMs, C2.4) starts the moment
+ * it is called, before the feed read, which gets 15 s or the time left if
+ * that is shorter. Research, the fit call and the fills share that one
+ * deadline: every Qloo call carries a signal that fires at it, so a call
+ * still running then is cut off and none starts after it, and the run fails
+ * with AGENT_LIMIT rather than the cut call's own code.
+ *
  * writeBrief reads the guest from the stored board (C6.2), writes the brief,
  * logs any removed links in a step, stores the brief, marks the guest's
  * brief claim done (markBriefDone), and appends a "brief" event.
@@ -189,8 +261,10 @@ function knownCode(error: unknown): string | null {
  * Every spend goes through the Qloo client and model for the surface read
  * back from the run's own row (qlooFor and modelFor), never from anything a
  * request carried, so an MCP run charges only MCP's buckets and a website
- * run only the website's (D3.2). A run whose row cannot be read is never
- * started or continued.
+ * run only the website's (D3.2). find_person runs on Qloo's harness, which
+ * continueRun attaches to the run once (attachHarness) over harnessFor of
+ * that same surface, with the run's deadline signal. A run whose row cannot
+ * be read is never started or continued.
  *
  * Any AgentError, QlooError or FeedError in startRun or continueRun ends the
  * run as failed through finishRun with only the error's code (C6.4, C3.6),
@@ -207,12 +281,13 @@ function knownCode(error: unknown): string | null {
 export function createAgentRunner(deps: {
   db: Db;
   qlooFor: (surface: RunSurface) => MeteredQloo;
+  harnessFor: (surface: RunSurface) => MeteredRawQloo;
   modelFor: (surface: RunSurface) => ModelClient;
   feeds: AgentFeeds;
   trends: boolean;
   now?: () => Date;
 }): AgentPort {
-  const { db, qlooFor, modelFor, feeds, trends } = deps;
+  const { db, qlooFor, harnessFor, modelFor, feeds, trends } = deps;
   const clock = deps.now ?? (() => new Date());
   const toolOptions = { trends };
   const fillTools = trends ? FILL_TOOLS : FILL_TOOLS.filter((tool) => tool !== "trend_of");
@@ -237,24 +312,49 @@ export function createAgentRunner(deps: {
     }
   };
 
-  // Every episode the parser kept, because a guest from years back is still
-  // a past guest. null means past guests cannot be checked, which the run
-  // reports instead of implying there were none.
-  const readFeed = async (runId: string, feedUrl: string | null, source: "directory" | "visitor"): Promise<ParsedFeed | null> => {
+  // null means past guests cannot be checked, which the run reports in a step
+  // instead of implying there were none.
+  const readFeed = async (
+    runId: string,
+    feedUrl: string | null,
+    source: "directory" | "visitor",
+    totalTimeoutMs: number,
+  ): Promise<ParsedFeed | null> => {
     const url = feedUrl === null ? null : URL.parse(feedUrl);
     if (url === null) {
       await step(runId, { tool: "feed", ok: false, label: "This show lists no feed, so past guests are not checked" });
       return null;
     }
-    const handles = new FeedHandles();
-    const handle = handles.issue(url, source);
+    const feed = await fetchShowFeed(feeds, url, source, totalTimeoutMs);
+    if (feed === null) await step(runId, { tool: "feed", ok: false, label: "Could not read the show's feed, so past guests are not checked" });
+    return feed;
+  };
+
+  // Best effort, after the board is stored: any error, or the run's deadline,
+  // stores { status: "unavailable" } instead, so the flip never fails the run
+  // or holds its done status past the deadline. At most 8 guesses with names
+  // capped at 120 characters keep the event far under appendEvent's 16 KB.
+  const addWithoutQloo = async (
+    runId: string,
+    flip: { model: ModelClient; qloo: MeteredQloo; ctx: RunContext; board: readonly BoardEntry[]; publisher: string | null },
+    deadline: { overTime: () => boolean; signal: AbortSignal },
+  ): Promise<void> => {
+    const result: WithoutQlooEvent = deadline.overTime()
+      ? WITHOUT_QLOO_UNAVAILABLE
+      : await guessWithoutQloo({ ...flip, signal: deadline.signal }).then(
+          (done) => (deadline.overTime() ? WITHOUT_QLOO_UNAVAILABLE : done),
+          () => WITHOUT_QLOO_UNAVAILABLE,
+        );
     try {
-      const { body } = await feeds.safeFetch(handles.resolve(handle));
-      return feeds.parseFeed(body);
+      if (result.status === "done") {
+        const label = `Asked the same model without Qloo, and scored its ${plural(result.guesses.length, "guess", "guesses")}`;
+        await step(runId, { tool: "without_qloo", ok: true, label });
+      }
+      await appendEvent(db, runId, "without_qloo", result, clock());
     } catch (error) {
-      if (!(error instanceof FeedError)) throw error;
-      await step(runId, { tool: "feed", ok: false, label: "Could not read the show's feed, so past guests are not checked" });
-      return null;
+      // A full or unreachable event log loses only the flip. finishRun below
+      // still ends the run, or fails on its own if the database is down.
+      if (!(error instanceof ServerError)) throw error;
     }
   };
 
@@ -262,18 +362,26 @@ export function createAgentRunner(deps: {
   // The answer replaces any affinity seen during research; a pick it leaves
   // out has no fit (fit 0, fitKnown false), never a guessed one. Returns the
   // ids that got a usable fit.
-  const scoreFit = async (qloo: MeteredQloo, ctx: RunContext, picks: ReadonlyArray<{ personId: string }>): Promise<ReadonlySet<string>> => {
+  const scoreFit = async (
+    qloo: MeteredQloo,
+    ctx: RunContext,
+    picks: ReadonlyArray<{ personId: string }>,
+    signal: AbortSignal,
+  ): Promise<ReadonlySet<string>> => {
     const ids = [...new Set(picks.map((pick) => pick.personId))]
       .filter((id) => ctx.people.has(id) && !ctx.dropped.has(id))
       .slice(0, MAX_FIT_IDS);
     if (ids.length === 0) return new Set();
-    const { data } = await qloo.call<QlooEntity[]>({
-      op: "insights",
-      filterType: "urn:entity:person",
-      signalEntities: [ctx.show.qlooId],
-      resultEntities: ids,
-      take: ids.length,
-    });
+    const { data } = await qloo.call<QlooEntity[]>(
+      {
+        op: "insights",
+        filterType: "urn:entity:person",
+        signalEntities: [ctx.show.qlooId],
+        resultEntities: ids,
+        take: ids.length,
+      },
+      { signal },
+    );
     if (!Array.isArray(data)) throw new QlooError("QLOO_SCHEMA");
     const wanted = new Set(ids);
     const scored = new Map<string, { affinity: number; popularity: number | null }>();
@@ -306,18 +414,19 @@ export function createAgentRunner(deps: {
     runId: string,
     ctx: RunContext,
     personIds: readonly string[],
-    overTime: () => boolean,
+    deadline: { overTime: () => boolean; signal: AbortSignal },
   ): Promise<void> => {
     const today = clock();
+    const options = { ...toolOptions, signal: deadline.signal };
     for (const personId of personIds) {
       if (ctx.dropped.has(personId)) continue;
       for (const tool of fillTools) {
         const present =
           tool === "audience_of" ? ctx.personDemographics.has(personId) : tool === "trend_of" ? ctx.trends.has(personId) : ctx.compares.has(personId);
         if (present) continue;
-        if (overTime()) throw new AgentError("AGENT_LIMIT");
+        if (deadline.overTime()) throw new AgentError("AGENT_LIMIT");
         const input = { personId };
-        const outcome = await runTool(ctx, qloo, tool, input, today, toolOptions);
+        const outcome = await runTool(ctx, qloo, tool, input, today, options);
         await step(runId, stepFor(ctx, tool, input, outcome));
       }
     }
@@ -349,6 +458,19 @@ export function createAgentRunner(deps: {
     },
 
     async continueRun(runId, candidateId) {
+      // The cap counts from confirm, so the feed read is spent from it too.
+      const startedAt = clock().getTime();
+      const deadline = startedAt + DEFAULT_LIMITS.maxWallMs;
+      const runClock = new AbortController();
+      const timer = setTimeout(() => runClock.abort(), DEFAULT_LIMITS.maxWallMs);
+      // The signal counts too: a timer can fire a moment before the clock
+      // reads the deadline, and a call it cut off must still end as a cap.
+      const overTime = () => runClock.signal.aborted || clock().getTime() >= deadline;
+      // A Qloo call the deadline cut off fails as QLOO_TIMEOUT; the run
+      // reports the cap it ran into instead.
+      const asLimit = (error: unknown): never => {
+        throw error instanceof QlooError && overTime() ? new AgentError("AGENT_LIMIT") : error;
+      };
       await failOnKnownError(runId, async () => {
         const run = await storedRun(runId);
         const qloo = qlooFor(run.surface);
@@ -357,24 +479,11 @@ export function createAgentRunner(deps: {
         if (!candidate.success) throw new AgentError("SHOW_NOT_FOUND");
         const show = candidate.data;
 
-        const feed = await readFeed(runId, show.feedUrl, show.feedHandleSource);
-        // The Qloo name, not the directory's or the visitor's text, is what
-        // the model is told (C2.7). Every name the show goes by joins the
-        // past-guest check, because a host is named there and rarely in an
-        // episode title.
-        const ctx = createRunContext({
-          show: { qlooId: show.qlooId, name: show.qlooName },
-          episodeTitles: (feed?.episodes ?? [])
-            .map((episode) => episode.title)
-            .filter((title) => title !== "")
-            .slice(0, MAX_EPISODE_TITLES),
-          exclusions: run.input.exclude,
-          pastGuestEpisodes: feed?.episodes ?? null,
-          showRunners: [show.name, show.publisher, show.qlooName, ...(feed === null ? [] : [feed.title])],
-        });
+        const feedTimeoutMs = Math.max(1, Math.min(FEED_TIMEOUT_MS, deadline - clock().getTime()));
+        const feed = await readFeed(runId, show.feedUrl, show.feedHandleSource, feedTimeoutMs);
+        const ctx = runContextFor(show, feed, run.input.exclude);
+        attachHarness(ctx, { qloo: harnessFor(run.surface), signal: runClock.signal });
         if (feed !== null) await step(runId, feedStep(ctx.pastGuests));
-        const startedAt = clock().getTime();
-        const overTime = () => clock().getTime() - startedAt >= DEFAULT_LIMITS.maxWallMs;
 
         const picks = await runResearch(ctx, {
           model,
@@ -383,6 +492,7 @@ export function createAgentRunner(deps: {
           trends,
           onStep: (event) => step(runId, event),
           nowMs: () => clock().getTime(),
+          startedAtMs: startedAt,
         });
 
         // Exclusions do not depend on the data fetched below, so a board that
@@ -391,13 +501,16 @@ export function createAgentRunner(deps: {
         // the fit call below.
         if (buildBoard(ctx, picks, { applyFitFloor: false }).length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
         if (overTime()) throw new AgentError("AGENT_LIMIT");
-        const scored = await scoreFit(qloo, ctx, picks);
+        const scored = await scoreFit(qloo, ctx, picks, runClock.signal).catch(asLimit);
         await step(runId, { tool: "fit", ok: true, label: `Scored ${plural(scored.size, "guest", "guests")} against this show's listeners` });
         // Built again once every pick has its fit, so a pick the floor or a
         // death date removes is never sent for more data.
         const kept = buildBoard(ctx, picks).map((entry) => entry.personId);
         if (kept.length < MIN_BOARD) throw new AgentError("AGENT_BOARD_TOO_SMALL");
-        await fillMissing(qloo, runId, ctx, kept, overTime);
+        await fillMissing(qloo, runId, ctx, kept, { overTime, signal: runClock.signal });
+        // A fill the deadline cut off comes back as an error result, and a
+        // board built without it would hide that the run ran out of time.
+        if (overTime()) throw new AgentError("AGENT_LIMIT");
 
         // buildBoard has cleaned every guest name, tag and angle. The show
         // name rides on every stored row too, and it was read back from the
@@ -422,10 +535,15 @@ export function createAgentRunner(deps: {
         const pastGuests = { checked: ctx.pastGuests.checked, skipped: ctx.pastGuests.skipped.size };
         const coverage = { titles: ctx.pastGuests.titles, since: ctx.pastGuests.since };
         await appendEvent(db, runId, "board", { guests, pastGuests: { ...pastGuests, ...coverage } }, clock());
+        await addWithoutQloo(
+          runId,
+          { model, qloo, ctx, board, publisher: publisherForPrompt(show) },
+          { overTime, signal: runClock.signal },
+        );
         // The done event keeps exactly { checked, skipped }: the seed command
         // reads it with a strict schema (src/ops/seed.ts).
         await finishRun(db, runId, "done", { name: "done", data: { guests: board.length, pastGuests } }, undefined, clock());
-      });
+      }).finally(() => clearTimeout(timer));
     },
 
     async writeBrief(runId, guestId) {

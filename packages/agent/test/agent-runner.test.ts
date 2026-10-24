@@ -8,16 +8,23 @@
 // functions main.ts wires in, that a run with trends off spends no trend
 // call, and that a past guest the feed names, a host any of the show's names
 // holds, a person the fit answer says has died, and a find_person pick under
-// the fit floor never reach the board. It does not cover the other HTTP routes
-// (server-app), the real network, the real model, main.ts itself (the live
-// dev smoke starts it), or races between database connections (PGlite has
-// one).
+// the fit floor never reach the board, and that the run's time cap counts from
+// confirm with every Qloo call after it carrying the deadline's signal. It also
+// covers the "Without Qloo" flip the runner adds after the board: its stored and
+// streamed event, its best-effort failure and the publisher rule for its prompt.
+// It does not cover the other HTTP routes (server-app), the real network, the real
+// model, main.ts itself (the live dev smoke starts it), the deadline's signal
+// firing in real time (agent-loop and qloo-client do), or races between
+// database connections (PGlite has one).
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ZodType } from "zod";
 import { AgentError } from "../src/agent/errors.js";
-import type { ModelClient } from "../src/agent/model.js";
-import { createAgentRunner, reserveSurfaceTokens, SURFACE_BUDGETS, waitForSurfaceQlooSlot } from "../src/agent/runner.js";
+import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
+import { WITHOUT_QLOO_SYSTEM } from "../src/agent/prompts.js";
+import { createAgentRunner, reserveSurfaceTokens, SURFACE_BUDGETS, waitForSurfaceQlooSlot, type AgentFeeds } from "../src/agent/runner.js";
 import { FeedError } from "../src/feeds/errors.js";
 import { issueToken } from "../src/mcp/tokens.js";
+import type { QlooCallOptions } from "../src/qloo/client.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
@@ -48,6 +55,7 @@ import {
   fakeFeeds,
   fakeModel,
   fakeQloo,
+  harnessFrom,
   MARKER,
   NOW,
   personId,
@@ -510,7 +518,7 @@ describe("continueRun (C1.5, C6.4)", () => {
           const reply = await scripted.turn(params, options);
           const content = reply.content.map((block) => {
             if (block.type !== "tool_use") return block;
-            if (block.name === "recent_episode_titles") return { ...block, name: "find_person", input: { name: "Synthetic Found" } };
+            if (block.name === "recent_episode_titles") return { ...block, name: "find_person", input: { name: "Synthetic Found 9" } };
             if (block.name !== "finish_board") return block;
             const picks = [1, 2, 3, 9].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
             return { ...block, input: { picks } };
@@ -647,6 +655,287 @@ describe("continueRun (C1.5, C6.4)", () => {
       [board[2]!.id, "Synthetic Person 1", 0.41, true],
     ]);
     expect(shown?.guests[0]).toMatchObject({ rising: "rising", bringsNew: "listeners 25 to 29" });
+  });
+});
+
+// The shared scripted model, with the flip's one call answered by `answer`,
+// which returns the model's reply or throws.
+function guessingModel(answer: () => unknown) {
+  const { model: scripted } = fakeModel(BRIEF);
+  const asked: Array<{ user: string; signal: AbortSignal | undefined }> = [];
+  const model: ModelClient = {
+    ...scripted,
+    async structured<T>(params: { system: string; user: string; schema: ZodType<T>; maxTokens: number }, options?: ModelCallOptions): Promise<T> {
+      if (params.system !== WITHOUT_QLOO_SYSTEM) return scripted.structured(params, options);
+      asked.push({ user: params.user, signal: options?.signal });
+      const parsed = params.schema.safeParse(answer());
+      if (!parsed.success) throw new AgentError("AGENT_BAD_PROSE");
+      return parsed.data;
+    },
+  };
+  return { model, asked };
+}
+
+const FLIP_MARKER = "MARKERwq9";
+const FLIP_PERSON = personId(20);
+const FLIP_GUESSES = [`Ann ${FLIP_MARKER} Lee`, "Synthetic Person 2", `${FLIP_MARKER} Nobody`];
+
+// The shared fake Qloo, also answering the flip's person searches and adding
+// its one new person to the fit call. Synthetic Person 2 is on the board.
+function flipQloo() {
+  return editedQloo((op, data) => {
+    if (op.op === "search" && op.types.includes("urn:entity:person")) {
+      if (op.query === FLIP_GUESSES[0]) return [{ entity_id: FLIP_PERSON, name: "Ann Lee", popularity: 0.5 }];
+      if (op.query === FLIP_GUESSES[1]) return [{ entity_id: personId(2), name: "Synthetic Person 2", popularity: 0.5 }];
+      return [];
+    }
+    if (op.op === "insights" && op.resultEntities?.includes(FLIP_PERSON)) {
+      return [...(data as unknown[]), { entity_id: FLIP_PERSON, name: "ignored", query: { affinity: 0.33 } }];
+    }
+    return data;
+  });
+}
+
+const STREAM_CONFIG: ServerConfig = {
+  production: false,
+  port: 8787,
+  appOrigin: "http://localhost:3000",
+  databaseUrl: null,
+  databaseNetwork: null,
+  visitorHashSecret: "v".repeat(32),
+  turnstileSecret: "test-secret",
+  clientIpHeader: null,
+  runsPerVisitorPerDay: 5,
+  maxInflightRuns: 3,
+  anthropicApiKey: null,
+  model: "claude-haiku-5-5",
+  effort: "medium",
+  anthropicTokensPerDay: 2_000_000,
+  trends: false,
+};
+
+describe("the Without Qloo flip", () => {
+  async function flipRun(model: ModelClient, opts: { input?: RunInput; qloo?: MeteredQloo } = {}) {
+    const input = opts.input ?? { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(model, opts.qloo ?? fakeQloo().qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
+    await agent.startRun(runId, input);
+    await agent.continueRun(runId, await confirmFirst(runId));
+    return { runId, agent };
+  }
+
+  it("stores the scored guesses as one fixed event between the board and done, with Qloo's names and no model text, and streams no id or model text (C3.3, D5.5)", async () => {
+    const { model, asked } = guessingModel(() => ({ guests: FLIP_GUESSES }));
+    const { qloo: plain, ops } = flipQloo();
+    const signals: Array<AbortSignal | undefined> = [];
+    const qloo: MeteredQloo = {
+      call: async <T>(op: QlooOperation, options?: QlooCallOptions) => {
+        if (op.op === "search" && op.types.includes("urn:entity:person")) signals.push(options?.signal);
+        return plain.call<T>(op, options);
+      },
+      stats: plain.stats,
+    };
+
+    const { runId, agent } = await flipRun(model, { qloo });
+
+    expect((await getRun(db, runId))?.status).toBe("done");
+    expect(await listBoard(db, runId)).toHaveLength(4);
+    const events = await listEventsAfter(db, runId, 0);
+    expect(events.slice(-4).map((event) => event.event)).toEqual(["board", "step", "without_qloo", "done"]);
+    expect(events.at(-3)?.data).toEqual({ tool: "without_qloo", ok: true, label: "Asked the same model without Qloo, and scored its 2 guesses" });
+    expect(events.at(-2)?.data).toEqual({
+      status: "done",
+      guesses: [
+        { name: "Ann Lee", fit: 0.33, fitKnown: true, reach: "bookable", pastGuest: false, onBoard: false },
+        { name: "Synthetic Person 2", fit: 0.77, fitKnown: true, reach: "bookable", pastGuest: false, onBoard: true },
+      ],
+      unresolved: 1,
+    });
+    // The run's own model and Qloo, under the run's deadline: one model call,
+    // one search per guess and a second fit call beside the board's.
+    expect(asked).toHaveLength(1);
+    expect(signals).toHaveLength(FLIP_GUESSES.length);
+    for (const signal of [asked[0]!.signal, ...signals]) expect(signal?.aborted).toBe(false);
+    expect(ops.filter((op) => op.op === "insights" && op.resultEntities !== undefined)).toHaveLength(2);
+
+    const stored = JSON.stringify([events, await listBoard(db, runId), await listCandidates(db, runId)]);
+    expect(stored).not.toContain(FLIP_MARKER);
+    const app = createApp({ db, config: STREAM_CONFIG, verifyTurnstile: async () => true, agent, socketAddress: () => null });
+    const stream = await (await app.request(`/runs/${runId}/events`)).text();
+    const frame = stream.split("\n\n").find((block) => block.includes("event: without_qloo"));
+    expect(frame).toBeDefined();
+    for (const absent of [FLIP_MARKER, "personId", FLIP_PERSON, personId(2)]) expect(frame, absent).not.toContain(absent);
+    expect(stream).not.toContain(FLIP_MARKER);
+  });
+
+  it("stores { status: unavailable } and still ends the run done with its board when the model call throws", async () => {
+    for (const failure of [new AgentError("MODEL_TIMEOUT"), new Error(FLIP_MARKER)]) {
+      const { model } = guessingModel(() => {
+        throw failure;
+      });
+
+      const { runId } = await flipRun(model, { qloo: flipQloo().qloo });
+
+      expect((await getRun(db, runId))?.status, failure.message).toBe("done");
+      expect(await listBoard(db, runId)).toHaveLength(4);
+      const events = await listEventsAfter(db, runId, 0);
+      expect(events.slice(-3).map((event) => event.event)).toEqual(["board", "without_qloo", "done"]);
+      expect(events.at(-2)?.data).toEqual({ status: "unavailable" });
+      expect(events.at(-1)?.data).toEqual({ guests: 4, pastGuests: { checked: true, skipped: 0 } });
+      expect(JSON.stringify(events)).not.toContain(FLIP_MARKER);
+    }
+  });
+
+  it("gives the flip's prompt a directory show's publisher, and no publisher at all for a pasted feed (C2.7)", async () => {
+    const listed = guessingModel(() => ({ guests: ["Nobody Here"] }));
+    await flipRun(listed.model);
+    const pasted = guessingModel(() => ({ guests: ["Nobody Here"] }));
+    await flipRun(pasted.model, { input: { show: "https://feeds.example/private-feed.xml", exclude: [] } });
+
+    expect(listed.asked[0]!.user).toContain('Publisher: "Synthetic Publisher 1"');
+    expect(pasted.asked).toHaveLength(1);
+    expect(pasted.asked[0]!.user).not.toContain("feeds.example");
+    expect(pasted.asked[0]!.user).not.toContain("Publisher");
+    expect(pasted.asked[0]!.user).toContain('Show: "Synthetic Show"');
+  });
+});
+
+describe("the run's time cap (C2.4)", () => {
+  // A clock the fakes move forward, starting at confirm.
+  function steppedClock() {
+    let elapsed = 0;
+    return { now: () => new Date(NOW.getTime() + elapsed), advance: (ms: number) => void (elapsed += ms), at: (ms: number) => new Date(NOW.getTime() + ms) };
+  }
+
+  it("counts the cap from confirm, so a feed read that takes 30 s comes out of research time", async () => {
+    const clock = steppedClock();
+    const timeouts: Array<number | undefined> = [];
+    const { feeds: plain } = fakeFeeds();
+    const feeds: AgentFeeds = {
+      ...plain,
+      safeFetch: async (url, opts) => {
+        timeouts.push(opts?.totalTimeoutMs);
+        clock.advance(30_000);
+        return plain.safeFetch(url);
+      },
+    };
+    const { model: scripted } = fakeModel(BRIEF);
+    let turns = 0;
+    // Never finishes, so only a cap can end the run. Each turn takes 30 s.
+    const model: ModelClient = {
+      ...scripted,
+      async turn(params, options) {
+        turns += 1;
+        clock.advance(30_000);
+        const reply = await scripted.turn(params, options);
+        const content = reply.content.map((block) =>
+          block.type === "tool_use" && block.name === "finish_board" ? { ...block, name: "recent_episode_titles", input: {} } : block,
+        );
+        return { ...reply, content };
+      },
+    };
+    const input: RunInput = { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(model, fakeQloo().qloo), feeds, trends: true, now: clock.now });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    expect(await getRun(db, runId)).toMatchObject({ status: "failed", errorCode: "AGENT_LIMIT", finishedAt: clock.at(120_000) });
+    expect(turns).toBe(3);
+    expect(timeouts).toEqual([15_000]);
+  });
+
+  it("gives every Qloo call after confirm a signal for the run's deadline, none fired in a run that ends in time", async () => {
+    const { qloo: plain } = fakeQloo();
+    const seen: Array<{ op: QlooOperation; signal: AbortSignal | undefined; firedAtStart: boolean | undefined }> = [];
+    const qloo: MeteredQloo = {
+      async call<T>(op: QlooOperation, options?: QlooCallOptions): Promise<{ data: T; fromCache: boolean }> {
+        seen.push({ op, signal: options?.signal, firedAtStart: options?.signal?.aborted });
+        return plain.call<T>(op);
+      },
+      stats: plain.stats,
+    };
+    const input: RunInput = { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
+    await agent.startRun(runId, input);
+    seen.length = 0;
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    expect((await getRun(db, runId))?.status).toBe("done");
+    // Research, the fit call and the fills are all here.
+    expect(new Set(seen.map((call) => call.op.op))).toEqual(new Set(["insights", "demographics", "trending", "compare"]));
+    for (const call of seen) {
+      expect(call.signal).toBeInstanceOf(AbortSignal);
+      expect(call.firedAtStart).toBe(false);
+    }
+  });
+
+  it("fails AGENT_LIMIT, not the Qloo code, when the fit call or the last fill call is cut off at the deadline, and makes no Qloo call after it", async () => {
+    const cuts = {
+      fit: (op: QlooOperation) => op.op === "insights" && op.resultEntities !== undefined,
+      "last fill": (op: QlooOperation) => op.op === "compare" && op.b[0] === personId(4),
+    };
+    for (const [name, isCut] of Object.entries(cuts)) {
+      const clock = steppedClock();
+      const { qloo: plain, ops } = fakeQloo();
+      // What the real client does when the deadline signal fires mid-call.
+      const qloo: MeteredQloo = {
+        async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
+          if (!isCut(op)) return plain.call<T>(op);
+          ops.push(op);
+          clock.advance(125_000);
+          throw new QlooError("QLOO_TIMEOUT");
+        },
+        stats: plain.stats,
+      };
+      const input: RunInput = { show: "Synthetic Show", exclude: [] };
+      const runId = await createRun(db, input, NOW);
+      const agent = createAgentRunner({ db, ...sameForBoth(fakeModel(BRIEF).model, qloo), feeds: fakeFeeds().feeds, trends: true, now: clock.now });
+      await agent.startRun(runId, input);
+
+      await agent.continueRun(runId, await confirmFirst(runId));
+
+      expect(await getRun(db, runId), name).toMatchObject({ status: "failed", errorCode: "AGENT_LIMIT", finishedAt: clock.at(125_000) });
+      expect(ops.filter(isCut), name).toHaveLength(1);
+      expect(isCut(ops.at(-1)!), name).toBe(true);
+      expect(await listBoard(db, runId), name).toEqual([]);
+    }
+  });
+
+  it("stores the flip as unavailable when the deadline cuts its model call or passes while it runs, and still ends the run done", async () => {
+    const cases = {
+      "cut off": () => {
+        throw new AgentError("MODEL_TIMEOUT");
+      },
+      "answered late": () => ({ guests: FLIP_GUESSES }),
+    };
+    for (const [name, reply] of Object.entries(cases)) {
+      const clock = steppedClock();
+      // What the real model does when the run's signal fires mid-call.
+      const { model } = guessingModel(() => {
+        clock.advance(125_000);
+        return reply();
+      });
+      const { qloo, ops } = flipQloo();
+      const input: RunInput = { show: "Synthetic Show", exclude: [] };
+      const runId = await createRun(db, input, NOW);
+      const agent = createAgentRunner({ db, ...sameForBoth(model, qloo), feeds: fakeFeeds().feeds, trends: true, now: clock.now });
+      await agent.startRun(runId, input);
+
+      await agent.continueRun(runId, await confirmFirst(runId));
+
+      expect(await getRun(db, runId), name).toMatchObject({ status: "done", finishedAt: clock.at(125_000) });
+      expect(await listBoard(db, runId), name).toHaveLength(4);
+      const events = await listEventsAfter(db, runId, 0);
+      expect(events.slice(-2).map((event) => [event.event, event.data]), name).toEqual([
+        ["without_qloo", { status: "unavailable" }],
+        ["done", { guests: 4, pastGuests: { checked: true, skipped: 0 } }],
+      ]);
+      if (name === "cut off") expect(ops.some((op) => op.op === "search" && op.types.includes("urn:entity:person")), name).toBe(false);
+    }
   });
 });
 
@@ -799,17 +1088,22 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
         },
       };
     };
+    const harnessPicks: RunSurface[] = [];
     const qloos = { web: meteredFor("web", qlooCalls), mcp: meteredFor("mcp", qlooCalls) };
     const models = { web: modelOf("web"), mcp: modelOf("mcp") };
     const agent = createAgentRunner({
       db,
       qlooFor: (surface) => qloos[surface],
+      harnessFor: (surface) => {
+        harnessPicks.push(surface);
+        return harnessFrom(qloos[surface]).harness;
+      },
       modelFor: (surface) => models[surface],
       feeds: fakeFeeds({ shows: [show(1)] }).feeds,
       trends: true,
       now: () => NOW,
     });
-    return { agent, qlooCalls, modelCalls };
+    return { agent, qlooCalls, modelCalls, harnessPicks };
   }
 
   async function runToBrief(agent: ReturnType<typeof surfaceRunner>["agent"], runId: string, input: RunInput): Promise<void> {
@@ -827,7 +1121,7 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
     async () => {
       await openBuckets();
       const { id: tokenId } = await issueToken(db);
-      const { agent, qlooCalls, modelCalls } = surfaceRunner();
+      const { agent, qlooCalls, modelCalls, harnessPicks } = surfaceRunner();
       const input: RunInput = { show: "Synthetic Show", exclude: [] };
 
       const mcpRun = await createRun(db, input, NOW, { surface: "mcp", tokenId });
@@ -837,6 +1131,7 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
       expect(mcpQloo).toBeGreaterThan(0);
       expect(new Set(qlooCalls)).toEqual(new Set(["mcp"]));
       expect(new Set(modelCalls)).toEqual(new Set(["mcp"]));
+      expect(harnessPicks).toEqual(["mcp"]);
       expect(await used()).toEqual({
         "qloo:month": mcpQloo,
         "qloo:day": 0,
@@ -853,6 +1148,7 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
 
       expect(new Set(qlooCalls)).toEqual(new Set(["web"]));
       expect(new Set(modelCalls)).toEqual(new Set(["web"]));
+      expect(harnessPicks).toEqual(["mcp", "web"]);
       expect(await used()).toEqual({
         "qloo:month": mcpQloo + qlooCalls.length,
         "qloo:day": qlooCalls.length,
@@ -916,6 +1212,10 @@ describe("which share a run spends from (D3.1, D3.2, D3.3)", () => {
       qlooFor: (surface) => {
         picked.push(surface);
         return fakeQloo().qloo;
+      },
+      harnessFor: (surface) => {
+        picked.push(surface);
+        return harnessFrom(fakeQloo().qloo).harness;
       },
       modelFor: (surface) => {
         picked.push(surface);

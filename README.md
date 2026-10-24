@@ -9,11 +9,11 @@ Built for the [Qloo Agentic Hackathon](https://qloo.devpost.com/). Vasal is an a
 Under construction, in public. What exists today:
 
 - `packages/agent`, the server side:
-  - a Qloo client built on Qloo's official harness (`qloo mcp`)
+  - a metered Qloo client: every request takes one budget slot, is cached, is tried once and never follows a redirect. The agent's person lookup runs on Qloo's official harness (`@qloo/qloo-harness`) inside our process: its describe workflow and name resolver, with every request it makes going through that same metered client. The other Qloo calls use the client directly, because the harness lacks the popularity and release-year filters Vasal needs
   - a feed reader that turns a show name, an Apple Podcasts link or an RSS URL into the show's episode list, without ever fetching a private or internal address
   - a key-day probe that checks Qloo's coverage of 30 real shows
   - the agent server: it starts a run only for a person on our own site who passes a human check, inside per-visitor, site-wide and budget caps, and it streams each run's progress live
-  - the agent: Claude Haiku researches the show with eight Qloo tools inside hard limits. Code then scores every finalist in one comparable Qloo call (fit, reach, the listeners they bring, the tastes they share). Qloo's hackathon server returns no trend data yet, so whether a guest is rising shows as unknown rather than a guess. The model writes only the angles and the booking brief, and code strips any number, link or email it invents
+  - the agent: Claude Haiku researches the show with eight Qloo tools inside hard limits. Code then scores every finalist in one comparable Qloo call (fit, reach, the listeners they bring, the tastes they share). Qloo's hackathon server returns no trend data yet, so whether a guest is rising shows as unknown rather than a guess. The model writes only the angles and the booking brief. Code refuses any number it writes, in digits or in words, and strips any link or email it invents
   - the backtest pipeline, exactly as pre-registered, with the 11 pinned YouTube channels in `docs/backtest-shows.json`
   - operator commands for budgets, pruning, the kill switch, health and the home-page showcase (`npm run ops -w packages/agent -- --dev selftest` tries them all on a throwaway database)
 - `docs/security/threat-model.md`: the threat model, written before the code. Its section C is the definition of done.

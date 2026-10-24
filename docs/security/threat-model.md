@@ -165,11 +165,15 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C2.2 The model can call only tools on a fixed server-side list. Tools the MCP server offers that are not on the list are refused, even if a package update adds them. Every tool argument passes a strict schema before any call: unknown keys are rejected, strings and numbers are capped, and Qloo operations come from a fixed set.
 - C2.3 No upstream request's host, path, header or raw query string comes from the model or the visitor. The server builds each request from checked fields. Visitor and model text enter only as the value of a single encoded parameter (URLSearchParams or the client library), never by joining strings.
   - Show it: the show name `x&take=500#y` produces a request whose parsed query has one parameter holding the whole string.
-- C2.4 Each run has hard caps in code on model turns, tool calls per tool, tokens per response, tokens per run, and wall-clock time. Hitting a cap ends the run as failed (C6.4), and what was spent stays counted.
+- C2.4 Each run has hard caps in code on model turns, tool calls per tool, tokens per response, tokens per run, and wall-clock time. Hitting a cap ends the run as failed with AGENT_LIMIT (C6.4), and what was spent stays counted.
+  - The wall clock runs 120 s from confirm. The feed read (at most 15 s), the research, the fit call and the fills all spend from it.
+  - Every Qloo call after confirm carries a signal that fires at the deadline. A call still running is cut off, no call, retry or wait for a meter slot starts after the deadline, and a cut-off call keeps the one meter slot it already took.
+  - A model turn starts only if the tokens used so far, plus the turn's estimated input (the model client's own reservation estimate, or the last turn's counted tokens if higher) and its output cap, fit under the run's token cap.
   - Show it: a stub model that asks for tools forever stops at the turn cap, and the run is marked failed.
 - C2.5 The visitor controls no model setting. Model name, system prompt, token limits and tool list are fixed on the server.
 - C2.6 No secret, environment variable, database URL or internal hostname appears in any message to the model, including tool results and tool errors.
 - C2.7 Exclusions are applied in code to the ranked board, and the model never sees them. Visitor free text never reaches the brief or pitch prompts. Those get only the confirmed show, the guest picked from the stored board, computed numbers and tool data.
+  - The Without Qloo prompt gets only Qloo's show name, the recent episode titles, and the publisher when the show came from Apple's directory. A pasted feed's publisher is the visitor's own hostname, so it never reaches a prompt. The visitor's exclusions apply to the flip too, in code.
 - C2.8 Tool results reach the model only as tool-result content, capped in size, and are never merged into the system prompt. Every third-party string in a tool result is cleaned first by the same cleaner as D5.2: NFC, `\p{Cc}` removed, `\p{Default_Ignorable_Code_Point}` and `\p{Bidi_Control}` removed. That takes out the invisible Unicode tag characters (U+E0000 to U+E007F), which a model reads and a person cannot see.
 - C2.9 A person the show has already had as a guest never reaches the board. Code (isPastGuest, at recordPerson, the one gate every person passes) removes anyone whose whole name, first and last name, or a three-letter short first name before the same surname appears in any episode title the feed gave, or in the show's own names (directory name, publisher, Qloo name, feed title), so a host never reaches the board, before the model sees them. A person dropped once (a past guest, or dead) stays dropped for the whole run, whatever a later answer says. The scoring step applies the death check too. Their id is then unknown, so it is refused like any id no tool returned (C2.2). When the feed cannot be read, or gives no titles, the run records that past guests were not checked, rather than implying there were none. The board records how many titles were checked and how far back. A false match only removes a person; it can never add one.
 
@@ -179,6 +183,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C3.2 Every link or image address built from upstream or model data comes out of the WHATWG URL parser with protocol `https:` or `http:`. Anything else shows as plain text. Feed-supplied image URLs never go to the Next.js image optimizer, whose list of remote hosts holds exact names with no wildcards.
   - Show it: a feed link of `javascript:alert(1)` or ` JaVaScRiPt:alert(1)` shows as text.
 - C3.3 Every stream frame is one `event:` line, with a name from a fixed set, and one `data:` line holding `JSON.stringify` output (which escapes CR and LF). No upstream string is ever written into the stream outside a JSON string.
+  - The without_qloo event carries only Qloo's names, numbers, booleans and counts (publicWithoutQloo, a strict schema). The model's own guessed names are never stored, streamed or shown; a guess Qloo cannot match shows only as a count.
   - Show it: a feed title containing `\n\nevent: done\ndata: {"board":[]}\n\n` reaches the browser as one text field of one event.
 - C3.4 No number on screen comes from model output. Metrics render only from fields computed in code. A number can appear in model prose only through a placeholder that code fills. Prose containing any other digit is regenerated once, and if it fails again that step fails.
   - Show it: a stub model writing "fit 9.7/10, 2M listeners" never gets those figures on screen.
@@ -204,6 +209,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C5.1 Qloo calls per day and per month, Anthropic tokens per day and YouTube units per day never go over operator-set caps. This holds across every process (web, agent, offline scripts) and every instance. A metered call is made only after the database reserves its share in one atomic statement (it adds to the counter only if the total stays under the cap). If the reservation fails, no call is made. The offline scripts draw from their own reserved share.
   - Show it: 50 simultaneous run starts against a cap of 10 produce exactly 10 reservations.
 - C5.2 The service never goes over Qloo's per-second limit across all instances. After a 429 from any upstream, a call is retried a fixed small number of times, honouring Retry-After, and then the step fails.
+  - Qloo's harness runs in our process for find_person only, on a client we supply (createMeteredHarnessClient). Each request it makes takes one meter slot, is tried once, never follows a redirect and carries the run's deadline. The harness's own HTTP client, its stdio `qloo mcp` route and its log files are never used. A harness match counts as found only when its name matches the name asked for (sameName), and an id-shaped name is refused with no Qloo call.
 - C5.3 Per-visitor caps use the client address from the header the hosting edge sets, the one clients cannot set. IPv6 addresses are counted per /64 block. One normaliser (`ipaddr.process`) produces the key both when counting and when checking, so `::ffff:1.2.3.4` and `1.2.3.4` count as the same visitor.
 - C5.4 No GET, HEAD, link prefetch or crawler visit starts a run or spends a metered call. Showing a saved run, a showcase run or the backtest page makes zero upstream calls.
   - Show it: crawl every page with GET requests only while counting upstream calls. The count is zero.
@@ -286,8 +292,8 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
    - request body: 8 KB
    - show text: 300 characters
    - exclusions: 25 names of 100 characters each
-   - feed fetch: 5 s to connect, 15 s total, 10 MB decoded, 3 redirects, IPv4 addresses dialled first, newest 2,000 items parsed
-   - model: 12 turns, 25 tool calls, 8,000 output tokens per reply (raised from a first guess of 4,000, so a turn that plans several tool calls is not cut off; the per-run cap is unchanged), 150,000 tokens per run
+   - feed fetch: 5 s to connect, 15 s total, 32 MB decoded, 3 redirects, IPv4 addresses dialled first, newest 2,000 items parsed (episode dates outside 2000 to now read as unknown)
+   - model: 12 turns, 25 tool calls, 8,000 output tokens per reply (raised from a first guess of 4,000, so a turn that plans several tool calls is not cut off; the per-run cap is unchanged), 250,000 tokens per run (raised from 150,000 on 24 Oct: once the check counted each turn's input, research on a large show hit 150,000 in about one run in seven)
    - run wall clock: 120 s
    - streams: 3 per run, 10 minutes each
    - runs in progress across the site: 3
@@ -464,6 +470,7 @@ D5 What goes back to the calling agent (A19, A20, A23, A25, G7, G10)
   - Show it: `![x](https://evil.example/p?d=)` and `evil.example/login` come back without the URL.
 - D5.4 Results label themselves in fixed fields: third-party text as data from directories, feeds and Qloo, not instructions; angles and briefs as AI drafts; numbers as computed by Vasal. The labels are a hint, not a defence.
 - D5.5 MCP returns no more than the run page shows a person: no raw Qloo responses, Qloo entity ids or step logs.
+  - The same holds for the Without Qloo flip on the run page: no Qloo ids, no model text.
 - D5.6 Nothing internal reaches the caller's model: secrets, internal hostnames, stack traces, other tokens' ids.
 
 D6 New tables

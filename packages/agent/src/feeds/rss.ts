@@ -94,11 +94,18 @@ function cappedText(value: unknown, max: number): string | null {
   return text === null ? null : capChars(text, max);
 }
 
+// Podcasts did not exist before 2000, and a date days ahead is a feed error,
+// not an episode. Out-of-range dates read as unknown, because one stray 1970
+// would otherwise say a show's feed was checked "back to Jan 1970".
+const EARLIEST_EPISODE_MS = Date.UTC(2000, 0, 1);
+const FUTURE_SLACK_MS = 2 * 24 * 60 * 60 * 1_000;
+
 function isoDate(value: unknown): string | null {
   const text = textOf(value);
   if (text === null || text.length > MAX_DATE_CHARS) return null;
   const ms = Date.parse(text);
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  if (!Number.isFinite(ms) || ms < EARLIEST_EPISODE_MS || ms > Date.now() + FUTURE_SLACK_MS) return null;
+  return new Date(ms).toISOString();
 }
 
 function durationSeconds(value: unknown): number | null {

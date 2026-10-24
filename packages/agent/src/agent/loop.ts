@@ -3,7 +3,7 @@ import type { MeteredQloo } from "../qloo/metered.js";
 import { cleanText } from "../text/normalize.js";
 import type { RunContext } from "./context.js";
 import { AgentError } from "./errors.js";
-import type { ModelClient } from "./model.js";
+import { estimateInputTokens, type ModelClient } from "./model.js";
 import { RESEARCH_NUDGE, researchSystem } from "./prompts.js";
 import { researchTools, runTool, TOOL_LIMITS, type ToolName, type ToolOutcome } from "./tools.js";
 
@@ -14,7 +14,7 @@ export type StepEvent = { tool: string; ok: boolean; label: string };
 export const DEFAULT_LIMITS: Readonly<LoopLimits> = Object.freeze({
   maxTurns: 12,
   maxToolCalls: 25,
-  maxRunTokens: 150_000,
+  maxRunTokens: 250_000,
   maxWallMs: 120_000,
   turnMaxTokens: 8_000,
 });
@@ -148,20 +148,28 @@ function checkedLimits(overrides: Partial<LoopLimits>): LoopLimits {
  * trend_of is neither named, offered nor run.
  *
  * Every cap is enforced here in code, never by asking the model (C2.1,
- * C2.4): before each model call the turn count, tool calls, the summed
- * input and output tokens of every reply and the wall clock are checked;
- * before each tool the tool-call count; after each tool the tokens and the
- * wall clock. A reply whose usage cannot be read counts as the whole token
- * budget, so it fails closed. Each model call gets the wall-clock time left
- * as its timeoutMs (at least 1 second) and a signal that fires when the
- * wall clock runs out, so a call still in flight then is cut off.
+ * C2.4): before each model call the turn count, tool calls, the wall clock,
+ * and whether the summed input and output tokens of every reply, plus the
+ * turn's estimated input (estimateInputTokens, the model client's own
+ * reservation estimate, or the last turn's counted tokens if more) and its
+ * output limit (turnMaxTokens), still fit in maxRunTokens are
+ * checked; before each tool the tool-call count; after each tool the tokens
+ * and the wall clock. A reply whose usage cannot be read counts as the whole
+ * token budget, so it fails closed. The wall clock runs maxWallMs from
+ * deps.startedAtMs (on the nowMs clock, default now; a later value counts
+ * as now), so a caller can count time it spent before research. Each model
+ * call gets the wall-clock time left as its timeoutMs (at least 1 second)
+ * and a signal that fires when the wall clock runs out, and every Qloo call
+ * a tool makes gets the same signal, so a call still in flight then is cut
+ * off and no Qloo call starts after it.
  *
- * Throws AgentError AGENT_LIMIT for any cap, MODEL_TIMEOUT for a model call
- * cut off by its timeout or the wall clock, AGENT_NO_BOARD for a second
- * reply with no tool call, MODEL_TRUNCATED for a reply cut off at its token
- * limit, any other AgentError the model client throws, RangeError for a
- * limit that is not a positive whole number, and whatever runTool or onStep
- * rethrows (such as StoreError).
+ * Throws AgentError AGENT_LIMIT for any cap, including a Qloo call cut off
+ * by the wall clock, MODEL_TIMEOUT for a model call cut off by its timeout
+ * or the wall clock, AGENT_NO_BOARD for a second reply with no tool call,
+ * MODEL_TRUNCATED for a reply cut off at its token limit, any other
+ * AgentError the model client throws, RangeError for a limit that is not a
+ * positive whole number or a startedAtMs that is not a finite number, and
+ * whatever runTool or onStep rethrows (such as StoreError).
  */
 export async function runResearch(
   ctx: RunContext,
@@ -172,12 +180,17 @@ export async function runResearch(
     trends: boolean;
     onStep: (s: StepEvent) => Promise<void>;
     nowMs?: () => number;
+    startedAtMs?: number;
   },
   limits?: Partial<LoopLimits>,
 ): Promise<Array<{ personId: string; angle: string }>> {
   const caps = checkedLimits(limits ?? {});
   const clock = deps.nowMs ?? Date.now;
-  const startedAt = clock();
+  const now = clock();
+  // A start in the future would stretch the cap, so it counts as now.
+  const startedAt = Math.min(deps.startedAtMs ?? now, now);
+  if (!Number.isFinite(startedAt)) throw new RangeError("startedAtMs must be a finite number.");
+  const deadline = startedAt + caps.maxWallMs;
   const toolOptions = { trends: deps.trends };
   const tools = researchTools(toolOptions);
   const system = researchSystem({ ...toolOptions, pastGuestsChecked: ctx.pastGuests.checked });
@@ -185,23 +198,40 @@ export async function runResearch(
   let turns = 0;
   let toolCalls = 0;
   let tokens = 0;
+  let lastTurnTokens = 0;
   let nudged = false;
 
-  const overTime = () => clock() - startedAt >= caps.maxWallMs;
-  const timeLeft = () => Math.max(MIN_TURN_TIMEOUT_MS, Math.ceil(caps.maxWallMs - (clock() - startedAt)));
-  const tokensOf = (value: unknown) => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : caps.maxRunTokens);
   const wallClock = new AbortController();
-  const wallTimer = setTimeout(() => wallClock.abort(), caps.maxWallMs);
+  // The signal counts too: a timer can fire a moment before the clock reads
+  // the deadline, and a call it cut off must still end the run as a cap.
+  const overTime = () => wallClock.signal.aborted || clock() >= deadline;
+  const timeLeft = () => Math.max(MIN_TURN_TIMEOUT_MS, Math.ceil(deadline - clock()));
+  const tokensOf = (value: unknown) => (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : caps.maxRunTokens);
+  const wallTimer = setTimeout(() => wallClock.abort(), Math.max(0, deadline - now));
+  const qlooOptions = { ...toolOptions, signal: wallClock.signal };
 
   try {
     for (;;) {
-      if (turns >= caps.maxTurns || toolCalls >= caps.maxToolCalls || tokens >= caps.maxRunTokens || overTime()) throw limitHit();
+      // A turn resends the whole conversation and may write up to
+      // turnMaxTokens, so it starts only if both still fit under the cap. Its
+      // input is taken as the model client's own reservation estimate, or the
+      // last turn's counted tokens if more, since it resends all of that turn.
+      const estimatedInput = Math.max(estimateInputTokens([system, messages, tools]), lastTurnTokens);
+      const turnFits = tokens + estimatedInput + caps.turnMaxTokens <= caps.maxRunTokens;
+      const which = turns >= caps.maxTurns ? "turn" : toolCalls >= caps.maxToolCalls ? "tool call" : !turnFits ? "token" : overTime() ? "time" : null;
+      if (which !== null) {
+        // AGENT_LIMIT names no cap, so the operator's log says which one ended
+        // the run. Fixed words and counts only.
+        console.warn(`research stopped at the ${which} limit after ${turns} turns, ${toolCalls} tool calls, ${tokens} tokens`);
+        throw limitHit();
+      }
       const response = await deps.model.turn(
         { system, messages, tools, maxTokens: caps.turnMaxTokens },
         { signal: wallClock.signal, timeoutMs: timeLeft() },
       );
       turns += 1;
-      tokens += tokensOf(response.usage?.input_tokens) + tokensOf(response.usage?.output_tokens);
+      lastTurnTokens = tokensOf(response.usage?.input_tokens) + tokensOf(response.usage?.output_tokens);
+      tokens += lastTurnTokens;
       messages.push({ role: "assistant", content: response.content });
 
       // A tool input cut off at the token limit can still parse, so none of
@@ -221,7 +251,7 @@ export async function runResearch(
       for (const block of toolUses) {
         if (toolCalls >= caps.maxToolCalls) throw limitHit();
         toolCalls += 1;
-        const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today, toolOptions);
+        const outcome = await runTool(ctx, deps.qloo, block.name, block.input, deps.today, qlooOptions);
         await deps.onStep(stepFor(ctx, block.name, block.input, outcome));
         if (tokens >= caps.maxRunTokens || overTime()) throw limitHit();
         if (outcome.finished !== undefined) return outcome.finished;

@@ -5,7 +5,8 @@
 // written by code, what the model is offered with trends off, and whether
 // it is told past guests were checked. One test
 // runs the real Anthropic client over a fake SDK that never answers, to show
-// the wall clock cuts a call off. It does not cover the real model's
+// the wall clock cuts a call off, and one does the same for a Qloo call that
+// never answers. It does not cover the real model's
 // choices, the rest of the Anthropic client
 // (agent-model), the tools' own checks (agent-tools) or storing step events
 // (agent-runner).
@@ -13,13 +14,15 @@ import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import { describe, expect, it, vi } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { AgentError } from "../src/agent/errors.js";
-import { runResearch, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
-import { createAnthropicModel, type ModelCallOptions, type ModelClient } from "../src/agent/model.js";
+import { DEFAULT_LIMITS, runResearch, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
+import { createAnthropicModel, estimateInputTokens, type ModelCallOptions, type ModelClient } from "../src/agent/model.js";
 import { RESEARCH_NUDGE, researchSystem } from "../src/agent/prompts.js";
 import { ACCUSATIONS_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
-import { TOOL_LIMITS } from "../src/agent/tools.js";
+import { attachHarness, TOOL_LIMITS } from "../src/agent/tools.js";
+import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
+import { harnessFrom } from "./helpers/agent-fakes.js";
 
 const MARKER = "MARKER-100p";
 const TODAY = new Date("2026-10-19T09:30:00.000Z");
@@ -100,6 +103,7 @@ const newContext = (): RunContext =>
 async function run(script: (turn: number) => Anthropic.Message, limits?: Partial<LoopLimits>, nowMs?: () => number, trends = true) {
   const ctx = newContext();
   const { qloo, ops } = fakeQloo();
+  attachHarness(ctx, { qloo: harnessFrom(qloo).harness });
   const { model, calls, options } = fakeModel(script);
   const steps: StepEvent[] = [];
   const outcome = runResearch(
@@ -211,13 +215,51 @@ describe("runResearch caps (C2.1, C2.4)", () => {
     expect(steps.filter((step) => step.tool === "recent_episode_titles")).toHaveLength(13);
   });
 
-  it("stops when the summed input and output tokens reach the run cap", async () => {
+  it("stops before the summed input and output tokens could pass the run cap", async () => {
+    // Two thirds of the cap per turn: the first fits, and a second, which
+    // resends all of the first and may write turnMaxTokens more, would not.
+    const perTurn = Math.floor((DEFAULT_LIMITS.maxRunTokens * 2) / 3);
     const { error, calls } = await run(() =>
-      reply([toolUse("t", "recent_episode_titles", {})], "tool_use", { input_tokens: 100_000, output_tokens: 1 }),
+      reply([toolUse("t", "recent_episode_titles", {})], "tool_use", { input_tokens: perTurn, output_tokens: 1 }),
     );
 
     expect(codeOf(error)).toBe("AGENT_LIMIT");
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(1);
+    expect(calls.length * (perTurn + 1)).toBeLessThanOrEqual(DEFAULT_LIMITS.maxRunTokens);
+  });
+
+  it("counts a turn's estimated input, the same estimate the model client reserves, before calling the model", async () => {
+    const script = () => reply([toolUse("p", "people_for_show", { reach: "any" }), finish()]);
+    const first = (await run(script)).calls[0]!;
+    const estimate = estimateInputTokens([first.system, first.messages, first.tools]);
+    expect(estimate).toBeGreaterThan(1_000);
+
+    // The input estimate alone passes the cap.
+    const alone = await run(script, { maxRunTokens: estimate - 1, turnMaxTokens: 1 });
+    expect(codeOf(alone.error)).toBe("AGENT_LIMIT");
+    expect(alone.calls).toHaveLength(0);
+
+    // The output cap alone fits; the estimate takes it one token over.
+    const over = await run(script, { maxRunTokens: estimate + 7_999, turnMaxTokens: 8_000 });
+    expect(codeOf(over.error)).toBe("AGENT_LIMIT");
+    expect(over.calls).toHaveLength(0);
+
+    const fits = await run(script, { maxRunTokens: estimate + 8_000, turnMaxTokens: 8_000 });
+    expect(fits.error).toBeNull();
+    expect(fits.calls).toHaveLength(1);
+  });
+
+  it("refuses a turn before calling the model when its token limit could take the run past the token cap", async () => {
+    const used = { input_tokens: 10_000, output_tokens: 4_000 };
+    const { error, calls } = await run(() => reply([toolUse("t", "recent_episode_titles", {})], "tool_use", used), {
+      maxRunTokens: 20_000,
+      turnMaxTokens: 8_000,
+    });
+
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    // 14,000 used, and the next turn could add 8,000 more.
+    expect(calls).toHaveLength(1);
+    expect(calls.length * (used.input_tokens + used.output_tokens)).toBeLessThanOrEqual(20_000);
   });
 
   it("stops when the wall clock passes the cap", async () => {
@@ -318,6 +360,50 @@ describe("runResearch caps (C2.1, C2.4)", () => {
     // The reservation was made before the call and stays spent.
     expect(reserveTokens).toHaveBeenCalledTimes(1);
     expect(steps).toHaveLength(0);
+  });
+
+  it("cuts off a Qloo call still in flight when the wall clock ends, fails AGENT_LIMIT, and starts no Qloo call after it", async () => {
+    const limitMs = 300;
+    const ops: QlooOperation[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
+    // Like the real client: no answer comes, and the call rejects once its
+    // signal fires. The fallback ends a call that is never given one.
+    const qloo: MeteredQloo = {
+      call(op, options) {
+        ops.push(op);
+        signals.push(options?.signal);
+        return new Promise((_resolve, reject) => {
+          const fallback = setTimeout(() => reject(new QlooError("QLOO_UPSTREAM")), 3_000);
+          options?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(fallback);
+              reject(new QlooError("QLOO_TIMEOUT"));
+            },
+            { once: true },
+          );
+        });
+      },
+      stats: () => ({ calls: ops.length, cacheHits: 0 }),
+    };
+    const { model, calls } = fakeModel(() =>
+      reply([toolUse("p", "people_for_show", { reach: "any" }), toolUse("u", "upcoming_releases", { kind: "movie" })]),
+    );
+    const started = Date.now();
+
+    const error = await runResearch(newContext(), { model, qloo, today: TODAY, trends: true, onStep: async () => {} }, { maxWallMs: limitMs }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+
+    const elapsed = Date.now() - started;
+    expect(codeOf(error)).toBe("AGENT_LIMIT");
+    expect(elapsed).toBeGreaterThanOrEqual(limitMs - 50);
+    expect(elapsed).toBeLessThan(limitMs + 1_000);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(ops.map((op) => op.op)).toEqual(["insights"]);
+    expect(calls).toHaveLength(1);
   });
 });
 

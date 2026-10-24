@@ -1,14 +1,20 @@
+import type { ZodType } from "zod";
 import { cacheGet, cachePut } from "../store/cache.js";
 import type { Db } from "../store/db.js";
 import { waitForQlooSlot } from "../store/meter.js";
-import type { QlooClient } from "./client.js";
+import { buildRawQlooRequest, RawQlooBody, type QlooCallOptions, type QlooClient, type RawQlooRequest } from "./client.js";
 import { QlooError } from "./errors.js";
 import { buildQlooRequest, type QlooOperation } from "./request.js";
 import { NORMALISED_SCHEMAS } from "./schemas.js";
 
 export type MeteredQloo = {
-  call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }>;
+  call<T>(op: QlooOperation, options?: QlooCallOptions): Promise<{ data: T; fromCache: boolean }>;
   stats(): { calls: number; cacheHits: number };
+};
+
+/** The metered path for one raw request from Qloo's harness (see createMeteredQloo). */
+export type MeteredRawQloo = {
+  callRaw(request: RawQlooRequest, options?: QlooCallOptions): Promise<{ data: RawQlooBody; fromCache: boolean }>;
 };
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -27,8 +33,23 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1_000;
  * cached (C7.2). `now` sets the clock for cache expiry only. The meter keeps
  * real time, because the per-second limit is about real time.
  *
- * Throws QlooError("QLOO_BAD_INPUT") for an operation the builder refuses,
- * QlooError("QLOO_BUDGET") with no request made when no slot is free, any
+ * options.signal goes to `waitForSlot` and then to the client. A cache hit is
+ * answered whether or not it has fired, since it spends nothing. A miss
+ * after it has fired takes no slot and makes no request, and a wait for a
+ * slot ends when it fires, also with no slot taken. A call it cuts off keeps
+ * the one slot it took, and the client never retries it. A custom
+ * `waitForSlot` honours the signal only if it passes it on.
+ *
+ * callRaw is the same path for one raw request from Qloo's harness: the key
+ * comes from buildRawQlooRequest, the builder client.callRaw sends with, a
+ * cached value must still be a JSON object, and on a miss one slot is
+ * reserved before client.callRaw makes its single attempt. Its calls and
+ * cache hits count in stats with the rest.
+ *
+ * Throws QlooError("QLOO_BAD_INPUT") for an operation or raw request the
+ * builder refuses, before any slot is taken,
+ * QlooError("QLOO_BUDGET") with no request made when no slot is free,
+ * QlooError("QLOO_TIMEOUT") for a miss once options.signal has fired, any
  * QlooError the client throws, and StoreError when the database fails, so an
  * outage is never mistaken for a miss or a free slot.
  */
@@ -38,32 +59,52 @@ export function createMeteredQloo(opts: {
   baseUrl: URL;
   ttlMs?: number;
   now?: () => Date;
-  waitForSlot?: (db: Db) => Promise<boolean>;
-}): MeteredQloo {
+  waitForSlot?: (db: Db, signal?: AbortSignal) => Promise<boolean>;
+}): MeteredQloo & MeteredRawQloo {
   const { client, db, baseUrl } = opts;
   const ttlMs = opts.ttlMs ?? SEVEN_DAYS_MS;
   const clock = opts.now ?? (() => new Date());
-  const waitForSlot = opts.waitForSlot ?? ((target: Db) => waitForQlooSlot(target));
+  const waitForSlot =
+    opts.waitForSlot ?? ((target: Db, signal?: AbortSignal) => waitForQlooSlot(target, signal === undefined ? {} : { signal }));
   let calls = 0;
   let cacheHits = 0;
 
+  // The one order both call shapes follow: cache, then meter, then network.
+  async function spend(
+    cacheKey: string,
+    schema: ZodType<unknown>,
+    options: QlooCallOptions,
+    send: () => Promise<unknown>,
+  ): Promise<{ data: unknown; fromCache: boolean }> {
+    const cached = await cacheGet<unknown>(db, cacheKey, schema, clock());
+    if (cached !== null) {
+      cacheHits += 1;
+      return { data: cached, fromCache: true };
+    }
+
+    // Past the caller's deadline nothing is spent, not even a slot.
+    const fired = () => options.signal?.aborted === true;
+    if (fired()) throw new QlooError("QLOO_TIMEOUT");
+    if (!(await waitForSlot(db, options.signal))) throw new QlooError(fired() ? "QLOO_TIMEOUT" : "QLOO_BUDGET");
+
+    // Counted before the await: a call that fails upstream still spent its slot.
+    calls += 1;
+    const data = await send();
+    await cachePut(db, cacheKey, data, ttlMs, clock());
+    return { data, fromCache: false };
+  }
+
   return {
-    async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
+    async call<T>(op: QlooOperation, options: QlooCallOptions = {}): Promise<{ data: T; fromCache: boolean }> {
       const { cacheKey } = buildQlooRequest(baseUrl, op);
+      const result = await spend(cacheKey, NORMALISED_SCHEMAS[op.op], options, async () => (await client.call<T>(op, options)).data);
+      return result as { data: T; fromCache: boolean };
+    },
 
-      const cached = await cacheGet<unknown>(db, cacheKey, NORMALISED_SCHEMAS[op.op], clock());
-      if (cached !== null) {
-        cacheHits += 1;
-        return { data: cached as T, fromCache: true };
-      }
-
-      if (!(await waitForSlot(db))) throw new QlooError("QLOO_BUDGET");
-
-      // Counted before the await: a call that fails upstream still spent its slot.
-      calls += 1;
-      const result = await client.call<T>(op);
-      await cachePut(db, cacheKey, result.data, ttlMs, clock());
-      return { data: result.data, fromCache: false };
+    async callRaw(request: RawQlooRequest, options: QlooCallOptions = {}): Promise<{ data: RawQlooBody; fromCache: boolean }> {
+      const { cacheKey } = buildRawQlooRequest(baseUrl, request);
+      const result = await spend(cacheKey, RawQlooBody, options, async () => (await client.callRaw(request, options)).data);
+      return result as { data: RawQlooBody; fromCache: boolean };
     },
 
     stats: () => ({ calls, cacheHits }),

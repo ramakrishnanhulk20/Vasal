@@ -238,3 +238,26 @@ describe("structure limits", () => {
     expect(parseFeed(rss(items.join(""))).episodes).toHaveLength(2_000);
   });
 });
+
+describe("episode dates outside 2000 to now read as unknown", () => {
+  // A stray 1970 in This Week in Startups' feed would have made the board say
+  // its past guests were checked "back to Jan 1970".
+  it("keeps a real date and drops one before 2000 or days in the future", () => {
+    const future = new Date(Date.now() + 10 * 24 * 60 * 60 * 1_000).toUTCString();
+    const episodes = parseFeed(
+      rss(
+        [
+          item("Real", "Mon, 12 Oct 2026 10:00:00 GMT"),
+          item("Epoch", "Thu, 01 Jan 1970 00:00:00 GMT"),
+          item("Nineties", "Fri, 31 Dec 1999 23:59:59 GMT"),
+          item("Ahead", future),
+        ].join(""),
+      ),
+    ).episodes;
+    const byTitle = new Map(episodes.map((episode) => [episode.title, episode.publishedAt]));
+    expect(byTitle.get("Real")).toBe("2026-10-12T10:00:00.000Z");
+    expect(byTitle.get("Epoch")).toBeNull();
+    expect(byTitle.get("Nineties")).toBeNull();
+    expect(byTitle.get("Ahead")).toBeNull();
+  });
+});

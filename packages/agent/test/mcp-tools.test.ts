@@ -53,6 +53,7 @@ import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
 import { setFlag } from "../src/store/flags.js";
 import { setBucket, usage } from "../src/store/meter.js";
+import { harnessFrom } from "./helpers/agent-fakes.js";
 import { migratedPglite } from "./helpers/pglite.js";
 import { SETTLE } from "./helpers/settle.js";
 
@@ -347,7 +348,14 @@ describe("find_show (F11)", () => {
       },
       parseFeed,
     };
-    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds, trends: true });
+    const agent = createAgentRunner({
+      db,
+      qlooFor: () => syntheticQloo(),
+      harnessFor: () => harnessFrom(syntheticQloo()).harness,
+      modelFor: () => syntheticModel(),
+      feeds,
+      trends: true,
+    });
     const client = await connect({ agent });
 
     const byName = await call(client, "find_show", { query: "Synthetic Show" });
@@ -827,7 +835,14 @@ describe("ownership (D4.1, D4.2)", () => {
       },
       parseFeed,
     };
-    const agent = createAgentRunner({ db, qlooFor: () => syntheticQloo(), modelFor: () => syntheticModel(), feeds, trends: true });
+    const agent = createAgentRunner({
+      db,
+      qlooFor: () => syntheticQloo(),
+      harnessFor: () => harnessFrom(syntheticQloo()).harness,
+      modelFor: () => syntheticModel(),
+      feeds,
+      trends: true,
+    });
     const client = await connect({ agent });
     const crafted = Buffer.from("http://10.0.0.1/").toString("base64");
 
@@ -849,6 +864,7 @@ describe("which share MCP spends from (D3.1, D3.2)", () => {
     const agent = createAgentRunner({
       db,
       qlooFor: (surface) => syntheticQloo(surface, surfaces),
+      harnessFor: (surface) => harnessFrom(syntheticQloo(surface, surfaces)).harness,
       modelFor: (surface) => syntheticModel(surface, surfaces),
       feeds: { searchShows: async () => [directoryShow(1)], lookupShow: async () => null, safeFetch: async () => ({ body: RSS }), parseFeed },
       trends: true,

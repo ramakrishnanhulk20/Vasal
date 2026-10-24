@@ -293,7 +293,9 @@ export async function reserveQlooCall(
  * database, and waits for the next second otherwise. The stored per-second
  * cap is not changed, so other callers keep the full QLOO_PER_SECOND_CAP.
  * Time is measured as the larger of clock time and time slept, so the loop
- * ends even if an injected clock never moves. Throws
+ * ends even if an injected clock never moves. Once `signal` has fired it
+ * returns false with no further try, and the wait in progress ends at once;
+ * a reservation already under way when it fires still completes. Throws
  * StoreError("STORE_BAD_INPUT") for a maxWaitMs outside 0 to 60000, a bad
  * dayKey or bad extraKeys, or a perSecondCap that is not a whole number from
  * 1 to QLOO_PER_SECOND_CAP, before any bucket is touched, and
@@ -303,11 +305,12 @@ export async function waitForQlooSlot(
   db: Db,
   opts: {
     maxWaitMs?: number;
-    sleep?: (ms: number) => Promise<void>;
+    sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
     now?: () => Date;
     dayKey?: string;
     extraKeys?: string[];
     perSecondCap?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<boolean> {
   const maxWaitMs = opts.maxWaitMs ?? 3_000;
@@ -315,12 +318,17 @@ export async function waitForQlooSlot(
   const dayKey = checkDayKey(opts.dayKey);
   const extraKeys = checkExtraKeys(opts.extraKeys, dayKey);
   const perSecondCap = checkPerSecondCap(opts.perSecondCap);
-  const sleep = opts.sleep ?? ((ms: number) => delay(ms));
+  const sleep = opts.sleep ?? ((ms: number, signal?: AbortSignal) => (signal === undefined ? delay(ms) : delay(ms, undefined, { signal })));
   const clock = opts.now ?? (() => new Date());
+  const { signal } = opts;
+  // Checked before every try and not only in the sleep, so an injected sleep
+  // that ignores the signal still takes no slot once it has fired.
+  const fired = () => signal?.aborted === true;
 
   const startedAt = checkInstant(clock()).getTime();
   let slept = 0;
   for (;;) {
+    if (fired()) return false;
     const now = checkInstant(clock());
     const outcome = await tryQlooCall(db, now, dayKey, extraKeys, perSecondCap);
     if (outcome.ok) return true;
@@ -329,7 +337,12 @@ export async function waitForQlooSlot(
     const pause = 1_000 - (((now.getTime() % 1_000) + 1_000) % 1_000);
     const waited = Math.max(now.getTime() - startedAt, slept);
     if (waited + pause > maxWaitMs) return false;
-    await sleep(pause);
+    try {
+      await sleep(pause, signal);
+    } catch (error) {
+      if (fired()) return false;
+      throw error;
+    }
     slept += pause;
   }
 }

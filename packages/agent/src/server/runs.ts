@@ -1007,6 +1007,84 @@ export function publicBoardGuest(row: unknown): PublicBoardGuest | null {
   };
 }
 
+/** What the run page shows for the "Without Qloo" flip, and nothing else (D5.5). */
+export type PublicWithoutQloo =
+  | {
+      status: "done";
+      guesses: Array<{ name: string; fit: number | null; fitKnown: boolean; reach: string; pastGuest: boolean; onBoard: boolean }>;
+      unresolved: number;
+    }
+  | { status: "unavailable" };
+
+const MAX_FLIP_GUESSES = 8;
+
+// The shape the agent runner writes (agent/without-qloo.ts), read back under
+// the board's name limit. A field outside it fails the whole event.
+const withoutQlooGuest = z
+  .strictObject({
+    name: z.string().min(1).max(200),
+    fit: z.number().nullable(),
+    fitKnown: z.boolean(),
+    reach: z.enum(["household name", "well known", "bookable", "unknown"]),
+    pastGuest: z.boolean(),
+    onBoard: z.boolean(),
+  })
+  .refine((guess) => guess.fitKnown === (guess.fit !== null));
+const withoutQlooEvent = z.discriminatedUnion("status", [
+  z.strictObject({
+    status: z.literal("done"),
+    guesses: z.array(withoutQlooGuest).max(MAX_FLIP_GUESSES),
+    unresolved: z.number().int().min(0).max(MAX_FLIP_GUESSES),
+  }),
+  z.strictObject({ status: z.literal("unavailable") }),
+]);
+
+/**
+ * The public view of one "without_qloo" event's data: the flip's status and,
+ * when done, each guess's name, fit, fitKnown, reach, pastGuest and onBoard
+ * plus the unresolved count, picked by name. The data must match the shape
+ * the runner writes exactly: a field it never writes (a Qloo id, model text),
+ * a fit that disagrees with fitKnown, more than 8 guesses or any other
+ * difference gives null, so nothing extra is ever passed on (C6.5, D5.5).
+ * Pure; never throws.
+ */
+export function publicWithoutQloo(data: unknown): PublicWithoutQloo | null {
+  const parsed = withoutQlooEvent.safeParse(data);
+  if (!parsed.success) return null;
+  if (parsed.data.status === "unavailable") return { status: "unavailable" };
+  return {
+    status: "done",
+    guesses: parsed.data.guesses.map((guess) => ({
+      name: guess.name,
+      fit: guess.fit,
+      fitKnown: guess.fitKnown,
+      reach: guess.reach,
+      pastGuest: guess.pastGuest,
+      onBoard: guess.onBoard,
+    })),
+    unresolved: parsed.data.unresolved,
+  };
+}
+
+/**
+ * Reads a run's latest "without_qloo" event through publicWithoutQloo. Only
+ * the latest counts, so a newer event that fails the schema gives null rather
+ * than an older one. Returns null, without querying, for anything that is not
+ * a lower-case UUID, and null when the run has no such event or its stored
+ * text is over 16,384 characters or not JSON. Throws
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getWithoutQloo(db: Db, runId: string): Promise<PublicWithoutQloo | null> {
+  if (!isId(runId)) return null;
+  const data = await readData(
+    db,
+    "SELECT data::text AS data FROM run_events WHERE run_id = $1::uuid AND event = $2 ORDER BY seq DESC LIMIT 1",
+    [runId, "without_qloo"],
+    MAX_EVENT_JSON,
+  );
+  return data === null ? null : publicWithoutQloo(data);
+}
+
 /**
  * What the home page shows for one run: its show name and its first 3 board
  * guests. `board` is the run's board from rank 1 down (at least its first 3

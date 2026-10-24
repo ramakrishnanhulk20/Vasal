@@ -56,6 +56,7 @@ describe("formatSseFrame", () => {
     for (const event of RUN_EVENTS) {
       expect(formatSseFrame(event, 1, {})).toContain(`event: ${event}\n`);
     }
+    expect(RUN_EVENTS).toContain("without_qloo");
   });
 
   it("refuses an id that is not a non-negative safe integer", () => {

@@ -28,6 +28,7 @@ import {
   getBriefClaim,
   getCandidate,
   getRun,
+  getWithoutQloo,
   listBoard,
   listCandidates,
   listEventsAfter,
@@ -192,7 +193,9 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * no Qloo entity id or internal number reaches the page and a row that fails
  * the runner's schema is left out (D5.5, C6.5). It, and each showcase run,
  * carry a kolam drawn from those rows' numbers and guest ids only
- * (kolam/kolam.ts, C3.9), or null.
+ * (kolam/kolam.ts, C3.9), or null. A done run's page also carries
+ * withoutQloo, its latest "without_qloo" event as getWithoutQloo reads it
+ * (Qloo names, numbers and flags only), or null.
  * Confirm and brief act only on website runs, and give an MCP run the same
  * 404 NOT_FOUND as an unknown one before any claim, cap or agent call
  * (D4.1). They act only on ids the server issued for that run (C6.2). A
@@ -526,10 +529,15 @@ export function createApp(deps: AppDeps): Hono {
   app.get("/runs/:id", async (c) => {
     const run = await getRun(db, c.req.param("id"));
     if (run === null) return refuse(c, 404, "NOT_FOUND");
-    const [candidates, stored] = await Promise.all([listCandidates(db, run.id), listBoard(db, run.id)]);
-    // Only a finished run shows its board, so a run that stopped early is
-    // never shown with partial results (C6.4).
-    const board = run.status === "done" ? publicBoard(stored) : [];
+    const done = run.status === "done";
+    const [candidates, stored, withoutQloo] = await Promise.all([
+      listCandidates(db, run.id),
+      listBoard(db, run.id),
+      done ? getWithoutQloo(db, run.id) : null,
+    ]);
+    // Only a finished run shows its board and its flip, so a run that stopped
+    // early is never shown with partial results (C6.4).
+    const board = done ? publicBoard(stored) : [];
     return c.json({
       id: run.id,
       status: run.status,
@@ -538,7 +546,8 @@ export function createApp(deps: AppDeps): Hono {
       errorCode: run.errorCode,
       candidates: publicCandidates(candidates),
       board,
-      kolam: run.status === "done" ? boardKolam(run.id, board) : null,
+      kolam: done ? boardKolam(run.id, board) : null,
+      withoutQloo,
     });
   });
 

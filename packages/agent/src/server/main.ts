@@ -11,7 +11,7 @@ import { resetTokenInflight } from "../mcp/usage.js";
 import { safeFetch } from "../net/safe-fetch.js";
 import { loadPolicy, profileFor } from "../ops/policy.js";
 import { createQlooClient } from "../qloo/client.js";
-import { createMeteredQloo, type MeteredQloo } from "../qloo/metered.js";
+import { createMeteredQloo } from "../qloo/metered.js";
 import { createPgDb, createPgliteDb, type Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { setFlag } from "../store/flags.js";
@@ -114,14 +114,17 @@ function createAgent(db: Db, config: ServerConfig, qloo: QlooConfig): AgentPort 
   // No retries inside the client, so every Qloo attempt takes its own slot
   // from the shared meter (C5.1, C5.2).
   const client = createQlooClient({ apiKey: qloo.apiKey, baseUrl: qloo.baseUrl, maxRetries: 0 });
-  const meteredFor = (surface: RunSurface): MeteredQloo =>
-    createMeteredQloo({ client, db, baseUrl: qloo.baseUrl, waitForSlot: (target) => waitForSurfaceQlooSlot(target, surface) });
+  const meteredFor = (surface: RunSurface) =>
+    createMeteredQloo({ client, db, baseUrl: qloo.baseUrl, waitForSlot: (target, signal) => waitForSurfaceQlooSlot(target, surface, signal) });
   const models: Record<RunSurface, ModelClient> = { web: modelFor("web"), mcp: modelFor("mcp") };
-  const qloos: Record<RunSurface, MeteredQloo> = { web: meteredFor("web"), mcp: meteredFor("mcp") };
+  const qloos = { web: meteredFor("web"), mcp: meteredFor("mcp") };
   console.log(`The agent is on and uses ${config.model}.`);
   return createAgentRunner({
     db,
     qlooFor: (surface) => qloos[surface],
+    // The harness behind find_person spends through the same surface's meter
+    // and cache as every other Qloo call of that run.
+    harnessFor: (surface) => qloos[surface],
     modelFor: (surface) => models[surface],
     feeds: { searchShows, lookupShow, safeFetch, parseFeed },
     trends: config.trends,

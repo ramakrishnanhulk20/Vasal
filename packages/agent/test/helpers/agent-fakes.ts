@@ -10,9 +10,10 @@ import type { ModelClient } from "../../src/agent/model.js";
 import type { AgentFeeds } from "../../src/agent/runner.js";
 import type { ShowCandidate } from "../../src/feeds/lookup.js";
 import { parseFeed } from "../../src/feeds/rss.js";
+import type { RawQlooRequest } from "../../src/qloo/client.js";
 import type { QlooError } from "../../src/qloo/errors.js";
-import type { MeteredQloo } from "../../src/qloo/metered.js";
-import type { QlooOperation } from "../../src/qloo/request.js";
+import type { MeteredQloo, MeteredRawQloo } from "../../src/qloo/metered.js";
+import type { EntityType, QlooOperation } from "../../src/qloo/request.js";
 import { claimRunStatus, listCandidates } from "../../src/server/runs.js";
 import type { Db } from "../../src/store/db.js";
 
@@ -123,9 +124,46 @@ export function fakeModel(briefDraft?: unknown) {
   return { model, turns };
 }
 
+// find_person reaches Qloo through the harness, which asks the metered raw
+// path for /search and then, for a name it can pick, /entities. Both are
+// answered from a fake metered Qloo's own search answers, so one fake scripts
+// every tool and its ops list records the search the harness made. The real
+// path is covered in qloo-harness-adapter.test.ts.
+export function harnessFrom(qloo: MeteredQloo) {
+  const requests: RawQlooRequest[] = [];
+  const seen = new Map<string, unknown>();
+  const harness: MeteredRawQloo = {
+    async callRaw(request, options) {
+      requests.push(request);
+      const params = new Map(request.params);
+      if (request.path === "/search") {
+        const op: QlooOperation = {
+          op: "search",
+          query: params.get("query") ?? "",
+          types: [params.get("types") as EntityType],
+          take: Number(params.get("take")),
+        };
+        const { data } = await qloo.call<unknown[]>(op, options);
+        for (const entity of data) seen.set((entity as { entity_id: string }).entity_id, entity);
+        return { data: { results: data }, fromCache: false };
+      }
+      if (request.path === "/entities") {
+        const ids = (params.get("entity_ids") ?? "").split(",");
+        return { data: { results: { entities: ids.filter((id) => seen.has(id)).map((id) => seen.get(id)) } }, fromCache: false };
+      }
+      throw new Error(`no fake answer for ${request.path}`);
+    },
+  };
+  return { harness, requests };
+}
+
 // Most tests here are about the run, not its surface, so both surfaces get
 // the same fakes.
-export const sameForBoth = (model: ModelClient, qloo: MeteredQloo) => ({ modelFor: () => model, qlooFor: () => qloo });
+export const sameForBoth = (model: ModelClient, qloo: MeteredQloo) => ({
+  modelFor: () => model,
+  qlooFor: () => qloo,
+  harnessFor: () => harnessFrom(qloo).harness,
+});
 
 // Records which transaction each statement ran in, so a test can show two
 // writes were committed together.

@@ -585,6 +585,7 @@ describe("GET /runs/:id", () => {
       ],
       board: [],
       kolam: null,
+      withoutQloo: null,
     });
     expect(JSON.stringify(await (await app.request(`/runs/${runId}`)).json())).not.toContain("feeds.example");
 
@@ -665,6 +666,50 @@ describe("GET /runs/:id", () => {
     for (const absent of ["MARKER-k1", "MARKER-k2", "late-night radio", guestIds[2]!, guestIds[3]!]) {
       expect(drawing).not.toContain(absent);
     }
+  });
+
+  it("includes a done run's latest Without Qloo flip with only its allowlisted fields, and null for anything else (C6.5, D5.5)", async () => {
+    const { app } = build();
+    const flip = {
+      status: "done",
+      guesses: [
+        { name: "Synthetic Guess 1", fit: 0.42, fitKnown: true, reach: "well known", pastGuest: true, onBoard: false },
+        { name: "Synthetic Guess 2", fit: null, fitKnown: false, reach: "unknown", pastGuest: false, onBoard: true },
+      ],
+      unresolved: 3,
+    };
+    const { runId } = await runWithBoard([storedGuest(1, [])]);
+    const flipOf = async (id: string) => ((await (await app.request(`/runs/${id}`)).json()) as { withoutQloo: unknown }).withoutQloo;
+
+    expect(await flipOf(runId)).toBeNull();
+    await appendEvent(db, runId, "without_qloo", { status: "unavailable" }, NOW);
+    expect(await flipOf(runId)).toEqual({ status: "unavailable" });
+    await appendEvent(db, runId, "without_qloo", flip, NOW);
+    expect(await flipOf(runId)).toEqual(flip);
+
+    // A later event that is not exactly the runner's shape hides the flip
+    // rather than passing an extra field on.
+    const [first] = flip.guesses;
+    const unfit = [
+      { ...flip, personIds: [MARKER] },
+      { ...flip, guesses: [{ ...first, personId: MARKER }] },
+      { ...flip, guesses: [{ ...first, fit: 0.5, fitKnown: false }] },
+      { ...flip, guesses: [{ ...first, reach: MARKER }] },
+      { status: "done", guesses: flip.guesses },
+      { status: "unavailable", reason: MARKER },
+    ];
+    for (const data of unfit) {
+      await appendEvent(db, runId, "without_qloo", data, NOW);
+      const text = await (await app.request(`/runs/${runId}`)).text();
+      expect((JSON.parse(text) as { withoutQloo: unknown }).withoutQloo, JSON.stringify(data)).toBeNull();
+      expect(text).not.toContain(MARKER);
+    }
+
+    // Like the board, a flip shows only once its run is done (C6.4).
+    const running = await createRun(db, INPUT, NOW);
+    await setRunStatus(db, running, "running", undefined, NOW);
+    await appendEvent(db, running, "without_qloo", flip, NOW);
+    expect(await flipOf(running)).toBeNull();
   });
 
   it("gives 404 for a non-UUID, an unknown id or a re-spelled id, and marks run responses noindex and no-store (C6.1, C3.8)", async () => {

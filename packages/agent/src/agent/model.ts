@@ -83,6 +83,16 @@ function jsonLength(value: unknown): number {
 }
 
 /**
+ * The input tokens a call sending `parts` is counted as: their summed JSON
+ * length divided by CHARS_PER_TOKEN, rounded up. Every reservation uses it,
+ * and so does the research loop's run cap, so the two never disagree.
+ */
+export function estimateInputTokens(parts: readonly unknown[]): number {
+  const sent = parts.reduce<number>((total, part) => total + jsonLength(part), 0);
+  return Math.ceil(sent / CHARS_PER_TOKEN);
+}
+
+/**
  * Builds the one client that talks to Claude. The model name, effort, token
  * limits and prompts are all chosen by server code, never by a visitor
  * (C2.5). `thinking` is left out and tool_choice stays auto. The API key goes
@@ -137,8 +147,7 @@ export function createAnthropicModel(opts: {
 
   const reserve = async (maxTokens: number, parts: unknown[], signal: AbortSignal | undefined): Promise<void> => {
     if (signal?.aborted === true) throw new AgentError("MODEL_TIMEOUT");
-    const sent = parts.reduce<number>((total, part) => total + jsonLength(part), 0);
-    if (!(await opts.reserveTokens(maxTokens + Math.ceil(sent / CHARS_PER_TOKEN)))) throw new AgentError("MODEL_BUDGET");
+    if (!(await opts.reserveTokens(maxTokens + estimateInputTokens(parts)))) throw new AgentError("MODEL_BUDGET");
   };
 
   const send = async (params: Anthropic.MessageCreateParamsNonStreaming, timeoutMs: number, caller: AbortSignal | undefined): Promise<Anthropic.Message> => {

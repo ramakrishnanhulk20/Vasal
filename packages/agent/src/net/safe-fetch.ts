@@ -141,7 +141,10 @@ export async function safeFetch(url: URL, opts: SafeFetchOptions = {}): Promise<
   const addressCheck = opts.addressCheck ?? isPublicUnicast;
   const connectTimeoutMs = opts.connectTimeoutMs ?? 5_000;
   const totalTimeoutMs = opts.totalTimeoutMs ?? 15_000;
-  const maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
+  // The largest feeds are near this: This Week in Startups was 12.4 MB on
+  // 24 Oct, and a 10 MB cap left its past guests unchecked. 32 MB of decoded
+  // text still fits in memory several times over on the server.
+  const maxBytes = opts.maxBytes ?? 32 * 1024 * 1024;
   const maxRedirects = opts.maxRedirects ?? 3;
   const accept = opts.accept ?? DEFAULT_ACCEPT;
 

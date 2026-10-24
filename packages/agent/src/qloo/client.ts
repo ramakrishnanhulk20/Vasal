@@ -1,7 +1,19 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { z } from "zod";
 import { QlooError, type QlooErrorCode } from "./errors.js";
 import { buildQlooRequest, type BuiltRequest, type QlooOperation } from "./request.js";
 import { parseQlooResponse } from "./schemas.js";
+
+/** The Qloo paths a raw request may name, one per method of Qloo's own harness client. */
+export const RAW_QLOO_PATHS = ["/search", "/entities", "/v2/tags", "/v2/insights", "/v2/analysis/compare", "/v2/trending"] as const;
+export type RawQlooPath = (typeof RAW_QLOO_PATHS)[number];
+
+/** One request in the shape Qloo's harness asks for: a fixed path and its query as text pairs. */
+export type RawQlooRequest = { path: RawQlooPath; params: ReadonlyArray<readonly [string, string]> };
+
+/** A raw answer is any JSON object. The harness reads it field by field and checks each one itself. */
+export const RawQlooBody = z.record(z.string(), z.unknown());
+export type RawQlooBody = z.infer<typeof RawQlooBody>;
 
 export type QlooClientOptions = {
   apiKey: string;
@@ -9,8 +21,11 @@ export type QlooClientOptions = {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   maxRetries?: number;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 };
+
+/** Per-call settings any Qloo call path accepts. `signal` ends the call when it fires. */
+export type QlooCallOptions = { signal?: AbortSignal };
 
 export type QlooCallResult<T> = {
   data: T;
@@ -20,7 +35,8 @@ export type QlooCallResult<T> = {
 };
 
 export type QlooClient = {
-  call<T>(op: QlooOperation): Promise<QlooCallResult<T>>;
+  call<T>(op: QlooOperation, options?: QlooCallOptions): Promise<QlooCallResult<T>>;
+  callRaw(request: RawQlooRequest, options?: QlooCallOptions): Promise<QlooCallResult<RawQlooBody>>;
 };
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -38,10 +54,62 @@ const CODE_FOR_STATUS: Partial<Record<number, QlooErrorCode>> = {
 // Qloo's own client stops at 5 MiB. A body past that is refused rather than
 // buffered, so one oversized answer cannot exhaust the agent's memory (C1.4 in spirit).
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
+// A raw answer is cached whole, so it is held to the cache's own body limit
+// rather than failing at the store after the slot is spent.
+const MAX_RAW_BODY_BYTES = 1_000_000;
+
+const RAW_PATHS: ReadonlySet<string> = new Set(RAW_QLOO_PATHS);
+const RAW_KEY = /^[a-z][a-z0-9_.]{0,63}$/;
+const MAX_RAW_PARAMS = 20;
+// Keeps the cache key, which holds the encoded query, inside the cache's
+// 4,096-character key limit.
+const MAX_RAW_QUERY_CHARS = 3_000;
+// The same test request.ts applies: URLSearchParams would turn a lone
+// surrogate into U+FFFD, so the text sent would differ from the text checked.
+const LONE_SURROGATE = /[\uD800-\uDFFF]/u;
 
 const isRetryableStatus = (status: number) => status === 429 || (status >= 500 && status <= 599);
 
-async function readBodyCapped(response: Response): Promise<string> {
+/**
+ * Builds the one GET request for a raw harness request. The client sends
+ * exactly this request and the cache keys on exactly this `cacheKey`, so the
+ * two can never disagree (C7.1). The key starts "RAW GET", a namespace of its
+ * own, so a raw answer never shares an entry with a checked operation's.
+ *
+ * The path must be one of RAW_QLOO_PATHS and only the origin of `baseUrl` is
+ * used. Every key must match /^[a-z][a-z0-9_.]{0,63}$/ and appear once, every
+ * value must be non-empty text with no lone surrogate, there may be at most
+ * 20 pairs, and the encoded query at most 3,000 characters. Pairs are sorted
+ * by key and each value enters the query through URLSearchParams as one
+ * encoded parameter (C2.3).
+ *
+ * Throws QlooError("QLOO_BAD_INPUT") for anything outside those rules.
+ */
+export function buildRawQlooRequest(baseUrl: URL, raw: RawQlooRequest): BuiltRequest {
+  const bad = () => new QlooError("QLOO_BAD_INPUT");
+  if (!RAW_PATHS.has(raw.path) || !Array.isArray(raw.params) || raw.params.length > MAX_RAW_PARAMS) throw bad();
+  const seen = new Set<string>();
+  const params: Array<[string, string]> = [];
+  for (const pair of raw.params) {
+    if (!Array.isArray(pair) || pair.length !== 2) throw bad();
+    const [key, value] = pair;
+    if (typeof key !== "string" || !RAW_KEY.test(key) || seen.has(key)) throw bad();
+    if (typeof value !== "string" || value === "" || LONE_SURROGATE.test(value)) throw bad();
+    seen.add(key);
+    params.push([key, value]);
+  }
+  // Keys are unique, so ordering by key alone fixes the order. Code-unit
+  // order, so the key never depends on the machine's locale.
+  params.sort(([keyA], [keyB]) => (keyA < keyB ? -1 : 1));
+  const query = new URLSearchParams(params).toString();
+  if (query.length > MAX_RAW_QUERY_CHARS) throw bad();
+
+  const url = new URL(raw.path, baseUrl.origin);
+  url.search = query;
+  return { method: "GET", url, path: raw.path, params, cacheKey: `RAW GET ${url.host}${raw.path}?${query}` };
+}
+
+async function readBodyCapped(response: Response, maxBytes: number): Promise<string> {
   if (response.body === null) return "";
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
@@ -51,7 +119,7 @@ async function readBodyCapped(response: Response): Promise<string> {
     const { done, value } = await reader.read();
     if (done) break;
     received += value.byteLength;
-    if (received > MAX_BODY_BYTES) {
+    if (received > maxBytes) {
       await reader.cancel().catch(() => undefined);
       throw new QlooError("QLOO_UPSTREAM");
     }
@@ -79,6 +147,18 @@ function retryDelayMs(retryAfter: string | null, retryIndex: number): number {
  * and 5xx are retried, at most `maxRetries` times (default 2), waiting
  * Retry-After seconds when given (capped at 10 s), else 500 ms then 1500 ms.
  *
+ * A call's options.signal is combined with each attempt's own timeout, so
+ * whichever fires first cuts the attempt off, body read included. Once the
+ * signal has fired no attempt starts, neither the first nor a retry, and the
+ * wait before a retry ends at once. A call it ends throws QLOO_TIMEOUT.
+ *
+ * callRaw sends the request buildRawQlooRequest builds, under the same
+ * headers, redirect refusal, timeout and signal, and makes exactly one
+ * attempt whatever `maxRetries` says, so one metered slot is one request. Its
+ * body is capped at 1,000,000 bytes and must be a JSON object. A refused
+ * request throws QLOO_BAD_INPUT before anything is sent, and an answer that
+ * is not a JSON object throws QLOO_SCHEMA.
+ *
  * Throws QlooError("QLOO_KEY_MISSING") for an empty key and
  * QlooError("QLOO_BAD_INPUT") for a non-https base URL or bad limits.
  */
@@ -89,59 +169,93 @@ export function createQlooClient(cfg: QlooClientOptions): QlooClient {
   const fetchImpl = cfg.fetchImpl ?? globalThis.fetch;
   const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRetries = cfg.maxRetries ?? DEFAULT_MAX_RETRIES;
-  const sleep = cfg.sleep ?? ((ms: number) => delay(ms));
+  const sleep = cfg.sleep ?? ((ms: number, signal?: AbortSignal) => (signal === undefined ? delay(ms) : delay(ms, undefined, { signal })));
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new QlooError("QLOO_BAD_INPUT");
   if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) throw new QlooError("QLOO_BAD_INPUT");
 
   const headers = { Accept: "application/json", "X-Api-Key": cfg.apiKey };
 
-  // One attempt, including reading the body, under one timeout. Any failure
-  // becomes a fixed code; the underlying error is dropped because undici
-  // errors can quote header values.
-  async function attempt(request: BuiltRequest): Promise<{ response: Response; body: string | undefined }> {
-    const signal = AbortSignal.timeout(timeoutMs);
+  // One attempt, including reading the body, under its own timeout and the
+  // caller's signal. Any failure becomes a fixed code; the underlying error
+  // is dropped because undici errors can quote header values.
+  async function attempt(
+    request: BuiltRequest,
+    caller: AbortSignal | undefined,
+    maxBytes: number,
+  ): Promise<{ response: Response; body: string | undefined }> {
+    const own = AbortSignal.timeout(timeoutMs);
+    const signal = caller === undefined ? own : AbortSignal.any([caller, own]);
     try {
       const response = await fetchImpl(request.url, { method: request.method, headers, redirect: "error", signal });
       if (!response.ok) {
         await response.body?.cancel().catch(() => undefined);
         return { response, body: undefined };
       }
-      return { response, body: await readBodyCapped(response) };
+      return { response, body: await readBodyCapped(response, maxBytes) };
     } catch (err) {
       if (err instanceof QlooError) throw err;
       throw new QlooError(signal.aborted ? "QLOO_TIMEOUT" : "QLOO_UPSTREAM");
     }
   }
 
-  return {
-    async call<T>(op: QlooOperation): Promise<QlooCallResult<T>> {
-      const request = buildQlooRequest(cfg.baseUrl, op);
-      const startedAt = performance.now();
+  async function send<T>(
+    request: BuiltRequest,
+    options: QlooCallOptions,
+    limits: { retries: number; maxBytes: number },
+    parse: (json: unknown) => T,
+  ): Promise<QlooCallResult<T>> {
+    const startedAt = performance.now();
+    const caller = options.signal;
+    const fired = () => caller?.aborted === true;
 
-      for (let retriesUsed = 0; ; retriesUsed += 1) {
-        const { response, body } = await attempt(request);
+    for (let retriesUsed = 0; ; retriesUsed += 1) {
+      // Checked here and not only in fetch, so an injected fetch or sleep
+      // that ignores the signal still sends nothing once it has fired.
+      if (fired()) throw new QlooError("QLOO_TIMEOUT");
+      const { response, body } = await attempt(request, caller, limits.maxBytes);
 
-        if (body !== undefined) {
-          let json: unknown;
-          try {
-            json = JSON.parse(body);
-          } catch {
-            throw new QlooError("QLOO_SCHEMA", response.status);
-          }
-          return {
-            data: parseQlooResponse(op, json) as T,
-            request: { path: request.path, params: request.params.map(([key, value]) => [key, value]) },
-            status: response.status,
-            durationMs: Math.round(performance.now() - startedAt),
-          };
+      if (body !== undefined) {
+        let json: unknown;
+        try {
+          json = JSON.parse(body);
+        } catch {
+          throw new QlooError("QLOO_SCHEMA", response.status);
         }
-
-        if (isRetryableStatus(response.status) && retriesUsed < maxRetries) {
-          await sleep(retryDelayMs(response.headers.get("retry-after"), retriesUsed));
-          continue;
-        }
-        throw new QlooError(CODE_FOR_STATUS[response.status] ?? "QLOO_UPSTREAM", response.status);
+        return {
+          data: parse(json),
+          request: { path: request.path, params: request.params.map(([key, value]) => [key, value]) },
+          status: response.status,
+          durationMs: Math.round(performance.now() - startedAt),
+        };
       }
+
+      if (isRetryableStatus(response.status) && retriesUsed < limits.retries) {
+        try {
+          await sleep(retryDelayMs(response.headers.get("retry-after"), retriesUsed), caller);
+        } catch {
+          throw new QlooError(fired() ? "QLOO_TIMEOUT" : "QLOO_UPSTREAM");
+        }
+        continue;
+      }
+      throw new QlooError(CODE_FOR_STATUS[response.status] ?? "QLOO_UPSTREAM", response.status);
+    }
+  }
+
+  const rawBodyOf = (json: unknown): RawQlooBody => {
+    const checked = RawQlooBody.safeParse(json);
+    if (!checked.success) throw new QlooError("QLOO_SCHEMA");
+    return checked.data;
+  };
+
+  return {
+    async call<T>(op: QlooOperation, options: QlooCallOptions = {}): Promise<QlooCallResult<T>> {
+      const request = buildQlooRequest(cfg.baseUrl, op);
+      return send(request, options, { retries: maxRetries, maxBytes: MAX_BODY_BYTES }, (json) => parseQlooResponse(op, json) as T);
+    },
+
+    async callRaw(raw: RawQlooRequest, options: QlooCallOptions = {}): Promise<QlooCallResult<RawQlooBody>> {
+      const request = buildRawQlooRequest(cfg.baseUrl, raw);
+      return send(request, options, { retries: 0, maxBytes: MAX_RAW_BODY_BYTES }, rawBodyOf);
     },
   };
 }

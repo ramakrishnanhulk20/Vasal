@@ -257,6 +257,30 @@ describe("waitForQlooSlot", () => {
     expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP);
   });
 
+  it("stops waiting and takes no slot once its signal fires, even with an injected wait that ignores it", async () => {
+    await openQlooBuckets(100, 1_000);
+    expect(await waitForQlooSlot(db, { now: () => NOW, signal: AbortSignal.abort() })).toBe(false);
+    expect(await usedOf("qloo:day")).toBe(0);
+    await fillSecond(NOW);
+
+    const ignoring = new AbortController();
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+      ignoring.abort();
+    };
+    expect(await waitForQlooSlot(db, { now: () => NOW, sleep, signal: ignoring.signal })).toBe(false);
+    expect(sleeps).toEqual([900]);
+
+    // The default wait ends when the signal fires, not after its 900 ms.
+    const cut = new AbortController();
+    setTimeout(() => cut.abort(), 20);
+    const started = Date.now();
+    expect(await waitForQlooSlot(db, { now: () => NOW, signal: cut.signal })).toBe(false);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(await usedOf("qloo:day")).toBe(QLOO_PER_SECOND_CAP);
+  });
+
   it("holds a caller to its perSecondCap of 2: the third call in a second waits into the next one", async () => {
     await openQlooBuckets(100, 1_000);
     const time = fakeTime(NOW);

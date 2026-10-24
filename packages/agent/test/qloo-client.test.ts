@@ -139,6 +139,54 @@ describe("createQlooClient", () => {
     expect(broken.calls).toHaveBeenCalledTimes(1);
   });
 
+  it("cuts off an attempt in flight when the caller's signal fires, with QLOO_TIMEOUT and no retry", async () => {
+    const sent: AbortSignal[] = [];
+    const hanging = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          if (init?.signal) sent.push(init.signal);
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    );
+    const client = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl: hanging as unknown as typeof fetch, timeoutMs: 2_000, sleep: async () => undefined });
+    const deadline = new AbortController();
+    setTimeout(() => deadline.abort(), 20);
+    const started = Date.now();
+
+    const error = await failureOf(client.call(SEARCH, { signal: deadline.signal }));
+
+    expect(error.code).toBe("QLOO_TIMEOUT");
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(hanging).toHaveBeenCalledTimes(1);
+    expect(sent[0]?.aborted).toBe(true);
+  });
+
+  it("starts no attempt once the caller's signal has fired: not the first, and not a retry after a 429", async () => {
+    const ready = scriptedFetch([() => json(200, { results: [] })]);
+    const early = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl: ready.fetchImpl });
+    expect((await failureOf(early.call(SEARCH, { signal: AbortSignal.abort() }))).code).toBe("QLOO_TIMEOUT");
+    expect(ready.calls).not.toHaveBeenCalled();
+
+    // An injected wait that ignores the signal still gets no second attempt.
+    const limited = scriptedFetch([() => json(429, {}, { "retry-after": "1" }), () => json(200, { results: [] })]);
+    const deadline = new AbortController();
+    const sleep = vi.fn(async (_ms: number) => deadline.abort());
+    const waiting = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl: limited.fetchImpl, sleep });
+    expect((await failureOf(waiting.call(SEARCH, { signal: deadline.signal }))).code).toBe("QLOO_TIMEOUT");
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(limited.calls).toHaveBeenCalledTimes(1);
+
+    // The default wait ends when the signal fires, not after the Retry-After second.
+    const slow = scriptedFetch([() => json(429, {}, { "retry-after": "1" }), () => json(200, { results: [] })]);
+    const cut = new AbortController();
+    setTimeout(() => cut.abort(), 20);
+    const started = Date.now();
+    const real = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl: slow.fetchImpl });
+    expect((await failureOf(real.call(SEARCH, { signal: cut.signal }))).code).toBe("QLOO_TIMEOUT");
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(slow.calls).toHaveBeenCalledTimes(1);
+  });
+
   it("sends GET with X-Api-Key as the only auth, refuses redirects, and never exposes the key (C4.1, C4.3)", async () => {
     const { fetchImpl, captured } = scriptedFetch([() => json(200, { results: { entities: [synthEntity(1)] } })]);
     const client = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl });

@@ -1,26 +1,34 @@
 import { z } from "zod";
+import { DEFAULT_LIMITS } from "../agent/loop.js";
 import { createAnthropicModel, type ModelClient } from "../agent/model.js";
 import { resolveShow } from "../agent/resolve.js";
-import { createAgentRunner, type AgentFeeds } from "../agent/runner.js";
+import { createAgentRunner, FEED_TIMEOUT_MS, fetchShowFeed, runContextFor, type AgentFeeds } from "../agent/runner.js";
+import { guessWithoutQloo, publisherForPrompt, WITHOUT_QLOO_UNAVAILABLE, type WithoutQlooEvent } from "../agent/without-qloo.js";
 import { lookupShow, searchShows } from "../feeds/lookup.js";
 import { parseFeed } from "../feeds/rss.js";
 import { safeFetch } from "../net/safe-fetch.js";
 import { createQlooClient } from "../qloo/client.js";
-import { createMeteredQloo, type MeteredQloo } from "../qloo/metered.js";
+import { createMeteredQloo, type MeteredQloo, type MeteredRawQloo } from "../qloo/metered.js";
 import type { AgentPort } from "../server/agent-port.js";
 import {
+  appendEvent,
   claimBrief,
   claimRunStatus,
   createRun,
   finishRun,
   getRun,
+  getWithoutQloo,
+  listBoard,
   listCandidates,
   listEventsAfter,
+  parseBoardGuest,
   type RunInput,
   type RunRecord,
+  type StoredBoardGuest,
 } from "../server/runs.js";
 import type { Db } from "../store/db.js";
 import { reserve, waitForQlooSlot } from "../store/meter.js";
+import { cleanText } from "../text/normalize.js";
 import { isWritable, readBriefs, type RunBriefs } from "./promote.js";
 
 /** The Qloo day share the seed spends from. Every call also counts against qloo:month and the per-second limit (C5.1). */
@@ -40,8 +48,18 @@ export const SEED_PREVIEW_FAILED = "SEED_PREVIEW_FAILED";
  * after sanitising (C3.6).
  */
 export type SeedCandidate = { rank: number; name: string; publisher: string; qlooName: string };
-/** What the seed needs from the agent: the show lookup on its own, and the real runner. */
-export type SeedAgent = { preview(show: string): Promise<SeedCandidate[]>; runner: AgentPort };
+/**
+ * What the seed needs from the agent: the show lookup on its own, the real
+ * runner, and the model, Qloo client and feeds the runner was built from,
+ * which the guesses backfill spends through.
+ */
+export type SeedAgent = {
+  preview(show: string): Promise<SeedCandidate[]>;
+  runner: AgentPort;
+  model: ModelClient;
+  qloo: MeteredQloo;
+  feeds: AgentFeeds;
+};
 /**
  * How seedShow ended. A failed outcome carries only a fixed upper-case code,
  * never error text (C3.6). A done outcome's pastGuests is read from the run's
@@ -131,11 +149,12 @@ async function closeFailed(db: Db, runId: string, code: string): Promise<SeedOut
  * 1,000,000 and StoreError("STORE_UNAVAILABLE") if the database fails.
  */
 export function seedMeterHooks(db: Db): {
-  waitForQlooSlot: (target: Db) => Promise<boolean>;
+  waitForQlooSlot: (target: Db, signal?: AbortSignal) => Promise<boolean>;
   reserveModelTokens: (amount: number) => Promise<boolean>;
 } {
   return {
-    waitForQlooSlot: (target) => waitForQlooSlot(target, { dayKey: SEED_QLOO_DAY }),
+    // The signal is the run's deadline, so a seed run never waits for a slot past it (C2.4).
+    waitForQlooSlot: (target, signal) => waitForQlooSlot(target, { dayKey: SEED_QLOO_DAY, ...(signal === undefined ? {} : { signal }) }),
     reserveModelTokens: (amount) => reserve(db, [{ key: SEED_MODEL_DAY, amount }]),
   };
 }
@@ -143,13 +162,15 @@ export function seedMeterHooks(db: Db): {
 /**
  * Builds the seed's agent from given parts, so a test can pass fakes and
  * createSeedAgent the real ones. runner is the real agent runner
- * (createAgentRunner) with `deps.qloo` and `deps.model` for every surface,
+ * (createAgentRunner) with `deps.qloo`, `deps.harness` (the metered raw path
+ * find_person's harness spends through) and `deps.model` for every surface,
  * so whatever surface a run records, it spends only through the meter those
  * parts were built with; from createSeedAgent that is qloo:day:offline,
  * qloo:month and anthropic:day:offline. preview(show) runs only the show
  * lookup startRun runs (resolveShow, with no exclusions), which spends one
  * metered Qloo search per directory match, and returns the candidates ranked
- * from 1. preview writes nothing to the runs tables. Neither runs the
+ * from 1. preview writes nothing to the runs tables. model, qloo and feeds
+ * are `deps.model`, `deps.qloo` and `deps.feeds` themselves. Neither runs the
  * server's start-up sweep, touches an in-flight counter or promotes a run.
  * Building throws nothing. preview rejects with what resolveShow throws:
  * AgentError SHOW_NOT_FOUND, SHOW_NO_QLOO_MATCH or FEED_UNAVAILABLE, a
@@ -158,15 +179,25 @@ export function seedMeterHooks(db: Db): {
  */
 export function seedAgentFrom(
   db: Db,
-  deps: { qloo: MeteredQloo; model: ModelClient; feeds: AgentFeeds; trends: boolean },
+  deps: { qloo: MeteredQloo; harness: MeteredRawQloo; model: ModelClient; feeds: AgentFeeds; trends: boolean },
 ): SeedAgent {
-  const runner = createAgentRunner({ db, qlooFor: () => deps.qloo, modelFor: () => deps.model, feeds: deps.feeds, trends: deps.trends });
+  const runner = createAgentRunner({
+    db,
+    qlooFor: () => deps.qloo,
+    harnessFor: () => deps.harness,
+    modelFor: () => deps.model,
+    feeds: deps.feeds,
+    trends: deps.trends,
+  });
   return {
     async preview(show) {
       const shows = await resolveShow({ show, exclude: [] }, { ...deps.feeds, qloo: deps.qloo });
       return shows.map((found, index) => ({ rank: index + 1, name: found.name, publisher: found.publisher, qlooName: found.qlooName }));
     },
     runner,
+    model: deps.model,
+    qloo: deps.qloo,
+    feeds: deps.feeds,
   };
 }
 
@@ -175,11 +206,11 @@ export function seedAgentFrom(
  * (createMeteredQloo) over a client with no retries, the Anthropic model,
  * and the directory lookup, feed fetcher and feed parser main.ts gives the
  * server, so a seed run is researched exactly as a visitor's is (C9.2). The
- * meter is seedMeterHooks, so every Qloo call charges qloo:day:offline and
- * qloo:month, every model call anthropic:day:offline, and nothing else
- * (C5.1). It never runs the server's start-up sweep, touches an in-flight
- * counter or promotes a run, and it makes no network call until preview or
- * the runner is used. Throws QlooError QLOO_KEY_MISSING for a blank Qloo key
+ * meter is seedMeterHooks, so every Qloo call, find_person's harness
+ * requests included, charges qloo:day:offline and qloo:month, every model
+ * call anthropic:day:offline, and nothing else (C5.1). It never runs the
+ * server's start-up sweep, touches an in-flight counter or promotes a run,
+ * and it makes no network call until preview or the runner is used. Throws QlooError QLOO_KEY_MISSING for a blank Qloo key
  * and QLOO_BAD_INPUT for a base URL that is not https, and AgentError
  * MODEL_KEY_MISSING for a blank Anthropic key.
  */
@@ -205,7 +236,7 @@ export function createSeedAgent(
     effort: opts.effort,
     reserveTokens: hooks.reserveModelTokens,
   });
-  return seedAgentFrom(db, { qloo, model, feeds: { searchShows, lookupShow, safeFetch, parseFeed }, trends: opts.trends });
+  return seedAgentFrom(db, { qloo, harness: qloo, model, feeds: { searchShows, lookupShow, safeFetch, parseFeed }, trends: opts.trends });
 }
 
 /**
@@ -255,7 +286,8 @@ export async function writeBriefs(db: Db, runner: Pick<AgentPort, "ready" | "wri
  * route does, runs continueRun on that candidate, writes the board's briefs
  * through writeBriefs with the same runner, and returns done with the pick,
  * the board's guest count, the done event's pastGuests (null when absent or
- * unreadable) and the briefs as they then stand; a brief that failed leaves
+ * unreadable) and the briefs as they then stand. continueRun adds the run's
+ * Without Qloo flip as part of the run, on the same meter. A brief that failed leaves
  * the outcome done, and promote refuses the run until it is written. Each
  * outcome is read from the run row and its
  * events, never from what the runner returned or threw. A run that failed in the
@@ -323,4 +355,102 @@ export async function seedShow(db: Db, agent: SeedAgent, show: string, pick: num
   }
   if (isOpen(finished)) return closeFailed(db, runId, SEED_UNEXPECTED_STATUS);
   return { kind: "failed", runId, code: finished?.errorCode ?? SEED_UNEXPECTED_STATUS };
+}
+
+/** Why the guesses backfill left a run alone: not done (or unknown), no readable board, or no one stored show the board was built for. */
+export type GuessesRefusal = "GUESSES_NOT_DONE" | "GUESSES_NO_BOARD" | "GUESSES_NO_SHOW";
+/** What ops guesses would do for a run, read from storage alone. */
+export type GuessesPlan =
+  | { kind: "ready"; runId: string; showName: string; guests: number }
+  | { kind: "has"; runId: string }
+  | { kind: "refused"; runId: string; code: GuessesRefusal };
+/** What ops guesses --yes did for a run. A flip that came back unavailable is still stored. */
+export type GuessesOutcome = Exclude<GuessesPlan, { kind: "ready" }> | { kind: "added"; runId: string; flip: WithoutQlooEvent };
+
+type GuessInputs =
+  | Exclude<GuessesPlan, { kind: "ready" }>
+  | { kind: "ready"; run: RunRecord; show: z.output<typeof CandidateRow>; showName: string; board: StoredBoardGuest[] };
+
+// The runner writes this on every board row as cleanText(qlooName, 200)
+// trimmed, so the same cleaner on each candidate finds the show it researched.
+const MAX_SHOW_NAME_CHARS = 200;
+
+async function guessInputs(db: Db, runId: string): Promise<GuessInputs> {
+  const run = await getRun(db, runId);
+  if (run === null || run.status !== "done") return { kind: "refused", runId, code: "GUESSES_NOT_DONE" };
+  // An unavailable flip is no flip, so the command may try again.
+  if ((await getWithoutQloo(db, run.id))?.status === "done") return { kind: "has", runId };
+  // listBoard hands back parsed JSON, and parseBoardGuest reads stored text,
+  // so each row goes back to text to pass the schema the runner and the home
+  // page read it with. One row that fails refuses the whole run (C6.5).
+  const board = (await listBoard(db, run.id)).map((row) => parseBoardGuest(JSON.stringify(row.data)));
+  const guests = board.filter((guest): guest is StoredBoardGuest => guest !== null);
+  const [first] = guests;
+  if (first === undefined || guests.length !== board.length) return { kind: "refused", runId, code: "GUESSES_NO_BOARD" };
+  const { showName } = first;
+  if (guests.some((guest) => guest.showName !== showName)) return { kind: "refused", runId, code: "GUESSES_NO_SHOW" };
+  const shows = (await listCandidates(db, run.id))
+    .map((row) => CandidateRow.safeParse(row.data))
+    .flatMap((parsed) => (parsed.success ? [parsed.data] : []))
+    .filter((candidate) => cleanText(candidate.qlooName, { maxChars: MAX_SHOW_NAME_CHARS }).trim() === showName);
+  const [show, ...others] = shows;
+  if (show === undefined || others.length > 0) return { kind: "refused", runId, code: "GUESSES_NO_SHOW" };
+  return { kind: "ready", run, show, showName, board: guests };
+}
+
+/**
+ * What ops guesses would do for a run, from storage alone, with no agent, so
+ * it can spend nothing. "ready" with the board's show name and guest count
+ * for a done run that has no done flip yet; "has" when its latest
+ * "without_qloo" event is a done flip; "refused" with GUESSES_NOT_DONE for a
+ * run that is unknown or not done, GUESSES_NO_BOARD when it has no board or a
+ * board row fails the runner's schema, and GUESSES_NO_SHOW unless exactly one
+ * readable stored candidate's Qloo name, cleaned the way the runner cleans
+ * it, is the board's show name. Throws ServerError("SRV_UNAVAILABLE") if the
+ * database fails.
+ */
+export async function planGuesses(db: Db, runId: string): Promise<GuessesPlan> {
+  const inputs = await guessInputs(db, runId);
+  if (inputs.kind !== "ready") return inputs;
+  return { kind: "ready", runId, showName: inputs.showName, guests: inputs.board.length };
+}
+
+/**
+ * Operator use, on the owner connection: adds the Without Qloo flip to a done
+ * run that has none, such as a showcase run made before the flip existed.
+ * Checks the run as planGuesses does and returns "has" or "refused" with no
+ * call made. Otherwise it rebuilds the run's context the way continueRun
+ * builds it (runContextFor): the stored show, its feed read once through
+ * fetchShowFeed (15 s; a feed that cannot be read leaves past guests
+ * unchecked) and the run's own exclusions, with the board from run_board.
+ * It runs guessWithoutQloo with `agent`'s model and Qloo client, the
+ * publisher only for a directory show, under a 120 second deadline, and
+ * appends the result as a "without_qloo" event, or { status: "unavailable" }
+ * on any error or once the deadline has passed. Spending is at most 1 model
+ * call, 8 Qloo searches and 1 insights call through `agent`; from
+ * createSeedAgent that is qloo:day:offline, qloo:month and
+ * anthropic:day:offline. Throws ServerError from the run store and whatever
+ * fetchShowFeed rethrows.
+ */
+export async function addGuesses(db: Db, agent: Pick<SeedAgent, "model" | "qloo" | "feeds">, runId: string): Promise<GuessesOutcome> {
+  const inputs = await guessInputs(db, runId);
+  if (inputs.kind !== "ready") return inputs;
+  const { run, show, board } = inputs;
+  const deadline = AbortSignal.timeout(DEFAULT_LIMITS.maxWallMs);
+  const url = show.feedUrl === null ? null : URL.parse(show.feedUrl);
+  const feed = url === null ? null : await fetchShowFeed(agent.feeds, url, show.feedHandleSource, FEED_TIMEOUT_MS);
+  const ctx = runContextFor(show, feed, run.input.exclude);
+  const flip: WithoutQlooEvent = await guessWithoutQloo({
+    model: agent.model,
+    qloo: agent.qloo,
+    ctx,
+    board,
+    publisher: publisherForPrompt(show),
+    signal: deadline,
+  }).then(
+    (done) => (deadline.aborted ? WITHOUT_QLOO_UNAVAILABLE : done),
+    () => WITHOUT_QLOO_UNAVAILABLE,
+  );
+  await appendEvent(db, run.id, "without_qloo", flip);
+  return { kind: "added", runId, flip };
 }
