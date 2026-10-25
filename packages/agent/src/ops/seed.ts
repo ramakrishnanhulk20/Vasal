@@ -375,7 +375,7 @@ type GuessInputs =
 // trimmed, so the same cleaner on each candidate finds the show it researched.
 const MAX_SHOW_NAME_CHARS = 200;
 
-async function guessInputs(db: Db, runId: string): Promise<GuessInputs> {
+async function guessInputs(db: Db, runId: string, pick?: number): Promise<GuessInputs> {
   const run = await getRun(db, runId);
   if (run === null || run.status !== "done") return { kind: "refused", runId, code: "GUESSES_NOT_DONE" };
   // An unavailable flip is no flip, so the command may try again.
@@ -389,10 +389,15 @@ async function guessInputs(db: Db, runId: string): Promise<GuessInputs> {
   if (first === undefined || guests.length !== board.length) return { kind: "refused", runId, code: "GUESSES_NO_BOARD" };
   const { showName } = first;
   if (guests.some((guest) => guest.showName !== showName)) return { kind: "refused", runId, code: "GUESSES_NO_SHOW" };
-  const shows = (await listCandidates(db, run.id))
-    .map((row) => CandidateRow.safeParse(row.data))
-    .flatMap((parsed) => (parsed.success ? [parsed.data] : []))
-    .filter((candidate) => cleanText(candidate.qlooName, { maxChars: MAX_SHOW_NAME_CHARS }).trim() === showName);
+  // listCandidates keeps rank order, so a pick of N is the Nth row. A run does
+  // not record which candidate it continued with, so when several share the
+  // board's Qloo show the operator names the rank the seed used (its output
+  // says "from candidate N"), and that row must still be the board's show.
+  const ranked = (await listCandidates(db, run.id)).map((row) => {
+    const parsed = CandidateRow.safeParse(row.data);
+    return parsed.success && cleanText(parsed.data.qlooName, { maxChars: MAX_SHOW_NAME_CHARS }).trim() === showName ? parsed.data : null;
+  });
+  const shows = pick === undefined ? ranked.filter((candidate) => candidate !== null) : [ranked[pick - 1] ?? null].filter((candidate) => candidate !== null);
   const [show, ...others] = shows;
   if (show === undefined || others.length > 0) return { kind: "refused", runId, code: "GUESSES_NO_SHOW" };
   return { kind: "ready", run, show, showName, board: guests };
@@ -409,8 +414,8 @@ async function guessInputs(db: Db, runId: string): Promise<GuessInputs> {
  * it, is the board's show name. Throws ServerError("SRV_UNAVAILABLE") if the
  * database fails.
  */
-export async function planGuesses(db: Db, runId: string): Promise<GuessesPlan> {
-  const inputs = await guessInputs(db, runId);
+export async function planGuesses(db: Db, runId: string, pick?: number): Promise<GuessesPlan> {
+  const inputs = await guessInputs(db, runId, pick);
   if (inputs.kind !== "ready") return inputs;
   return { kind: "ready", runId, showName: inputs.showName, guests: inputs.board.length };
 }
@@ -432,8 +437,8 @@ export async function planGuesses(db: Db, runId: string): Promise<GuessesPlan> {
  * anthropic:day:offline. Throws ServerError from the run store and whatever
  * fetchShowFeed rethrows.
  */
-export async function addGuesses(db: Db, agent: Pick<SeedAgent, "model" | "qloo" | "feeds">, runId: string): Promise<GuessesOutcome> {
-  const inputs = await guessInputs(db, runId);
+export async function addGuesses(db: Db, agent: Pick<SeedAgent, "model" | "qloo" | "feeds">, runId: string, pick?: number): Promise<GuessesOutcome> {
+  const inputs = await guessInputs(db, runId, pick);
   if (inputs.kind !== "ready") return inputs;
   const { run, show, board } = inputs;
   const deadline = AbortSignal.timeout(DEFAULT_LIMITS.maxWallMs);

@@ -92,7 +92,7 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   briefs <runId> [--yes]  list the board guests of a done run that lack a brief; with --yes,
                           write them with the real agent and print every brief in full. It
                           spends only anthropic:day:offline
-  guesses <runId> [--yes] say whether a done run lacks its Without Qloo flip; with --yes, ask the
+  guesses <runId> [--pick N] [--yes] say whether a done run lacks its Without Qloo flip; with --yes, ask the
                           real model for guests with no Qloo data, score them with Qloo and add
                           the flip. It spends only qloo:day:offline, qloo:month and
                           anthropic:day:offline
@@ -109,7 +109,7 @@ command except roles without --apply needs OWNER_DATABASE_URL.
 --tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
 database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
 as vasal_owner with VASAL_OWNER_PASSWORD.
---yes is accepted only by promote, briefs and guesses, --apply only by roles, and --pick only by seed.`;
+--yes is accepted only by promote, briefs and guesses, --apply only by roles, and --pick only by seed and guesses (for guesses: the candidate rank the seed used, when several candidates share the show).`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
@@ -123,7 +123,7 @@ type Command =
   | { name: "mcp"; action: "revoke"; tokenId: string }
   | { name: "promote"; runId: string; position: number; yes: boolean }
   | { name: "briefs"; runId: string; yes: boolean }
-  | { name: "guesses"; runId: string; yes: boolean }
+  | { name: "guesses"; runId: string; yes: boolean; pick: number | undefined }
   | { name: "unpromote"; runId: string }
   | { name: "seed"; show: string; pick: number | undefined };
 
@@ -190,7 +190,7 @@ export function readArgs(argv: string[]): Args | undefined {
   if (pick !== undefined && !(pick >= 1 && pick <= MAX_PICK)) return undefined;
   const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true, pick);
   if (command === undefined) return undefined;
-  if (pick !== undefined && command.name !== "seed") return undefined;
+  if (pick !== undefined && command.name !== "seed" && command.name !== "guesses") return undefined;
   if (tunnelPort !== undefined && ((command.name === "roles" && !command.apply) || command.name === "selftest")) return undefined;
   return { dev, tunnelPort, command };
 }
@@ -221,7 +221,7 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
   if (name === "guesses") {
     const [runId] = rest;
     if (rest.length !== 1 || runId === undefined) return undefined;
-    return { name, runId, yes };
+    return { name, runId, yes, pick };
   }
   if (yes) return undefined;
   if (name === "unpromote") {
@@ -536,8 +536,8 @@ const fitText = (fit: number | null) => (fit === null ? "fit unknown" : `fit ${f
 
 // Without --yes it only reads storage and builds no agent, so it cannot
 // spend. Qloo names reach the terminal only through printableName (C3.6).
-async function runGuesses(db: Db, runId: string, yes: boolean): Promise<boolean> {
-  const plan = await planGuesses(db, runId);
+async function runGuesses(db: Db, runId: string, yes: boolean, pick: number | undefined): Promise<boolean> {
+  const plan = await planGuesses(db, runId, pick);
   const id = printableName(runId);
   if (plan.kind === "has") {
     console.log(`Run ${id} already has its Without Qloo flip, so nothing was done.`);
@@ -556,7 +556,7 @@ async function runGuesses(db: Db, runId: string, yes: boolean): Promise<boolean>
   const built = seedAgentFromEnv(db, "guesses");
   if (built === null) return false;
   console.log(`Asking ${built.settings.model} for guests for ${printableName(plan.showName)} with no Qloo data: ${spend}`);
-  const outcome = await addGuesses(db, built.agent, runId);
+  const outcome = await addGuesses(db, built.agent, runId, pick);
   if (outcome.kind === "has") {
     console.log(`Run ${id} already has its Without Qloo flip, so nothing was done.`);
     return true;
@@ -889,7 +889,7 @@ async function main(): Promise<number> {
       case "briefs":
         return (await runBriefs(db, command.runId, command.yes)) ? 0 : 1;
       case "guesses":
-        return (await runGuesses(db, command.runId, command.yes)) ? 0 : 1;
+        return (await runGuesses(db, command.runId, command.yes, command.pick)) ? 0 : 1;
       case "unpromote":
         return (await runUnpromote(db, command.runId)) ? 0 : 1;
       case "showcase":

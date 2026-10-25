@@ -198,20 +198,19 @@ describe("guesses (the Without Qloo backfill)", () => {
   const FEED = `<?xml version="1.0"?><rss><channel><title>${SHOW}</title><item><title>Talking with Synthetic Outsider</title></item></channel></rss>`;
 
   // A done run stored the way the runner stores one, before the flip existed.
-  async function doneRunWithoutFlip(): Promise<string> {
+  async function doneRunWithoutFlip(opts: { sameShowFeeds?: number } = {}): Promise<string> {
     const runId = await createRun(db, { show: SHOW, exclude: [] });
     await setRunStatus(db, runId, "running");
-    await putCandidates(db, runId, [
-      {
-        appleId: "1001",
-        name: "Synthetic Show Directory Name",
-        publisher: "Synthetic Publisher",
-        feedHandleSource: "directory",
-        feedUrl: "https://feeds.example/show-1.xml",
-        qlooId: "00000000-0000-4000-8000-000000000500",
-        qlooName: SHOW,
-      },
-    ]);
+    const candidate = (n: number) => ({
+      appleId: String(1000 + n),
+      name: "Synthetic Show Directory Name",
+      publisher: "Synthetic Publisher",
+      feedHandleSource: "directory" as const,
+      feedUrl: `https://feeds.example/show-${n}.xml`,
+      qlooId: "00000000-0000-4000-8000-000000000500",
+      qlooName: SHOW,
+    });
+    await putCandidates(db, runId, Array.from({ length: opts.sameShowFeeds ?? 1 }, (_, i) => candidate(i + 1)));
     await putBoard(db, runId, SEVEN_GUESTS);
     await finishRun(db, runId, "done", { name: "done", data: { guests: 7 } });
     return runId;
@@ -289,6 +288,26 @@ describe("guesses (the Without Qloo backfill)", () => {
     expect(fetched).toHaveLength(1);
   });
 
+  // Several feeds can share one Qloo show (DOAC, Lex Fridman and Armchair Expert
+  // did on 24 Oct), and a run does not record which one it continued with, so
+  // the operator names the rank the seed used and nothing is guessed.
+  it("refuses a run whose candidates share the show unless the rank is given, then uses that rank's feed", async () => {
+    const runId = await doneRunWithoutFlip({ sameShowFeeds: 2 });
+    expect(await planGuesses(db, runId)).toEqual({ kind: "refused", runId, code: "GUESSES_NO_SHOW" });
+    expect(await planGuesses(db, runId, 3)).toEqual({ kind: "refused", runId, code: "GUESSES_NO_SHOW" });
+    expect(await planGuesses(db, runId, 1)).toEqual({ kind: "ready", runId, showName: SHOW, guests: 7 });
+
+    const { agent, fetched } = guessingAgent(["Synthetic Outsider"]);
+    expect(await addGuesses(db, agent, runId, 2)).toMatchObject({ kind: "added", flip: { status: "done" } });
+    expect(fetched.map((url) => url.href)).toEqual(["https://feeds.example/show-2.xml"]);
+  });
+
+  it("readArgs takes --pick for guesses as the candidate rank", () => {
+    const id = "00000000-0000-4000-8000-000000000001";
+    expect(readArgs(["guesses", id, "--pick", "1", "--yes"])).toMatchObject({ command: { name: "guesses", runId: id, yes: true, pick: 1 } });
+    expect(readArgs(["guesses", id])).toMatchObject({ command: { name: "guesses", pick: undefined } });
+  });
+
   it("stores an unavailable flip when the model fails, which a later run of the command may replace", async () => {
     const runId = await doneRunWithoutFlip();
 
@@ -363,16 +382,16 @@ describe("ops.ts seed arguments", () => {
     }
   });
 
-  it("readArgs accepts guesses with a run id and an optional --yes, and refuses anything else", () => {
+  it("readArgs accepts guesses with a run id, an optional --yes and an optional --pick, and refuses anything else", () => {
     const runId = "00000000-0000-4000-8000-000000000700";
-    expect(readArgs(["guesses", runId])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "guesses", runId, yes: false } });
+    expect(readArgs(["guesses", runId])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "guesses", runId, yes: false, pick: undefined } });
     expect(readArgs(["--tunnel", "55432", "guesses", runId, "--yes"])).toEqual({
       dev: false,
       tunnelPort: 55432,
-      command: { name: "guesses", runId, yes: true },
+      command: { name: "guesses", runId, yes: true, pick: undefined },
     });
 
-    for (const argv of [["guesses"], ["guesses", runId, "extra"], ["guesses", runId, "--apply"], ["guesses", runId, "--pick", "1"]]) {
+    for (const argv of [["guesses"], ["guesses", runId, "extra"], ["guesses", runId, "--apply"], ["guesses", runId, "--pick", "0"], ["guesses", runId, "--pick", "x"]]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
   });
