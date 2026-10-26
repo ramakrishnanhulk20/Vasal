@@ -1,8 +1,12 @@
 // Covers the cache-then-meter-then-network order of the metered Qloo wrapper
-// on PGlite with a fake client, and, with the real client over a fake fetch,
-// what a call's signal spends when it fires. It does not cover the rest of
-// the real HTTPS client (see qloo-client.test.ts), races between connections
-// (PGlite has one), or real Qloo response shapes. Every body here is synthetic.
+// on PGlite with a fake client, its retry of a 429 or 5xx on a fresh slot,
+// its refusal under Qloo's own stored monthly count, and, with the real
+// client over a fake fetch, what a call's signal spends when it fires and how
+// a reply's count stops the next attempt. It does not cover Retry-After,
+// which the retry does not read, the rest of the real HTTPS client (see
+// qloo-client.test.ts), races between connections (PGlite has one), two
+// processes on separate databases, or real Qloo response shapes and headers.
+// Every body here is synthetic.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createQlooClient, type QlooCallResult, type QlooClient } from "../src/qloo/client.js";
 import { QlooError } from "../src/qloo/errors.js";
@@ -11,6 +15,7 @@ import { buildQlooRequest, type QlooOperation } from "../src/qloo/request.js";
 import { cachePut } from "../src/store/cache.js";
 import type { Db } from "../src/store/db.js";
 import { QLOO_PER_SECOND_CAP, reserveQlooCall, setBucket, usage, waitForQlooSlot } from "../src/store/meter.js";
+import { recordQuota } from "../src/store/quota.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
 const BASE = new URL("https://hackathon.api.qloo.com");
@@ -110,14 +115,14 @@ describe("createMeteredQloo", () => {
   it("never caches a client error, so the next identical op calls again (C7.2)", async () => {
     const { client, ops } = fakeClient([
       () => {
-        throw new QlooError("QLOO_UPSTREAM", 502);
+        throw new QlooError("QLOO_SCHEMA");
       },
       () => SYNTH_PEOPLE,
     ]);
     const qloo = createMeteredQloo({ client, db, baseUrl: BASE, now: () => NOW });
 
     const error = await errorOf(qloo.call(OP));
-    expect((error as QlooError).code).toBe("QLOO_UPSTREAM");
+    expect((error as QlooError).code).toBe("QLOO_SCHEMA");
     expect(await cacheRows()).toBe(0);
 
     const retry = await qloo.call(OP);
@@ -216,6 +221,226 @@ describe("createMeteredQloo", () => {
     expect(ops).toHaveLength(0);
     expect((await usage(db, "qloo:day"))?.used).toBe(filled);
     expect(qloo.stats()).toEqual({ calls: 0, cacheHits: 0 });
+  });
+
+  describe("retries (C5.2)", () => {
+    const failWith = (code: "QLOO_RATE_LIMIT" | "QLOO_UPSTREAM" | "QLOO_AUTH", status: number) => () => {
+      throw new QlooError(code, status);
+    };
+
+    function counted(script: Array<() => unknown>) {
+      const { client, ops } = fakeClient(script);
+      const sleeps: number[] = [];
+      const slots = { taken: 0 };
+      const qloo = createMeteredQloo({
+        client,
+        db,
+        baseUrl: BASE,
+        now: () => NOW,
+        waitForSlot: async (target, signal) => {
+          slots.taken += 1;
+          return waitForQlooSlot(target, signal === undefined ? {} : { signal });
+        },
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      });
+      return { qloo, ops, sleeps, slots };
+    }
+
+    it("gives the data after a 429, with a fresh slot for the second attempt", async () => {
+      const { qloo, ops, sleeps, slots } = counted([failWith("QLOO_RATE_LIMIT", 429), () => SYNTH_PEOPLE]);
+
+      expect(await qloo.call(OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: false });
+
+      expect([ops.length, slots.taken, sleeps]).toEqual([2, 2, [250]]);
+      expect((await usage(db, "qloo:day"))?.used).toBe(2);
+      expect(qloo.stats()).toEqual({ calls: 2, cacheHits: 0 });
+      expect(await cacheRows()).toBe(1);
+    });
+
+    it("gives QLOO_UPSTREAM after three 5xx, with 3 slots taken and nothing cached", async () => {
+      const { qloo, ops, sleeps, slots } = counted([failWith("QLOO_UPSTREAM", 503)]);
+
+      expect(((await errorOf(qloo.call(OP))) as QlooError).code).toBe("QLOO_UPSTREAM");
+
+      expect([ops.length, slots.taken, sleeps]).toEqual([3, 3, [250, 750]]);
+      expect(qloo.stats()).toEqual({ calls: 3, cacheHits: 0 });
+      expect(await cacheRows()).toBe(0);
+    });
+
+    it("never retries QLOO_AUTH", async () => {
+      const { qloo, ops, sleeps, slots } = counted([failWith("QLOO_AUTH", 401), () => SYNTH_PEOPLE]);
+
+      expect(((await errorOf(qloo.call(OP))) as QlooError).code).toBe("QLOO_AUTH");
+
+      expect([ops.length, slots.taken, sleeps]).toEqual([1, 1, []]);
+    });
+
+    it("spends exactly one slot and one request on a Qloo 400, through the real client (audit R2)", async () => {
+      let sent = 0;
+      const fetchImpl = (async () => {
+        sent += 1;
+        return new Response(JSON.stringify({ error: "synthetic bad request" }), { status: 400 });
+      }) as unknown as typeof fetch;
+      const client = createQlooClient({ apiKey: "FAKE-KEY-400", baseUrl: BASE, fetchImpl, maxRetries: 0 });
+      let slots = 0;
+      const qloo = createMeteredQloo({
+        client,
+        db,
+        baseUrl: BASE,
+        now: () => NOW,
+        waitForSlot: async (target, signal) => {
+          slots += 1;
+          return waitForQlooSlot(target, signal === undefined ? {} : { signal });
+        },
+        sleep: async () => undefined,
+      });
+
+      const error = await errorOf(qloo.call(OP));
+
+      expect(error).toMatchObject({ code: "QLOO_BAD_INPUT", status: 400 });
+      expect([sent, slots]).toEqual([1, 1]);
+      expect((await usage(db, "qloo:day"))?.used).toBe(1);
+      expect(await cacheRows()).toBe(0);
+    });
+
+    it("ends the call when a retry finds no slot, with no further request", async () => {
+      await setBucket(db, { key: "qloo:day", cap: 1, windowEnd: FAR_FUTURE });
+      const { qloo, ops, slots } = counted([failWith("QLOO_RATE_LIMIT", 429), () => SYNTH_PEOPLE]);
+
+      expect(((await errorOf(qloo.call(OP))) as QlooError).code).toBe("QLOO_BUDGET");
+
+      expect([ops.length, slots.taken]).toEqual([1, 2]);
+      expect((await usage(db, "qloo:day"))?.used).toBe(1);
+    });
+
+    it("stops with QLOO_TIMEOUT and takes no further slot when the signal fires during the pause", async () => {
+      const { client, ops } = fakeClient([failWith("QLOO_RATE_LIMIT", 429), () => SYNTH_PEOPLE]);
+      let slots = 0;
+      const qloo = createMeteredQloo({
+        client,
+        db,
+        baseUrl: BASE,
+        now: () => NOW,
+        waitForSlot: async (target, signal) => {
+          slots += 1;
+          return waitForQlooSlot(target, signal === undefined ? {} : { signal });
+        },
+      });
+      const deadline = new AbortController();
+      setTimeout(() => deadline.abort(), 20);
+      const started = Date.now();
+
+      const error = await errorOf(qloo.call(OP, { signal: deadline.signal }));
+
+      expect((error as QlooError).code).toBe("QLOO_TIMEOUT");
+      expect(Date.now() - started).toBeLessThan(250);
+      expect([ops.length, slots]).toEqual([1, 1]);
+      expect((await usage(db, "qloo:day"))?.used).toBe(1);
+      expect(qloo.stats()).toEqual({ calls: 1, cacheHits: 0 });
+    });
+  });
+
+  describe("Qloo's own monthly count", () => {
+    const HOUR_MS = 60 * 60 * 1_000;
+    // recordQuota stamps the database's own time, which is after NOW, so the
+    // reading is fresh to this meter's clock until stampedAt moves it.
+    const seen = (remaining: number) => recordQuota(db, { remaining, limit: 50_000, seenAt: NOW });
+    const stampedAt = (at: Date) => db.query("UPDATE qloo_quota SET seen_at = $1::timestamptz", [at.toISOString()]);
+
+    function watched(opts: { quotaFloor?: number } = {}) {
+      const { client, ops } = fakeClient([() => SYNTH_PEOPLE]);
+      const slots = { taken: 0 };
+      const qloo = createMeteredQloo({
+        client,
+        db,
+        baseUrl: BASE,
+        now: () => NOW,
+        waitForSlot: async (target, signal) => {
+          slots.taken += 1;
+          return waitForQlooSlot(target, signal === undefined ? {} : { signal });
+        },
+        ...opts,
+      });
+      return { qloo, ops, slots };
+    }
+
+    it("refuses a miss with QLOO_BUDGET when 1,499 remain, with no slot taken and no request", async () => {
+      await seen(1_499);
+      const { qloo, ops, slots } = watched();
+
+      expect(((await errorOf(qloo.call(OP))) as QlooError).code).toBe("QLOO_BUDGET");
+
+      expect([ops.length, slots.taken]).toEqual([0, 0]);
+      expect((await usage(db, "qloo:day"))?.used).toBe(0);
+      expect(qloo.stats()).toEqual({ calls: 0, cacheHits: 0 });
+    });
+
+    it("lets a miss through when exactly 1,500 remain", async () => {
+      await seen(1_500);
+      const { qloo, ops, slots } = watched();
+
+      expect(await qloo.call(OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: false });
+      expect([ops.length, slots.taken]).toEqual([1, 1]);
+    });
+
+    it("ignores a count under the floor seen 25 hours ago, as after Qloo's reset, while one seen 23 hours ago still refuses", async () => {
+      await seen(0);
+      await stampedAt(new Date(NOW.getTime() - 25 * HOUR_MS));
+      const { qloo, ops } = watched();
+      expect(await qloo.call(OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: false });
+      expect(ops).toHaveLength(1);
+
+      await stampedAt(new Date(NOW.getTime() - 23 * HOUR_MS));
+      expect(((await errorOf(qloo.call(CACHED_OP))) as QlooError).code).toBe("QLOO_BUDGET");
+      expect(ops).toHaveLength(1);
+    });
+
+    it("lets a miss through when no count has been stored, as on a fresh database", async () => {
+      const { qloo, ops, slots } = watched();
+
+      expect(await qloo.call(OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: false });
+      expect([ops.length, slots.taken]).toEqual([1, 1]);
+    });
+
+    it("answers a cache hit even when the count is under the floor", async () => {
+      await cachePut(db, buildQlooRequest(BASE, CACHED_OP).cacheKey, SYNTH_PEOPLE, 60_000, NOW);
+      await seen(0);
+      const { qloo, ops, slots } = watched();
+
+      expect(await qloo.call(CACHED_OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: true });
+      expect([ops.length, slots.taken]).toEqual([0, 0]);
+      expect(qloo.stats()).toEqual({ calls: 0, cacheHits: 1 });
+    });
+
+    it("takes its floor from quotaFloor, and refuses a floor that is not a whole number from 0", async () => {
+      await seen(99);
+      expect(((await errorOf(watched({ quotaFloor: 100 }).qloo.call(OP))) as QlooError).code).toBe("QLOO_BUDGET");
+      expect(await watched({ quotaFloor: 99 }).qloo.call(OP)).toEqual({ data: SYNTH_PEOPLE, fromCache: false });
+
+      for (const quotaFloor of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(() => watched({ quotaFloor })).toThrow(expect.objectContaining({ code: "QLOO_BAD_INPUT" }));
+      }
+    });
+
+    it("stops the retry when the 429 before it reported 1,499 left, through the client's onQuota wired to recordQuota", async () => {
+      const replies = [
+        () => new Response("{}", { status: 429, headers: { "X-Month-RateLimit-Remaining": "1499", "X-Month-RateLimit-Limit": "50000" } }),
+        () => new Response(JSON.stringify({ results: { entities: SYNTH_PEOPLE } }), { status: 200 }),
+      ];
+      let sent = 0;
+      const fetchImpl = (async () => replies[sent++]!()) as unknown as typeof fetch;
+      const client = createQlooClient({ apiKey: "FAKE-KEY-quota", baseUrl: BASE, fetchImpl, maxRetries: 0, onQuota: (quota) => recordQuota(db, quota) });
+      // The client stamps each count with real time, so the meter keeps real time here too.
+      const qloo = createMeteredQloo({ client, db, baseUrl: BASE, sleep: async () => undefined });
+
+      expect(((await errorOf(qloo.call(OP))) as QlooError).code).toBe("QLOO_BUDGET");
+
+      expect(sent).toBe(1);
+      expect((await usage(db, "qloo:day"))?.used).toBe(1);
+      expect(await cacheRows()).toBe(0);
+    });
   });
 
   it("refuses an operation the request builder rejects before any slot or call", async () => {

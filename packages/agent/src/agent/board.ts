@@ -4,8 +4,8 @@ import { sameName } from "./past-guests.js";
 
 export type Rising = { state: "rising" | "steady" | "falling" | "unknown"; points: number | null };
 export type BringsNew = { segment: string; label: string; gap: number } | null;
-/** How hard a guest is likely to book. "unknown" means Qloo gave no popularity, never that booking is easy. */
-export type Reach = "household name" | "well known" | "bookable" | "unknown";
+/** Whether Qloo marks a guest as one of the most famous people it knows. "none" says nothing about how easy they are to book. */
+export type Reach = "household name" | "none";
 export type BoardEntry = {
   personId: string;
   name: string;
@@ -28,8 +28,11 @@ const BASELINE_WEEKS = 8;
 const RISING_AT_POINTS = 2;
 const FALLING_AT_POINTS = -2;
 
-const HOUSEHOLD_NAME_AT = 0.95;
-const WELL_KNOWN_AT = 0.8;
+// A calibration on 30 people (25 Oct) found Qloo popularity marks only the
+// very top: 9 of 10 household names scored 0.99 or more and nobody else
+// passed 0.95, while Tina Fey scored 0.15 and Bill Hader 0.46. Below this it
+// cannot tell a famous guest from an unknown one, so no other band is named.
+export const HOUSEHOLD_NAME_AT = 0.97;
 
 /**
  * The fit a pick needs when only find_person returned it. A pasted feed's
@@ -127,9 +130,10 @@ export function risingFrom(rows: readonly TrendRow[]): Rising {
 }
 
 /**
- * Finds the audience a guest would bring that the show does not have yet.
- * For each documented age band and gender present in both breakdowns, the gap
- * is person minus show. Returns the largest gap among segments where the
+ * Finds an audience group this guest's fans lean toward more than the show's
+ * listeners do. That is a lean, not proof the show has none of those
+ * listeners. For each documented age band and gender present in both
+ * breakdowns, the gap is person minus show. Returns the largest gap among segments where the
  * person over-indexes (above 0) and the show does not (0 or below), with a
  * fixed plain label and the gap rounded to 2 decimals. Age and gender are
  * separate in Qloo's data, so a label never combines them. Returns null when
@@ -175,16 +179,13 @@ export function strongestSegments(audience: Demographics, count: number): string
 }
 
 /**
- * How hard a guest is likely to book, from Qloo popularity (0 to 1): 0.95 and
- * up is a household name, 0.8 and up is well known, any other number is
- * bookable. A missing or non-finite value is unknown, so absent data never
- * reads as the favourable label (G15).
+ * Reach from Qloo popularity (0 to 1): "household name" at
+ * HOUSEHOLD_NAME_AT (0.97) or above, and "none" for any other value,
+ * including null and a non-finite number, so missing data never earns a
+ * label (G15).
  */
 export function reachFrom(popularity: number | null): Reach {
-  if (popularity === null || !Number.isFinite(popularity)) return "unknown";
-  if (popularity >= HOUSEHOLD_NAME_AT) return "household name";
-  if (popularity >= WELL_KNOWN_AT) return "well known";
-  return "bookable";
+  return popularity !== null && Number.isFinite(popularity) && popularity >= HOUSEHOLD_NAME_AT ? "household name" : "none";
 }
 
 /**

@@ -29,6 +29,11 @@ const COUNT_USE: Record<TokenUseKind, string> = {
            ON CONFLICT (token_id, day) DO UPDATE SET briefs = d.briefs + 1 WHERE d.briefs < $3
            RETURNING d.token_id`,
 };
+const READ_USE: Record<TokenUseKind, string> = {
+  runs: "SELECT runs AS n FROM mcp_token_daily WHERE token_id = $1::uuid AND day = $2::date",
+  finds: "SELECT finds AS n FROM mcp_token_daily WHERE token_id = $1::uuid AND day = $2::date",
+  briefs: "SELECT briefs AS n FROM mcp_token_daily WHERE token_id = $1::uuid AND day = $2::date",
+};
 
 const MAX_DAILY_CAP = 1_000;
 const MAX_INFLIGHT = 20;
@@ -89,6 +94,26 @@ export async function countTokenUse(
   const day = utcDayOf(now);
   const { rows } = await stored(() => db.query(COUNT_USE[kind], [id, day, cap]));
   return rows.length === 1;
+}
+
+/**
+ * True when a key has already used `cap` of `kind` in the UTC day of `now`.
+ * A plain read with no write and no lock, so it only lets a call that is
+ * sure to be refused stop before it takes anything; countTokenUse stays the
+ * gate (D3.6). A key with no row for the day has used none. A count that
+ * does not read back as a whole number counts as at the cap (C5.7). Throws
+ * ServerError("SRV_BAD_INPUT") for the inputs countTokenUse refuses, and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function tokenUseAtCap(db: Db, tokenId: string, kind: TokenUseKind, cap: number, now: Date): Promise<boolean> {
+  const id = checkTokenId(tokenId);
+  if (typeof kind !== "string" || !Object.hasOwn(READ_USE, kind)) throw badInput();
+  checkWhole(cap, 1, MAX_DAILY_CAP);
+  const day = utcDayOf(now);
+  const { rows } = await stored(() => db.query(READ_USE[kind], [id, day]));
+  if (rows.length === 0) return false;
+  const used: unknown = rows[0]?.["n"];
+  return typeof used !== "number" || !Number.isSafeInteger(used) || used >= cap;
 }
 
 /**

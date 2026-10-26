@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import type { Reach } from "../agent/board.js";
+import { isShowableTag } from "../agent/prose.js";
 import type { Db } from "../store/db.js";
+import { cleanText } from "../text/normalize.js";
 import { ServerError } from "./errors.js";
 import { RUN_EVENTS, type RunEventName } from "./sse.js";
 
@@ -553,10 +556,58 @@ export async function getBoardGuest(db: Db, runId: string, guestId: string): Pro
   );
 }
 
+/** How many of a brief's questions any public view shows. The runner writes exactly this many. */
+export const MAX_BRIEF_QUESTIONS = 5;
+
+const storedBriefText = z.string().max(MAX_BRIEF_JSON);
+
 /**
- * Returns the stored brief for a guest on a run, or null when there is none,
- * either id is not a lower-case UUID, or the row fails its schema. Throws
- * ServerError("SRV_UNAVAILABLE") if the database fails.
+ * A brief as the agent runner stores it (writeBrief in agent/brief.ts),
+ * under putBrief's own size bound. A key it does not name is dropped, and
+ * the removed counts are for the operator only, so no public view shows
+ * them. Up to twice the shown questions are read, so a longer list is cut
+ * by the view rather than refused.
+ */
+export const storedBriefSchema = z.object({
+  why: storedBriefText,
+  angle: storedBriefText,
+  questions: z.array(storedBriefText).max(MAX_BRIEF_QUESTIONS * 2),
+  pitch_subject: storedBriefText,
+  pitch_body: storedBriefText,
+  removed: z.object({ links: z.number().int().min(0), emails: z.number().int().min(0) }).optional(),
+});
+
+/** What the run page shows of one guest's brief, and nothing else (C6.5). */
+export type PublicBrief = { why: string; angle: string; questions: string[]; pitchSubject: string; pitchBody: string };
+
+/**
+ * The public view of one stored brief, as getBrief returns it: why, angle,
+ * the first 5 questions, pitchSubject and pitchBody, picked by name, so no
+ * other stored field ever reaches the page. A brief that fails
+ * storedBriefSchema, or null, gives null, which the routes read as missing
+ * (C6.5). Pure; never throws.
+ */
+export function publicBrief(row: unknown): PublicBrief | null {
+  const parsed = storedBriefSchema.safeParse(row);
+  if (!parsed.success) return null;
+  const brief = parsed.data;
+  return {
+    why: brief.why,
+    angle: brief.angle,
+    questions: brief.questions.slice(0, MAX_BRIEF_QUESTIONS),
+    pitchSubject: brief.pitch_subject,
+    pitchBody: brief.pitch_body,
+  };
+}
+
+/**
+ * Returns the stored brief data for a guest on a run exactly as stored,
+ * with no check of its shape, because the runner and the promote command
+ * read it with their own schemas. Every public read must go through
+ * publicBrief or storedBriefSchema first. Returns null when there is none,
+ * either id is not a lower-case UUID, or the stored text is over 65,536
+ * characters or not JSON. Throws ServerError("SRV_UNAVAILABLE") if the
+ * database fails.
  */
 export async function getBrief(db: Db, runId: string, guestId: string): Promise<unknown | null> {
   if (!isId(runId) || !isId(guestId)) return null;
@@ -609,12 +660,19 @@ export async function putBrief(
 }
 
 /**
- * Startup step: marks every queued, awaiting_confirm or running run as failed
- * with error code SERVER_RESTART and finished_at `now`, and appends a failed
- * event to each, all in one statement, so no run is left looking alive after
- * the process that ran it died (C6.4). A run whose 500 event slots are all
- * used already ended with a terminal event and gets no extra one. Done and
- * failed runs are left alone. Returns how many runs were failed. Assumes one
+ * Startup step: marks every queued or running run as failed with error code
+ * SERVER_RESTART and finished_at `now`, and appends a failed event to each,
+ * all in one statement, so no run is left looking alive after the process
+ * that ran it died (C6.4). A run whose 500 event slots are all used already
+ * ended with a terminal event and gets no extra one. A run awaiting_confirm
+ * is left alone: it holds no slot and nothing is working on it, so a deploy
+ * does not cost its visitor the run, and it still ends through the confirm
+ * window or the operator's prune. Done and failed runs are left alone too,
+ * and so is any run on the showcase, inside the statement: the app role
+ * cannot change a promoted run (schema.sql), and one refused row would fail
+ * the whole sweep and stop the server starting. Promotion needs a done run,
+ * so only a promoted run the owner moved back by hand is ever skipped.
+ * Returns how many runs were failed. Assumes one
  * agent server process per database: a second live process would have its
  * runs failed too. Throws ServerError("SRV_BAD_INPUT") for an invalid date
  * and ServerError("SRV_UNAVAILABLE") if the database fails.
@@ -629,7 +687,8 @@ export async function failInterruptedRuns(db: Db, now: Date = new Date()): Promi
         tx,
         `WITH stopped AS (
            UPDATE runs SET status = 'failed', error_code = $1, finished_at = $2::timestamptz
-           WHERE status IN ('queued', 'awaiting_confirm', 'running')
+           WHERE status IN ('queued', 'running')
+             AND NOT EXISTS (SELECT 1 FROM showcase_runs s WHERE s.run_id = runs.id)
            RETURNING id
          ),
          numbered AS (
@@ -739,26 +798,45 @@ export async function claimRunStatus(
   return rows.length === 1;
 }
 
-export type BriefClaimStatus = "pending" | "failed" | "done";
+/** The code write_brief defers its own claim with when the key's daily briefs are used up. */
+export const MCP_BRIEF_BUDGET = "MCP_BRIEF_BUDGET";
+
+/**
+ * "deferred" is a claim a budget refused: it spent no attempt, holds none of
+ * the run's places, and may be claimed again with the same attempts.
+ */
+export type BriefClaimStatus = "pending" | "failed" | "done" | "deferred";
 export type BriefClaim = { status: BriefClaimStatus; attempts: 1 | 2; errorCode: string | null };
 
 const MAX_BRIEF_ATTEMPTS = 2;
+// The refusals that mean "not now" rather than "this brief failed". Each is
+// thrown before the call it would have paid for goes out.
+const BUDGET_CODES: ReadonlySet<string> = new Set(["MODEL_BUDGET", "QLOO_BUDGET", MCP_BRIEF_BUDGET]);
+// A deferred claim holds no place, so it is left out of every count against
+// the per-run limit, and taking it again needs a place like a new claim.
+const PLACES_TAKEN = "SELECT count(*)::int AS n FROM run_brief_claims WHERE run_id = $1::uuid AND status <> 'deferred'";
 
-// Only failed claims carry a code, and it is always a fixed upper-case code.
+// Only failed and deferred claims carry a code, always a fixed upper-case
+// one, and a deferred claim only a budget's.
 const briefClaimRow = z
   .object({
-    status: z.enum(["pending", "failed", "done"]),
+    status: z.enum(["pending", "failed", "done", "deferred"]),
     attempts: z.union([z.literal(1), z.literal(MAX_BRIEF_ATTEMPTS)]),
     error_code: z.string().regex(ERROR_CODE).nullable(),
   })
-  .refine((row) => (row.status === "failed") === (row.error_code !== null));
+  .refine((row) => (row.status === "failed" || row.status === "deferred") === (row.error_code !== null))
+  .refine((row) => row.status !== "deferred" || BUDGET_CODES.has(row.error_code ?? ""));
 
 /**
  * Claims the brief a guest may get on a run, before any model call (C5.8).
  * Inside one transaction that holds the run's row lock it checks the guest
  * is on the run's stored board (C6.2), then reads that guest's claim:
- * - none: "limit" if the run already has `maxPerRun` claims, otherwise it
- *   inserts a pending claim with attempts 1 and returns "claimed";
+ * - none: "limit" if the run already has `maxPerRun` claims that are not
+ *   deferred, otherwise it inserts a pending claim with attempts 1 and
+ *   returns "claimed";
+ * - deferred: counted against the limit exactly like a new claim, "limit"
+ *   or one UPDATE, only WHERE status = 'deferred', back to pending with the
+ *   same attempts, no code and created_at `now`, returning "claimed";
  * - pending or done: "exists";
  * - failed after 1 attempt: one UPDATE moves it to pending with attempts 2
  *   and created_at `now`, only WHERE status = 'failed' AND attempts = 1, and
@@ -798,7 +876,18 @@ export async function claimBrief(
       );
       if (held.rows.length === 1) {
         const claim = briefClaimRow.safeParse(held.rows[0]);
-        if (!claim.success || claim.data.status !== "failed") return "exists";
+        if (!claim.success) return "exists";
+        if (claim.data.status === "deferred") {
+          if ((await countOf(tx, PLACES_TAKEN, [id])) >= maxPerRun) return "limit";
+          const resumed = await tx.query(
+            `UPDATE run_brief_claims SET status = 'pending', error_code = NULL, created_at = $3::timestamptz
+             WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'deferred'
+             RETURNING guest_id`,
+            [id, guest, now.toISOString()],
+          );
+          return resumed.rows.length === 1 ? "claimed" : "exists";
+        }
+        if (claim.data.status !== "failed") return "exists";
         if (claim.data.attempts === MAX_BRIEF_ATTEMPTS) return "failed";
         // created_at is when the current attempt was claimed, so a stale sweep
         // with a threshold never fails a retry that has just started.
@@ -810,8 +899,7 @@ export async function claimBrief(
         );
         return retried.rows.length === 1 ? "claimed" : "exists";
       }
-      const claims = await countOf(tx, "SELECT count(*)::int AS n FROM run_brief_claims WHERE run_id = $1::uuid", [id]);
-      if (claims >= maxPerRun) return "limit";
+      if ((await countOf(tx, PLACES_TAKEN, [id])) >= maxPerRun) return "limit";
       const { rows } = await tx.query(
         `INSERT INTO run_brief_claims (run_id, guest_id, status, attempts, error_code, created_at)
          VALUES ($1::uuid, $2::uuid, 'pending', 1, NULL, $3::timestamptz)
@@ -826,7 +914,7 @@ export async function claimBrief(
 
 /**
  * Reads a guest's brief claim on a run: its status, attempts (1 or 2) and,
- * for a failed claim only, its error code. Returns null without querying for
+ * for a failed or deferred claim only, its error code. Returns null without querying for
  * anything that is not a lower-case UUID, and null when there is no claim or
  * the row fails its schema (C6.5). Changes nothing. Throws
  * ServerError("SRV_UNAVAILABLE") if the database fails.
@@ -867,22 +955,26 @@ export async function markBriefDone(db: Db, runId: string, guestId: string): Pro
 
 /**
  * Marks a guest's pending brief claim failed with `code`, which must be an
- * upper-case code such as MODEL_TIMEOUT, never free text (C3.6). Returns true
- * when a pending claim moved and false when there was none to move, in which
- * case nothing changes. The claim's attempts are left as they are, so
- * claimBrief allows exactly one retry. Throws ServerError("SRV_BAD_INPUT") for
- * a bad id or code and ServerError("SRV_UNAVAILABLE") if the database fails.
+ * upper-case code such as MODEL_TIMEOUT, never free text (C3.6). A budget's
+ * refusal (MODEL_BUDGET, QLOO_BUDGET or MCP_BRIEF_BUDGET) instead marks it
+ * deferred with that code, so it spends no attempt and claimBrief may take
+ * it again. Returns true when a pending claim moved and false when there was
+ * none to move, in which case nothing changes. The claim's attempts are left
+ * as they are, so claimBrief allows exactly one retry after a real failure.
+ * Throws ServerError("SRV_BAD_INPUT") for a bad id or code and
+ * ServerError("SRV_UNAVAILABLE") if the database fails.
  */
 export async function markBriefFailed(db: Db, runId: string, guestId: string, code: string): Promise<boolean> {
   const id = checkId(runId);
   const guest = checkId(guestId);
   if (typeof code !== "string" || !ERROR_CODE.test(code)) throw badInput();
+  const status = BUDGET_CODES.has(code) ? "deferred" : "failed";
   const { rows } = await stored(() =>
     db.query(
-      `UPDATE run_brief_claims SET status = 'failed', error_code = $3
+      `UPDATE run_brief_claims SET status = $4, error_code = $3
        WHERE run_id = $1::uuid AND guest_id = $2::uuid AND status = 'pending'
        RETURNING guest_id`,
-      [id, guest, code],
+      [id, guest, code, status],
     ),
   );
   return rows.length === 1;
@@ -895,7 +987,11 @@ export async function markBriefFailed(db: Db, runId: string, guestId: string, co
  * statement, so a brief whose writer died with the last process is never
  * left pending (C6.4). Attempts are left as they are, so a first attempt
  * may still be retried once. Claims created at or after the cutoff, and done
- * or failed claims, are left alone. Returns how many claims were failed.
+ * or failed claims, are left alone. So is every claim on a run on the
+ * showcase, inside the statement: the app role cannot change a promoted
+ * run's rows (schema.sql), and one refused row would fail the whole sweep
+ * and stop the server starting. Such a claim stays pending until the owner
+ * settles it. Returns how many claims were failed.
  * Throws ServerError("SRV_BAD_INPUT") for an olderThanMs that is not a
  * non-negative safe integer or a date (or cutoff) that is not valid, and
  * ServerError("SRV_UNAVAILABLE") if the database fails.
@@ -910,6 +1006,7 @@ export async function failStaleBriefClaims(db: Db, olderThanMs: number, now: Dat
       `WITH stopped AS (
          UPDATE run_brief_claims SET status = 'failed', error_code = $1
          WHERE status = 'pending' AND created_at < $2::timestamptz
+           AND NOT EXISTS (SELECT 1 FROM showcase_runs s WHERE s.run_id = run_brief_claims.run_id)
          RETURNING 1
        )
        SELECT count(*)::int AS n FROM stopped`,
@@ -924,6 +1021,55 @@ export const MAX_SHOWCASE_POSITION = 12;
 export const SHOWCASE_GUESTS = 3;
 const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
 
+/**
+ * Reach as a stored board row or flip guess holds it, read the one way every
+ * reader shares. Rows written before reach meant only Qloo's very top hold
+ * "well known", "bookable" or "unknown", labels Qloo's popularity cannot
+ * back, so they read as "none" like "none" itself; only "household name"
+ * keeps its label. Any other value fails the row (C6.5).
+ */
+export const storedReach = z
+  .enum(["household name", "well known", "bookable", "unknown", "none"])
+  .transform((reach): Reach => (reach === "household name" ? "household name" : "none"));
+
+/** Reach as every public view shows it: "household name", or null when there is no label. */
+export type PublicReach = "household name" | null;
+
+/** The one place a stored reach becomes a public one, so no view can show "none" or an old label. */
+export function publicReach(reach: Reach): PublicReach {
+  return reach === "household name" ? "household name" : null;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+// A label storedReach refuses, or no string at all, shows as no label rather
+// than passing through as written.
+function streamedReach(value: unknown): PublicReach {
+  const parsed = storedReach.safeParse(value);
+  return parsed.success ? publicReach(parsed.data) : null;
+}
+
+function withStreamedReach(items: unknown): unknown {
+  if (!Array.isArray(items)) return items;
+  return items.map((item) => (isRecord(item) && Object.hasOwn(item, "reach") ? { ...item, reach: streamedReach(item["reach"]) } : item));
+}
+
+/**
+ * One stored event's data as GET /runs/:id/events sends it. In a "board"
+ * event's guests and a "without_qloo" event's guesses, each reach goes
+ * through storedReach and publicReach, as GET /runs/:id shows it:
+ * "household name", or null for every other label, including one storedReach
+ * refuses. Every other field, and every other event, is returned exactly as
+ * stored, and the stored row is never changed. Pure; never throws.
+ */
+export function streamedEventData(event: RunEventName, data: unknown): unknown {
+  if (!isRecord(data)) return data;
+  const list = event === "board" ? "guests" : event === "without_qloo" ? "guesses" : null;
+  if (list === null || !Object.hasOwn(data, list)) return data;
+  return { ...data, [list]: withStreamedReach(data[list]) };
+}
+
 // A board guest exactly as the agent runner stores it, under the limits the
 // runner reads it back with for a brief (BoardRow in agent/runner.ts). A row
 // that could not reach a brief cannot reach the home page either (C6.5).
@@ -933,7 +1079,7 @@ const boardGuest = z.strictObject({
   fit: z.number(),
   fitKnown: z.boolean(),
   fitRank: z.number().int().min(1),
-  reach: z.enum(["household name", "well known", "bookable", "unknown"]),
+  reach: storedReach,
   rising: z.strictObject({ state: z.enum(["rising", "steady", "falling", "unknown"]), points: z.number().nullable() }),
   bringsNew: z.strictObject({ segment: z.string().max(100), label: z.string().max(100), gap: z.number() }).nullable(),
   sharedTags: z.array(z.string().max(200)).max(5),
@@ -948,12 +1094,19 @@ export type ShowcaseGuest = {
   name: string;
   fit: number;
   fitKnown: boolean;
-  reach: string;
+  reach: PublicReach;
   rising: string;
   bringsNew: string | null;
   sharedTags: string[];
 };
-export type ShowcaseRun = { runId: string; position: number; showName: string; finishedAt: Date; guests: ShowcaseGuest[] };
+export type ShowcaseRun = {
+  runId: string;
+  position: number;
+  showName: string;
+  finishedAt: Date;
+  guests: ShowcaseGuest[];
+  pastGuests: PublicPastGuests | null;
+};
 /** What the run page shows for one board guest, and nothing else (D5.5). */
 export type PublicBoardGuest = {
   id: string;
@@ -961,7 +1114,7 @@ export type PublicBoardGuest = {
   fit: number;
   fitKnown: boolean;
   fitRank: number;
-  reach: string;
+  reach: PublicReach;
   rising: string;
   bringsNew: string | null;
   sharedTags: string[];
@@ -984,7 +1137,11 @@ const listedBoardRow = z.object({ id: z.string().refine(isId), data: boardGuest 
  * The public view of one row from listBoard ({ id, data }): its server id and
  * the fields the page draws, picked by name so a stored field stays private
  * unless it is added here. personId (a Qloo entity id), rising.points,
- * bringsNew's segment and gap, and showName never leave the server (D5.5).
+ * bringsNew's segment and gap, and showName never leave the server (D5.5),
+ * and reach goes out through publicReach, so only "household name" or null
+ * is ever shown. sharedTags keeps only the tags isShowableTag passes today,
+ * so a row stored under older chip rules never shows a chip they now refuse
+ * (C3.10).
  * `data` must pass the same schema the runner and the showcase read it with;
  * a row that fails, or an id that is not a lower-case UUID, gives null and is
  * not shown (C6.5). Pure; never throws.
@@ -999,10 +1156,10 @@ export function publicBoardGuest(row: unknown): PublicBoardGuest | null {
     fit: data.fit,
     fitKnown: data.fitKnown,
     fitRank: data.fitRank,
-    reach: data.reach,
+    reach: publicReach(data.reach),
     rising: data.rising.state,
     bringsNew: data.bringsNew?.label ?? null,
-    sharedTags: [...data.sharedTags],
+    sharedTags: data.sharedTags.filter(isShowableTag),
     angle: data.angle,
   };
 }
@@ -1011,7 +1168,7 @@ export function publicBoardGuest(row: unknown): PublicBoardGuest | null {
 export type PublicWithoutQloo =
   | {
       status: "done";
-      guesses: Array<{ name: string; fit: number | null; fitKnown: boolean; reach: string; pastGuest: boolean; onBoard: boolean }>;
+      guesses: Array<{ name: string; fit: number | null; fitKnown: boolean; reach: PublicReach; pastGuest: boolean; host: boolean; onBoard: boolean }>;
       unresolved: number;
     }
   | { status: "unavailable" };
@@ -1019,17 +1176,20 @@ export type PublicWithoutQloo =
 const MAX_FLIP_GUESSES = 8;
 
 // The shape the agent runner writes (agent/without-qloo.ts), read back under
-// the board's name limit. A field outside it fails the whole event.
+// the board's name limit. A field outside it fails the whole event. Flips
+// stored before hosts were told apart have no host field, and read as no host.
 const withoutQlooGuest = z
   .strictObject({
     name: z.string().min(1).max(200),
     fit: z.number().nullable(),
     fitKnown: z.boolean(),
-    reach: z.enum(["household name", "well known", "bookable", "unknown"]),
+    reach: storedReach,
     pastGuest: z.boolean(),
+    host: z.boolean().optional(),
     onBoard: z.boolean(),
   })
-  .refine((guess) => guess.fitKnown === (guess.fit !== null));
+  .refine((guess) => guess.fitKnown === (guess.fit !== null))
+  .refine((guess) => !(guess.host === true && guess.pastGuest));
 const withoutQlooEvent = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("done"),
@@ -1041,11 +1201,13 @@ const withoutQlooEvent = z.discriminatedUnion("status", [
 
 /**
  * The public view of one "without_qloo" event's data: the flip's status and,
- * when done, each guess's name, fit, fitKnown, reach, pastGuest and onBoard
- * plus the unresolved count, picked by name. The data must match the shape
- * the runner writes exactly: a field it never writes (a Qloo id, model text),
- * a fit that disagrees with fitKnown, more than 8 guesses or any other
- * difference gives null, so nothing extra is ever passed on (C6.5, D5.5).
+ * when done, each guess's name, fit, fitKnown, reach (through publicReach),
+ * pastGuest, host and onBoard plus the unresolved count, picked by name. A guess stored before
+ * hosts were told apart has no host and shows host false. The data must
+ * match the shape the runner writes exactly: a field it never writes (a Qloo
+ * id, model text), a fit that disagrees with fitKnown, a guess that is both
+ * a host and a past guest, more than 8 guesses or any other difference gives
+ * null, so nothing extra is ever passed on (C6.5, D5.5).
  * Pure; never throws.
  */
 export function publicWithoutQloo(data: unknown): PublicWithoutQloo | null {
@@ -1058,8 +1220,9 @@ export function publicWithoutQloo(data: unknown): PublicWithoutQloo | null {
       name: guess.name,
       fit: guess.fit,
       fitKnown: guess.fitKnown,
-      reach: guess.reach,
+      reach: publicReach(guess.reach),
       pastGuest: guess.pastGuest,
+      host: guess.host ?? false,
       onBoard: guess.onBoard,
     })),
     unresolved: parsed.data.unresolved,
@@ -1086,8 +1249,212 @@ export async function getWithoutQloo(db: Db, runId: string): Promise<PublicWitho
 }
 
 /**
- * What the home page shows for one run: its show name and its first 3 board
- * guests. `board` is the run's board from rank 1 down (at least its first 3
+ * What every public view says about how far a run checked for past guests
+ * (A2-6), and against which feed: the confirmed candidate's provenance and
+ * its directory name and publisher (null when an older run cannot say which
+ * candidate it confirmed). It never holds a feed URL.
+ */
+export type PublicPastGuests = {
+  checked: boolean;
+  episodes: number;
+  since: string | null;
+  source: FeedSource;
+  feedName: string | null;
+  feedPublisher: string | null;
+  archiveTitles: number;
+};
+
+// The feed parser keeps at most 2,000 episodes (feeds/rss.ts) and an
+// operator's archive holds at most 10,000 lines (ops/seed.ts).
+const MAX_FEED_EPISODES = 2_000;
+const MAX_ARCHIVE_LINES = 10_000;
+const YEAR_MONTH = /^\d{4}-\d{2}$/;
+
+// The board event as the agent runner writes it (agent/runner.ts). One
+// written before the check recorded its feed has no source or candidateId,
+// and one written before it counted titles fails here and reads as missing.
+const boardEvent = z.strictObject({
+  guests: z.array(z.unknown()).max(MAX_BOARD_GUESTS),
+  pastGuests: z
+    .strictObject({
+      checked: z.boolean(),
+      skipped: z.number().int().min(0),
+      titles: z.number().int().min(0).max(MAX_FEED_EPISODES),
+      since: z.string().regex(YEAR_MONTH).nullable(),
+      source: z.enum(["directory", "linked", "pasted"]).optional(),
+      candidateId: z.string().refine(isId).optional(),
+      archiveTitles: z.number().int().min(0).max(MAX_ARCHIVE_LINES).optional(),
+    })
+    .refine((check) => check.checked === check.titles > 0)
+    .refine((check) => (check.source === undefined) === (check.candidateId === undefined)),
+});
+
+/**
+ * What vouched for a candidate's feed: "directory" for a show a name search
+ * found, "linked" for an Apple Podcasts link or id the visitor gave, which no
+ * search vouched for, and "pasted" for a feed URL the visitor gave. Only a
+ * "directory" feed's titles reach a model (C2.7).
+ */
+export type FeedSource = "directory" | "linked" | "pasted";
+const FEED_SOURCES = ["directory", "linked", "pasted"] as const satisfies readonly FeedSource[];
+
+// A row stored before provenance was recorded holds only the fetch source,
+// and every Apple link then was stored as "directory".
+function provenanceOf(row: { provenance?: FeedSource | undefined; feedHandleSource: "directory" | "visitor" }): FeedSource {
+  return row.provenance ?? (row.feedHandleSource === "directory" ? "directory" : "pasted");
+}
+
+/**
+ * A stored show candidate, read back under the limits it was written with,
+ * by continueRun (as CandidateRow in agent/runner.ts), the ops commands and
+ * the past-guest view, so a row the runner would refuse cannot vouch for a
+ * feed either; a row that does not fit counts as missing (C6.5). provenance
+ * always comes out set: a row stored without it reads as "directory" when
+ * its feedHandleSource is "directory" and "pasted" otherwise. A row whose
+ * provenance and feedHandleSource disagree ("pasted" goes only with
+ * "visitor") is one the code never writes, and fails.
+ */
+export const storedCandidateRow = z
+  .strictObject({
+    appleId: z.string().max(20).nullable(),
+    name: z.string().min(1).max(200),
+    publisher: z.string().max(200),
+    feedHandleSource: z.enum(["directory", "visitor"]),
+    provenance: z.enum(FEED_SOURCES).optional(),
+    feedUrl: z.string().max(8_192).nullable(),
+    qlooId: z.string().regex(QLOO_ID),
+    qlooName: z.string().min(1).max(200),
+  })
+  .refine((row) => row.provenance === undefined || (row.provenance === "pasted") === (row.feedHandleSource === "visitor"))
+  .transform((row) => ({ ...row, provenance: provenanceOf(row) }));
+
+type CheckedFeed = { source: FeedSource; name: string | null; publisher: string | null };
+
+// Read back from the database, so cleaned again where it is shown (C3.7).
+// The row's own schema already caps it at 200.
+const shownName = (text: string): string => cleanText(text, { maxChars: 200 }).trim();
+
+// The feed the check read: the candidate the board event names. An older
+// event did not name one, but one run's candidates all come from one place,
+// so they give the source they agree on, and a name only when there was a
+// single candidate to confirm. A row that does not read back, or no row at
+// all, leaves the feed unknown rather than assumed.
+function checkedFeed(candidates: ReadonlyArray<{ id: string; data: unknown } | null>, candidateId: string | undefined): CheckedFeed | null {
+  if (candidateId !== undefined) {
+    const confirmed = storedCandidateRow.safeParse(candidates.find((item) => item?.id === candidateId)?.data);
+    if (!confirmed.success) return null;
+    return { source: confirmed.data.provenance, name: shownName(confirmed.data.name), publisher: shownName(confirmed.data.publisher) };
+  }
+  const rows: Array<z.output<typeof storedCandidateRow>> = [];
+  for (const item of candidates) {
+    const parsed = storedCandidateRow.safeParse(item?.data);
+    if (!parsed.success) return null;
+    rows.push(parsed.data);
+  }
+  const [first] = rows;
+  if (first === undefined || rows.some((row) => row.provenance !== first.provenance)) return null;
+  const single = rows.length === 1;
+  return { source: first.provenance, name: single ? shownName(first.name) : null, publisher: single ? shownName(first.publisher) : null };
+}
+
+/**
+ * The public view of a run's past-guest check, picked by name from its
+ * "board" event's data: checked, episodes (how many feed titles were
+ * checked), since ("YYYY-MM" of the oldest dated one, or null) and
+ * archiveTitles (lines of an operator's archive, 0 when none), plus source,
+ * feedName and feedPublisher from the confirmed candidate in `candidates`,
+ * the run's stored candidates as { id, data } (null for a row that did not
+ * read back): its provenance ("directory", "linked" or "pasted") and its
+ * name and publisher, cleaned with cleanText. The skipped count and
+ * candidateId stay private. Every candidate read must pass
+ * storedCandidateRow, the runner's own schema. For an event that names its
+ * candidate, that row must read back and its provenance must equal the
+ * event's source. An event written before the candidate was recorded gets
+ * the provenance every stored candidate agrees on, and a name and publisher
+ * only when the run had one candidate (null otherwise). Anything else, or
+ * an event that is not exactly the runner's shape or was written before
+ * titles were counted, gives null (C6.5, D5.5). Pure; never throws.
+ */
+export function publicPastGuests(event: unknown, candidates: ReadonlyArray<{ id: string; data: unknown } | null>): PublicPastGuests | null {
+  const parsed = boardEvent.safeParse(event);
+  if (!parsed.success) return null;
+  const check = parsed.data.pastGuests;
+  const feed = checkedFeed(candidates, check.candidateId);
+  if (feed === null || (check.source !== undefined && check.source !== feed.source)) return null;
+  return {
+    checked: check.checked,
+    episodes: check.titles,
+    since: check.since,
+    source: feed.source,
+    feedName: feed.name,
+    feedPublisher: feed.publisher,
+    archiveTitles: check.archiveTitles ?? 0,
+  };
+}
+
+const ownerRow = z.object({ run_id: z.string().refine(isId) });
+const runEventRow = z.object({ run_id: z.string().refine(isId), data: storedJson(MAX_EVENT_JSON) });
+
+// Each run's latest board event and its candidates, in at most two SELECTs
+// whatever the number of runs.
+async function pastGuestsOf(db: Db, runIds: readonly string[]): Promise<Map<string, PublicPastGuests | null>> {
+  const ids = runIds.filter(isId);
+  const found = new Map<string, PublicPastGuests | null>();
+  if (ids.length === 0) return found;
+  const { rows } = await stored(() =>
+    db.query(
+      `SELECT DISTINCT ON (run_id) run_id::text AS run_id, data::text AS data FROM run_events
+       WHERE run_id = ANY ($1::uuid[]) AND event = $2 ORDER BY run_id, seq DESC`,
+      [ids, "board"],
+    ),
+  );
+  const events = new Map<string, unknown>();
+  for (const row of rows) {
+    const parsed = runEventRow.safeParse(row);
+    if (parsed.success) events.set(parsed.data.run_id, parsed.data.data);
+  }
+  const withEvents = [...events.keys()];
+  const candidates = new Map<string, Array<{ id: string; data: unknown } | null>>();
+  if (withEvents.length > 0) {
+    const listed = await stored(() =>
+      db.query(
+        `SELECT run_id::text AS run_id, candidate_id::text AS id, data::text AS data FROM run_candidates
+         WHERE run_id = ANY ($1::uuid[]) ORDER BY run_id, rank LIMIT $2`,
+        [withEvents, withEvents.length * MAX_CANDIDATES],
+      ),
+    );
+    for (const row of listed.rows) {
+      const owner = ownerRow.safeParse(row);
+      if (!owner.success) continue;
+      // A row that does not read back stays as null, so an older event's run
+      // is refused rather than judged from the rows that remain.
+      const item = itemRow.safeParse(row);
+      const list = candidates.get(owner.data.run_id) ?? [];
+      list.push(item.success ? item.data : null);
+      candidates.set(owner.data.run_id, list);
+    }
+  }
+  for (const id of ids) found.set(id, events.has(id) ? publicPastGuests(events.get(id), candidates.get(id) ?? []) : null);
+  return found;
+}
+
+/**
+ * Reads a run's latest "board" event through publicPastGuests, with the
+ * run's stored candidates, which say which feed was checked.
+ * Returns null, without querying, for anything that is not a lower-case
+ * UUID, and null when the run has no board event or it does not read back.
+ * Throws ServerError("SRV_UNAVAILABLE") if the database fails.
+ */
+export async function getPastGuests(db: Db, runId: string): Promise<PublicPastGuests | null> {
+  if (!isId(runId)) return null;
+  return (await pastGuestsOf(db, [runId])).get(runId) ?? null;
+}
+
+/**
+ * What the home page shows for one run: its show name, its first 3 board
+ * guests, each with its reach through publicReach and only the shared tags
+ * isShowableTag passes today (C3.10), and `pastGuests`, the run's publicPastGuests view (null when it has
+ * none). `board` is the run's board from rank 1 down (at least its first 3
  * rows), with null in place of a row that failed its schema. Returns null
  * unless `status` is done, the board has at least 3 rows, the first 3 all
  * parsed, and they name the same show. A damaged or unfinished run is never
@@ -1096,7 +1463,8 @@ export async function getWithoutQloo(db: Db, runId: string): Promise<PublicWitho
 export function showcaseView(
   status: RunStatus,
   board: ReadonlyArray<{ id: string; guest: StoredBoardGuest } | null>,
-): { showName: string; guests: ShowcaseGuest[] } | null {
+  pastGuests: PublicPastGuests | null = null,
+): { showName: string; guests: ShowcaseGuest[]; pastGuests: PublicPastGuests | null } | null {
   if (status !== "done") return null;
   const top: Array<{ id: string; guest: StoredBoardGuest }> = [];
   for (const item of board.slice(0, SHOWCASE_GUESTS)) {
@@ -1114,11 +1482,12 @@ export function showcaseView(
       name: guest.name,
       fit: guest.fit,
       fitKnown: guest.fitKnown,
-      reach: guest.reach,
+      reach: publicReach(guest.reach),
       rising: guest.rising.state,
       bringsNew: guest.bringsNew?.label ?? null,
-      sharedTags: [...guest.sharedTags],
+      sharedTags: guest.sharedTags.filter(isShowableTag),
     })),
+    pastGuests,
   };
 }
 
@@ -1128,12 +1497,13 @@ const showcaseBoardRow = z.object({ id: z.string().refine(isId), data: storedBoa
 
 /**
  * Lists the runs the operator promoted to the home page, by position, each
- * with its show name, finish time and first 3 board guests in rank order
- * (C6.3). A promoted run is listed only when its showcase row, its run row
- * and its first 3 board rows all pass their schemas and showcaseView accepts
- * it; any other promoted run is skipped (C6.4, C6.5). Two SELECTs read at
- * most 12 runs and 36 board rows, so it calls nothing upstream, changes
- * nothing (C5.4), and the app role may run it. Throws
+ * with its show name, finish time, first 3 board guests in rank order and
+ * pastGuests, its publicPastGuests view or null (C6.3). A promoted run is
+ * listed only when its showcase row, its run row and its first 3 board rows
+ * all pass their schemas and showcaseView accepts it; any other promoted run
+ * is skipped (C6.4, C6.5). At most four SELECTs read at most 12 runs, 36
+ * board rows, 12 board events and 120 candidate rows, so it calls nothing
+ * upstream, changes nothing (C5.4), and the app role may run it. Throws
  * ServerError("SRV_UNAVAILABLE") if the database fails.
  */
 export async function listShowcase(db: Db): Promise<ShowcaseRun[]> {
@@ -1179,11 +1549,22 @@ export async function listShowcase(db: Db): Promise<ShowcaseRun[]> {
     boards.set(owner.data.run_id, board);
   }
 
+  const coverage = await pastGuestsOf(
+    db,
+    runs.map((run) => run.id),
+  );
   const shown: ShowcaseRun[] = [];
   for (const run of runs) {
-    const view = showcaseView(run.status, boards.get(run.id) ?? []);
+    const view = showcaseView(run.status, boards.get(run.id) ?? [], coverage.get(run.id) ?? null);
     if (view === null) continue;
-    shown.push({ runId: run.id, position: run.position, showName: view.showName, finishedAt: run.finishedAt, guests: view.guests });
+    shown.push({
+      runId: run.id,
+      position: run.position,
+      showName: view.showName,
+      finishedAt: run.finishedAt,
+      guests: view.guests,
+      pastGuests: view.pastGuests,
+    });
   }
   return shown;
 }

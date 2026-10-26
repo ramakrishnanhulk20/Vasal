@@ -77,8 +77,10 @@ function signalFor(own: AbortSignal | undefined, caller: AbortSignal | undefined
  *
  * Each method resolves to the parsed JSON object body (at most 1,000,000
  * bytes) and rejects with a QlooError: QLOO_BAD_INPUT for a refused query,
- * QLOO_BUDGET, QLOO_TIMEOUT, or the code for an HTTP failure. It never
- * retries. A StoreError from the database passes through unchanged.
+ * QLOO_BUDGET, QLOO_TIMEOUT, or the code for an HTTP failure. It adds no
+ * retry of its own: the metered callRaw tries a 429 or 5xx at most three
+ * times, each on a fresh slot. A StoreError from the database passes through
+ * unchanged.
  */
 export function createMeteredHarnessClient(deps: { qloo: MeteredRawQloo; signal?: AbortSignal }): QlooToolClient {
   const send = async (path: RawQlooPath, query: HarnessQuery | undefined, options: HarnessOptions): Promise<HarnessAnswer> => {

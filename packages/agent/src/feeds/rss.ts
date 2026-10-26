@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { cleanText } from "../text/normalize.js";
 import { FeedError } from "./errors.js";
 
 export type FeedEpisode = {
@@ -6,9 +7,10 @@ export type FeedEpisode = {
   publishedAt: string | null;
   guid: string | null;
   durationSec: number | null;
+  description: string | null;
 };
 
-export type ParsedFeed = { title: string; episodes: FeedEpisode[] };
+export type ParsedFeed = { title: string; authors: string[]; episodes: FeedEpisode[] };
 
 const MAX_DEPTH = 32;
 // The 10 MB cap on decoded bytes is what bounds memory. This cap only stops
@@ -19,6 +21,9 @@ const MAX_ELEMENTS = 300_000;
 const MAX_EPISODES = 2_000;
 const MAX_TITLE_CHARS = 500;
 const MAX_DATE_CHARS = 100;
+const MAX_DESCRIPTION_CHARS = 2_000;
+const MAX_AUTHORS = 4;
+const MAX_AUTHOR_CHARS = 200;
 const DOCTYPE = /<!doctype/i;
 // fast-xml-parser 5.11.2 throws a plain Error with this exact text when
 // maxNestedTags is exceeded. The depth test pins it, so a library change that
@@ -119,13 +124,50 @@ function durationSeconds(value: unknown): number | null {
   return null;
 }
 
-function episode(title: unknown, date: unknown, guid: unknown, duration: unknown): FeedEpisode {
+// Bounded, so a stray "<" with no ">" after it costs at most this many steps
+// and stays in the text instead of swallowing the rest of it.
+const HTML_TAG = /<[^<>]{0,500}>/g;
+const HTML_ENTITY = /&(?:#\d{1,7}|#x[0-9a-f]{1,6}|[a-z][a-z0-9]{1,31});/gi;
+
+// Trimmed between cleaning and the cap, so spaces left where tags were never
+// use up the cap.
+function plainText(text: string, maxChars: number): string {
+  const whole = cleanText(text, { maxChars: Number.POSITIVE_INFINITY }).trim();
+  return cleanText(whole, { maxChars }).trim();
+}
+
+// Show notes arrive as HTML, usually inside CDATA. Tags and the entities left
+// after the XML escapes are decoded become spaces, so "Peyton<br>Manning"
+// still reads as two words.
+function descriptionOf(summary: unknown, description: unknown): string | null {
+  const text = textOf(summary) ?? textOf(description);
+  if (text === null) return null;
+  const plain = plainText(text.replace(HTML_TAG, " ").replace(HTML_ENTITY, " "), MAX_DESCRIPTION_CHARS);
+  return plain === "" ? null : plain;
+}
+
+function episode(title: unknown, date: unknown, guid: unknown, duration: unknown, description: string | null): FeedEpisode {
   return {
     title: capChars(textOf(title) ?? "", MAX_TITLE_CHARS),
     publishedAt: isoDate(date),
     guid: cappedText(guid, MAX_TITLE_CHARS),
     durationSec: durationSeconds(duration),
+    description,
   };
+}
+
+// The names a show's own feed gives for who makes it. They are the hosts far
+// more often than a guest, so they only ever leave people off the board.
+function authorsOf(channel: XmlNode): string[] {
+  const owners = asList(channel["itunes:owner"]).map((owner) => (isNode(owner) ? owner["itunes:name"] : undefined));
+  const authors: string[] = [];
+  for (const value of [...asList(channel["itunes:author"]), ...owners]) {
+    const text = textOf(value);
+    const name = text === null ? "" : plainText(text, MAX_AUTHOR_CHARS);
+    if (name !== "" && !authors.includes(name)) authors.push(name);
+    if (authors.length === MAX_AUTHORS) break;
+  }
+  return authors;
 }
 
 function newestFirst(episodes: FeedEpisode[]): FeedEpisode[] {
@@ -141,23 +183,36 @@ function newestFirst(episodes: FeedEpisode[]): FeedEpisode[] {
 function fromRss(channel: XmlNode): ParsedFeed {
   const episodes = asList(channel["item"])
     .filter(isNode)
-    .map((item) => episode(item["title"], item["pubDate"], item["guid"], item["itunes:duration"]));
-  return { title: capChars(textOf(channel["title"]) ?? "", MAX_TITLE_CHARS), episodes: newestFirst(episodes) };
+    .map((item) =>
+      episode(item["title"], item["pubDate"], item["guid"], item["itunes:duration"], descriptionOf(item["itunes:summary"], item["description"])),
+    );
+  return { title: capChars(textOf(channel["title"]) ?? "", MAX_TITLE_CHARS), authors: authorsOf(channel), episodes: newestFirst(episodes) };
 }
 
 function fromAtom(feed: XmlNode): ParsedFeed {
   const episodes = asList(feed["entry"])
     .filter(isNode)
     .map((entry) =>
-      episode(entry["title"], entry["published"] ?? entry["updated"], entry["id"], entry["itunes:duration"]),
+      episode(
+        entry["title"],
+        entry["published"] ?? entry["updated"],
+        entry["id"],
+        entry["itunes:duration"],
+        descriptionOf(entry["itunes:summary"], entry["description"]),
+      ),
     );
-  return { title: capChars(textOf(feed["title"]) ?? "", MAX_TITLE_CHARS), episodes: newestFirst(episodes) };
+  return { title: capChars(textOf(feed["title"]) ?? "", MAX_TITLE_CHARS), authors: authorsOf(feed), episodes: newestFirst(episodes) };
 }
 
 /**
  * Reads an RSS 2.0 (rss > channel > item) or Atom (feed > entry) document
- * into a show title and its newest 2,000 episodes, newest first. Titles are
- * capped at 500 characters. Episodes with no readable date sort last.
+ * into a show title, its authors and its newest 2,000 episodes, newest
+ * first. Titles are capped at 500 characters. Episodes with no readable date
+ * sort last. Each episode's description is its itunes:summary, else its
+ * description, with HTML tags and entities taken out, cleaned (cleanText)
+ * and capped at 2,000 characters, or null when none is left. authors are the
+ * channel's itunes:author and itunes:owner's itunes:name, in that order,
+ * cleaned, each capped at 200 characters, duplicates dropped, at most 4.
  *
  * Throws FeedError:
  * - FEED_DOCTYPE_REJECTED if the text holds a DOCTYPE declaration, in any

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { mcpEnabled } from "../mcp/tokens.js";
+import { SLOT_HOLDING_STATUSES } from "../server/caps.js";
 import type { Db } from "../store/db.js";
 import { liveRunsEnabled } from "../store/flags.js";
 import { profileFor, type BudgetPolicy } from "./policy.js";
@@ -45,7 +46,8 @@ const MCP_INFLIGHT_SLOT = "mcp";
 const MAX_BUCKET_ROWS = 200;
 // Two weeks gives the operator time to add a profile after the warning.
 const POLICY_LOOKAHEAD_DAYS = 14;
-const RESTART_HINT = "If the next health check shows it too, restart the agent server, which resets the counter.";
+const RECONCILE_HINT =
+  "If the next health check shows it too, run ops reconcile, which lowers the counter to the runs that hold it, or restart the agent server.";
 
 // pg returns bigint columns as digit strings and PGlite as numbers (C6.5).
 const count = z
@@ -119,12 +121,14 @@ async function readAgentKeys(db: Db): Promise<{ live: number; revoked: number }>
 }
 
 // A run holds its place from just before it is created until just after it
-// ends, so a queued run counts too. A place whose release failed holds the
-// counter up with nothing behind it until a restart (G23).
+// ends, so a queued run counts too. The statuses are the ones
+// reconcileInflight counts. A place whose release failed holds the counter
+// up with nothing behind it until a reconcile or a restart (G23).
 async function readActiveRuns(db: Db): Promise<{ all: number; mcp: number }> {
   const { rows } = await db.query(
     `SELECT count(*)::int AS all_runs, count(*) FILTER (WHERE surface = 'mcp')::int AS mcp_runs
-     FROM runs WHERE status IN ('queued', 'running')`,
+     FROM runs WHERE status = ANY($1::text[])`,
+    [SLOT_HOLDING_STATUSES],
   );
   const parsed = ActiveRow.parse(rows[0]);
   return { all: parsed.all_runs, mcp: parsed.mcp_runs };
@@ -132,15 +136,24 @@ async function readActiveRuns(db: Db): Promise<{ all: number; mcp: number }> {
 
 const lost = (n: number) => (n === 1 ? "places is lost" : "places are lost");
 
+function holding(count: number, kind: string): string {
+  if (count === 0) return `no ${kind} is`;
+  return count === 1 ? `only 1 ${kind} is` : `only ${grouped.format(count)} ${kind}s are`;
+}
+
 function lostSlotProblems(inflight: number | null, mcpInflight: number | null, active: { all: number; mcp: number }): string[] {
   const problems: string[] = [];
-  if (inflight !== null && inflight > 0 && active.all === 0) {
-    const n = grouped.format(inflight);
-    problems.push(`The in-progress run counter is at ${n}, but no run is queued or running, so ${n} of the site's run ${lost(inflight)}. ${RESTART_HINT}`);
+  if (inflight !== null && inflight > active.all) {
+    const extra = inflight - active.all;
+    problems.push(
+      `The in-progress run counter is at ${grouped.format(inflight)}, but ${holding(active.all, "run")} queued or running, so ${grouped.format(extra)} of the site's run ${lost(extra)}. ${RECONCILE_HINT}`,
+    );
   }
-  if (mcpInflight !== null && mcpInflight > 0 && active.mcp === 0) {
-    const n = grouped.format(mcpInflight);
-    problems.push(`The MCP in-progress run counter is at ${n}, but no MCP run is queued or running, so ${n} of MCP's run ${lost(mcpInflight)}. ${RESTART_HINT}`);
+  if (mcpInflight !== null && mcpInflight > active.mcp) {
+    const extra = mcpInflight - active.mcp;
+    problems.push(
+      `The MCP in-progress run counter is at ${grouped.format(mcpInflight)}, but ${holding(active.mcp, "MCP run")} queued or running, so ${grouped.format(extra)} of MCP's run ${lost(extra)}. ${RECONCILE_HINT}`,
+    );
   }
   return problems;
 }
@@ -193,13 +206,14 @@ function bucketProblems(buckets: BucketHealth[]): string[] {
  * part that could not be read; no buckets at all; a bucket whose window has
  * ended at or before `now` (it fails closed, C5.7); a bucket with cap 0; a
  * bucket at or over 80 percent of its cap; live runs being off; the site's
- * or MCP's in-progress counter above 0 while no run (for MCP, no MCP run) is
- * queued or running, which is a place lost to a failed release until a
- * restart (G23), and which a check at the very moment a run takes or gives
- * back its place can also show once; and the first day from today to 14
- * days after `now` that no profile in `policy` covers, or `policy` being
- * null, which means the caller could not read it. MCP being off is reported
- * but is not a problem, because the operator may keep it off on purpose.
+ * or MCP's in-progress counter above the number of runs (for MCP, MCP runs)
+ * queued or running, which is a place lost to a failed release until ops
+ * reconcile or a restart (G23), and which a check at the very moment a run
+ * takes or gives back its place can also show once; and the first day from
+ * today to 14 days after `now` that no profile in `policy` covers, or
+ * `policy` being null, which means the caller could not read it. MCP being
+ * off is reported but is not a problem, because the operator may keep it
+ * off on purpose.
  * Only SELECTs run, so either role can call it. An invalid `now` falls back
  * to the clock. Never throws, and the report never holds a connection
  * string, a key or a driver message.
@@ -265,7 +279,7 @@ export function formatHealth(report: HealthReport): string[] {
     lines.push(`  Runs started in the last 24 hours: ${runText}`);
     lines.push(`  Runs in progress: ${report.inflight ?? "unknown"}`);
     lines.push(`  MCP runs in progress: ${report.mcpInflight ?? "unknown"}`);
-    lines.push(`  Cached Qloo answers: ${report.cacheRows === null ? "unknown" : grouped.format(report.cacheRows)}`);
+    lines.push(`  Cached Qloo and Apple answers: ${report.cacheRows === null ? "unknown" : grouped.format(report.cacheRows)}`);
     const buckets = report.buckets ?? [];
     lines.push(report.buckets === null ? "  Budgets: unknown" : buckets.length === 0 ? "  Budgets: none" : "  Budgets:");
     for (const bucket of buckets) {

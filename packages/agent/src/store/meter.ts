@@ -5,6 +5,12 @@ import { StoreError } from "./errors.js";
 
 export type Reservation = { key: string; amount: number };
 export type BucketPolicy = { key: string; cap: number; windowEnd: Date };
+/**
+ * What reserveWithReceipt reserved: one item per key with the summed amount,
+ * and each bucket's window_end (ISO) at that moment, so a refund can tell
+ * whether the window it was charged in is still the bucket's window.
+ */
+export type Receipt = { items: Reservation[]; windowEnds: Record<string, string> };
 
 const MAX_ITEMS = 8;
 const MAX_AMOUNT = 1_000_000;
@@ -39,7 +45,7 @@ const instant = z
 const bucketRow = z.object({ key: z.string(), cap: count, used: count, window_end: instant });
 type BucketRow = z.output<typeof bucketRow>;
 
-type Outcome = { ok: true } | { ok: false; refused: string[] };
+type Outcome = { ok: true; windowEnds: Map<string, Date> } | { ok: false; refused: string[] };
 
 const badInput = (): StoreError => new StoreError("STORE_BAD_INPUT");
 
@@ -117,7 +123,7 @@ async function reserveWithin(
      WHERE b.key = v.key`,
     [keys, entries.map(([, amount]) => amount)],
   );
-  return { ok: true };
+  return { ok: true, windowEnds: new Map(keys.map((key) => [key, buckets.get(key)!.window_end])) };
 }
 
 /**
@@ -163,6 +169,127 @@ export async function reserve(db: Db, items: Reservation[], now: Date = new Date
   const totals = totalsOf(items);
   checkInstant(now);
   return db.transaction(async (tx) => (await reserveWithin(tx, totals, now)).ok);
+}
+
+/**
+ * reserve, with the same checks in the same one transaction, that also says
+ * what it took. Returns a Receipt (one item per key with duplicates summed,
+ * and each bucket's window_end as it stood under the lock) when every amount
+ * was added, and null, changing nothing, on any failed check. Throws exactly
+ * what reserve throws.
+ */
+export async function reserveWithReceipt(db: Db, items: Reservation[], now: Date = new Date()): Promise<Receipt | null> {
+  const totals = totalsOf(items);
+  checkInstant(now);
+  const outcome = await db.transaction((tx) => reserveWithin(tx, totals, now));
+  if (!outcome.ok) return null;
+  return {
+    items: [...totals].map(([key, amount]) => ({ key, amount })),
+    windowEnds: Object.fromEntries([...outcome.windowEnds].map(([key, end]) => [key, end.toISOString()])),
+  };
+}
+
+// delta is negative to give back and positive to charge more.
+type Change = { key: string; delta: number; windowEnd: string };
+
+// The receipt is read back like any input: a repeated key would let a
+// refund give back more than one reservation took, so it is refused.
+function reservedOf(receipt: unknown): Map<string, { amount: number; windowEnd: string }> {
+  if (typeof receipt !== "object" || receipt === null) throw badInput();
+  const { items, windowEnds } = receipt as { items?: unknown; windowEnds?: unknown };
+  const totals = totalsOf(items);
+  if (totals.size !== (items as unknown[]).length || typeof windowEnds !== "object" || windowEnds === null) throw badInput();
+  const reserved = new Map<string, { amount: number; windowEnd: string }>();
+  for (const [key, amount] of totals) {
+    const end = Object.hasOwn(windowEnds, key) ? (windowEnds as Record<string, unknown>)[key] : undefined;
+    if (typeof end !== "string") throw badInput();
+    reserved.set(key, { amount, windowEnd: checkInstant(new Date(end)).toISOString() });
+  }
+  return reserved;
+}
+
+function givesOf(amounts: unknown, reserved: Map<string, { amount: number; windowEnd: string }>): Change[] {
+  if (typeof amounts !== "object" || amounts === null || Array.isArray(amounts)) throw badInput();
+  const gives: Change[] = [];
+  for (const [key, amount] of Object.entries(amounts)) {
+    const held = reserved.get(key);
+    if (held === undefined || typeof amount !== "number" || !Number.isSafeInteger(amount) || amount < 0 || amount > MAX_AMOUNT) {
+      throw badInput();
+    }
+    const give = Math.min(amount, held.amount);
+    if (give > 0) gives.push({ key, delta: -give, windowEnd: held.windowEnd });
+  }
+  return gives;
+}
+
+// Held by object identity, so settling the same call twice, through refund
+// or settleToUsage, can never give back or charge its tokens twice. A
+// settle the database refused frees it again.
+const settled = new WeakSet<object>();
+
+async function settleOnce(db: Db, receipt: Receipt, changes: Change[]): Promise<void> {
+  if (settled.has(receipt)) return;
+  settled.add(receipt);
+  if (changes.length === 0) return;
+  const keys = changes.map((change) => change.key);
+  try {
+    await db.transaction(async (tx) => {
+      await tx.query(`SELECT key FROM usage_buckets WHERE key = ANY($1::text[]) ORDER BY key COLLATE "C" FOR UPDATE`, [keys]);
+      await tx.query(
+        `UPDATE usage_buckets AS b SET used = GREATEST(b.used + v.delta, 0)
+         FROM unnest($1::text[], $2::bigint[], $3::timestamptz[]) AS v(key, delta, window_end)
+         WHERE b.key = v.key AND date_trunc('milliseconds', b.window_end) = v.window_end`,
+        [keys, changes.map((change) => change.delta), changes.map((change) => change.windowEnd)],
+      );
+    });
+  } catch (error) {
+    settled.delete(receipt);
+    throw error;
+  }
+}
+
+/**
+ * Gives back part of what reserveWithReceipt took. For each key in
+ * `amounts` it lowers used by that amount, but by no more than the receipt
+ * reserved for the key, never below 0, and only on a bucket whose window_end
+ * (compared to the millisecond) still equals the receipt's, so tokens
+ * reserved in a window that has since rolled are never taken off the new
+ * one. A receipt settles once, through this or settleToUsage: every later
+ * call with the same receipt object changes nothing, unless the earlier one
+ * threw. The buckets are locked in the same sorted order reserve uses, in
+ * one transaction. Throws StoreError("STORE_BAD_INPUT") for a receipt that
+ * is not one reserve could give, a key the receipt does not hold, or an
+ * amount that is not a whole number from 0 to 1,000,000, before anything
+ * changes, and StoreError("STORE_UNAVAILABLE") if the database fails.
+ */
+export async function refund(db: Db, receipt: Receipt, amounts: Record<string, number>): Promise<void> {
+  await settleOnce(db, receipt, givesOf(amounts, reservedOf(receipt)));
+}
+
+/**
+ * The settle callback for a model call: given the tokens the call really
+ * used, it moves each item of `receipt` to that count (C5.1). An item that
+ * reserved more than was used gets the difference back, as refund gives it.
+ * An item that reserved less is charged the difference as one more add,
+ * which is never refused and never checked against the cap, so the meter
+ * never counts fewer tokens than the call used; a bucket taken past its cap
+ * this way refuses every later reservation until its window rolls. Equal
+ * changes nothing. Either way it acts only on a bucket whose window_end
+ * still equals the receipt's, so a window that has rolled since is left
+ * alone, and a receipt settles once, as for refund. Throws
+ * StoreError("STORE_BAD_INPUT") for a used that is not a whole number from 0
+ * or a receipt reserve could not give, before anything changes, and
+ * StoreError("STORE_UNAVAILABLE") if the database fails.
+ */
+export function settleToUsage(db: Db, receipt: Receipt): (used: number) => Promise<void> {
+  return async (used) => {
+    if (!Number.isSafeInteger(used) || used < 0) throw badInput();
+    const changes: Change[] = [];
+    for (const [key, held] of reservedOf(receipt)) {
+      if (used !== held.amount) changes.push({ key, delta: used - held.amount, windowEnd: held.windowEnd });
+    }
+    await settleOnce(db, receipt, changes);
+  };
 }
 
 /**

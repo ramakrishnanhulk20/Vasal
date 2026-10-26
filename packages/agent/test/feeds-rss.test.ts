@@ -1,6 +1,8 @@
 // Not covered here: downloading feeds (safe-fetch.test.ts), feeds in encodings
-// other than UTF-8, RSS 1.0 beyond refusing it, and podcast tags other than
-// itunes:duration. Every feed below is synthetic.
+// other than UTF-8, RSS 1.0 beyond refusing it, podcast tags other than
+// itunes:duration, itunes:summary, itunes:author and itunes:owner, and HTML
+// in a description that is neither inside CDATA nor escaped. Every feed
+// below is synthetic.
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -55,12 +57,13 @@ describe("reading RSS 2.0 and Atom", () => {
     );
     expect(feed.title).toBe("The Show");
     expect(feed.episodes).toEqual([
-      { title: "Hours", publishedAt: "2026-10-12T07:01:00.000Z", guid: "g-1", durationSec: 3723 },
-      { title: "Minutes", publishedAt: "2026-10-05T07:01:00.000Z", guid: null, durationSec: 2712 },
-      { title: "Seconds & more", publishedAt: "2026-09-28T07:01:00.000Z", guid: null, durationSec: 3600 },
-      { title: "Bad duration", publishedAt: "2026-09-21T07:01:00.000Z", guid: null, durationSec: null },
-      { title: "No date", publishedAt: null, guid: null, durationSec: null },
+      { title: "Hours", publishedAt: "2026-10-12T07:01:00.000Z", guid: "g-1", durationSec: 3723, description: null },
+      { title: "Minutes", publishedAt: "2026-10-05T07:01:00.000Z", guid: null, durationSec: 2712, description: null },
+      { title: "Seconds & more", publishedAt: "2026-09-28T07:01:00.000Z", guid: null, durationSec: 3600, description: null },
+      { title: "Bad duration", publishedAt: "2026-09-21T07:01:00.000Z", guid: null, durationSec: null, description: null },
+      { title: "No date", publishedAt: null, guid: null, durationSec: null, description: null },
     ]);
+    expect(feed.authors).toEqual([]);
   });
 
   it("reads an Atom feed, using updated when published is missing", () => {
@@ -108,6 +111,73 @@ describe("reading RSS 2.0 and Atom", () => {
       "Tom &amp; Jerry ’s \u{1F600} <b>",
       "&nbsp; &#0; &#xD800; '",
     ]);
+  });
+});
+
+describe("episode descriptions and feed authors", () => {
+  const owner = (name: string) => `<itunes:owner><itunes:name>${name}</itunes:name><itunes:email>x@example.com</itunes:email></itunes:owner>`;
+  const dated = (day: number) => new Date(Date.UTC(2026, 9, 12) - day * 86_400_000).toUTCString();
+
+  it("takes the HTML out of a CDATA description, prefers itunes:summary, and gives null when there is none", () => {
+    const feed = parseFeed(
+      rss(
+        [
+          item(
+            "Notes",
+            dated(0),
+            '<description><![CDATA[<p>Peyton<br/>and <a href="https://x.example">Eli Manning</a> &amp; friends&nbsp;&mdash; live</p>]]></description>',
+          ),
+          item("Escaped", dated(1), "<description>&lt;b&gt;Julie Ertz&lt;/b&gt; &amp;amp; Zach</description>"),
+          item("Summary first", dated(2), "<itunes:summary>From the summary</itunes:summary><description>From the description</description>"),
+          item("None", dated(3)),
+          item("Only tags", dated(4), "<description><![CDATA[<p> </p><br>]]></description>"),
+          item("Stray bracket", dated(5), "<description>Rates &lt; five with Peyton Manning</description>"),
+        ].join(""),
+      ),
+    );
+    expect(feed.episodes.map((episode) => episode.description)).toEqual([
+      "Peyton and Eli Manning & friends live",
+      "Julie Ertz Zach",
+      "From the summary",
+      null,
+      null,
+      "Rates < five with Peyton Manning",
+    ]);
+  });
+
+  it("removes invisible and control characters and caps a description at 2,000 characters", () => {
+    const feed = parseFeed(
+      rss(
+        [
+          item("Long", dated(0), `<description><![CDATA[<p>${"\u{1F600}".repeat(2_100)}</p>]]></description>`),
+          item("Hidden", dated(1), "<description>Ste​phen\u0007 Colbert‮</description>"),
+        ].join(""),
+      ),
+    );
+    expect(feed.episodes[0]?.description).toBe("\u{1F600}".repeat(2_000));
+    expect(feed.episodes[1]?.description).toBe("Stephen Colbert");
+  });
+
+  it("reads itunes:author, then itunes:owner's name, cleaned, without repeats", () => {
+    const feed = parseFeed(
+      rss(`<itunes:author>Jason Kelce &amp; Travis Kelce</itunes:author>${owner("Wondery")}${owner("Jason Kelce &amp; Travis Kelce")}${item("One")}`),
+    );
+    expect(feed.authors).toEqual(["Jason Kelce & Travis Kelce", "Wondery"]);
+  });
+
+  it("keeps at most 4 authors of at most 200 characters each", () => {
+    const authors = Array.from({ length: 6 }, (_, n) => `<itunes:author>Author ${n}</itunes:author>`).join("");
+    expect(parseFeed(rss(`${authors}${owner("Owner")}${item("One")}`)).authors).toEqual(["Author 0", "Author 1", "Author 2", "Author 3"]);
+    expect(parseFeed(rss(`${owner("y".repeat(300))}${item("One")}`)).authors).toEqual(["y".repeat(200)]);
+  });
+
+  it("keeps the 2,000-episode cap with a description on every episode", () => {
+    const items = Array.from({ length: 2_050 }, (_, n) =>
+      item(`Episode ${n}`, new Date(Date.UTC(2010, 0, 1) + n * 86_400_000).toUTCString(), `<description><![CDATA[<p>Guest ${n}</p>]]></description>`),
+    );
+    const feed = parseFeed(rss(items.join("")));
+    expect(feed.episodes).toHaveLength(2_000);
+    expect(feed.episodes[0]?.description).toBe("Guest 2049");
   });
 });
 

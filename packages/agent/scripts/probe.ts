@@ -2,7 +2,17 @@
 // needs? Prints a coverage table. Raw responses go only to the git-ignored
 // data/probe folder, because Qloo's terms forbid its data in a public repo.
 //
-// Usage: npm run probe -- [--dry-run] [--limit N] [--max-calls N]
+// A live run opens the owner database (OWNER_DATABASE_URL, or --tunnel
+// <port> as scripts/ops.ts takes it) and records Qloo's own monthly count
+// from every reply there. Before each request it reads the stored count, which
+// any process on that database may have written, and stops once it is under
+// 1,500 and under 24 hours old (quotaAllows, the meter's own rule). The
+// harness's requests are not read by that check: their replies never pass
+// through this client, so the count is checked only before qloo_recommend
+// starts. Nor are the client's own retries inside one request, at most 2. A
+// dry run opens no database.
+//
+// Usage: npm run probe -- [--dry-run] [--limit N] [--max-calls N] [--tunnel <port>]
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,14 +21,22 @@ import { parseArgs } from "node:util";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { loadQlooConfig, type QlooConfig } from "../src/config.js";
+import { loadRepoEnv, OpsConfigError, openOwnerDb, tunnelPortFrom } from "../src/ops/db.js";
 import { createQlooClient } from "../src/qloo/client.js";
 import { QlooError, type QlooErrorCode } from "../src/qloo/errors.js";
 import { startHarness, type QlooHarness } from "../src/qloo/harness.js";
 import { buildQlooRequest, type BuiltRequest, type EntityType, type QlooOperation } from "../src/qloo/request.js";
 import type { QlooCompareResult, QlooDemographic, QlooEntity, QlooTrendRow } from "../src/qloo/schemas.js";
+import type { Db } from "../src/store/db.js";
+import { StoreError } from "../src/store/errors.js";
+import { QLOO_QUOTA_FLOOR, quotaAllows, recordQuota } from "../src/store/quota.js";
 
 const NO_KEY_MESSAGE = "QLOO_API_KEY is not set. Add it to .env (see .env.example).";
-const USAGE = "Usage: npm run probe -- [--dry-run] [--limit N] [--max-calls N]";
+const NO_DB_MESSAGE =
+  "A live probe needs the owner database, so Qloo's own monthly count can be read and recorded. Set OWNER_DATABASE_URL in .env, or pass --tunnel <port>. Nothing was sent to Qloo.";
+const QUOTA_STOP = `Stopped early: Qloo's own count shows fewer than ${QLOO_QUOTA_FLOOR.toLocaleString("en-US")} calls left this month.`;
+const QUOTA_UNREAD = "Stopped early: the owner database could not be read, so Qloo's own count could not be checked.";
+const USAGE = "Usage: npm run probe -- [--dry-run] [--limit N] [--max-calls N] [--tunnel <port>]";
 
 const PODCAST: EntityType = "urn:entity:podcast";
 const PERSON: EntityType = "urn:entity:person";
@@ -47,7 +65,9 @@ type Outcome<T> = { kind: "ok"; data: T } | { kind: "planned" } | Failure;
 
 const isFailure = <T>(outcome: Outcome<T>): outcome is Failure => outcome.kind === "error" || outcome.kind === "budget";
 
-function readArgs(argv: string[]): { dryRun: boolean; limit: number | undefined; maxCalls: number } | undefined {
+function readArgs(
+  argv: string[],
+): { dryRun: boolean; limit: number | undefined; maxCalls: number; tunnelPort: number | undefined } | undefined {
   try {
     const { values } = parseArgs({
       args: argv,
@@ -55,20 +75,40 @@ function readArgs(argv: string[]): { dryRun: boolean; limit: number | undefined;
         "dry-run": { type: "boolean", default: false },
         limit: { type: "string" },
         "max-calls": { type: "string" },
+        tunnel: { type: "string" },
       },
       strict: true,
       allowPositionals: false,
     });
     const count = z.coerce.number().int().min(1).max(10_000);
+    const tunnelPort = values.tunnel === undefined ? undefined : tunnelPortFrom(values.tunnel);
+    // A dry run opens no database, so a tunnel there would be silently unused.
+    if (values["dry-run"] && tunnelPort !== undefined) return undefined;
     return {
       dryRun: values["dry-run"],
       limit: values.limit === undefined ? undefined : count.parse(values.limit),
       maxCalls: values["max-calls"] === undefined ? DEFAULT_MAX_CALLS : count.parse(values["max-calls"]),
+      tunnelPort,
     };
   } catch {
     return undefined;
   }
 }
+
+// The count is kept on the hosted database, so the probe reads what every
+// other process with the key has recorded, and they read what it records.
+function openProbeDb(tunnelPort: number | undefined): Db | string {
+  loadRepoEnv();
+  if (tunnelPort === undefined && (process.env["OWNER_DATABASE_URL"] ?? "").trim() === "") return NO_DB_MESSAGE;
+  try {
+    return openOwnerDb(process.env, tunnelPort === undefined ? {} : { tunnelPort });
+  } catch (error) {
+    // Both carry fixed text that names a variable, never its value.
+    return error instanceof OpsConfigError || error instanceof StoreError ? error.message : "The owner database could not be opened.";
+  }
+}
+
+let openedDb: Db | undefined;
 
 // ISO weeks, Monday to Sunday, ending with the last week that has finished.
 function lastFullWeeks(weeks: number, now: Date): { startDate: string; endDate: string } {
@@ -214,7 +254,7 @@ async function main(): Promise<number> {
     console.error(USAGE);
     return 2;
   }
-  const { dryRun, limit, maxCalls } = options;
+  const { dryRun, limit, maxCalls, tunnelPort } = options;
   const shows = ShowsSchema.parse(JSON.parse(readFileSync(SHOWS_FILE, "utf8"))).slice(0, limit);
 
   let config: QlooConfig;
@@ -234,12 +274,27 @@ async function main(): Promise<number> {
   const currentYear = now.getUTCFullYear();
   const trendWindow = lastFullWeeks(TREND_WEEKS, now);
 
+  const opened = dryRun ? undefined : openProbeDb(tunnelPort);
+  if (typeof opened === "string") {
+    console.error(opened);
+    return 1;
+  }
+  const db = opened;
+  openedDb = db;
+
   const budget = new RequestBudget(maxCalls);
   const capture: Capture = { status: undefined, body: undefined, refused: false };
   const client =
-    dryRun || config.apiKey === undefined
+    db === undefined || config.apiKey === undefined
       ? undefined
-      : createQlooClient({ apiKey: config.apiKey, baseUrl, fetchImpl: countedFetch(budget, capture) });
+      : createQlooClient({
+          apiKey: config.apiKey,
+          baseUrl,
+          fetchImpl: countedFetch(budget, capture),
+          // The client's own retries would run between quota checks.
+          maxRetries: 0,
+          onQuota: (quota) => recordQuota(db, quota),
+        });
   const runDir = join(PROBE_DATA_DIR, now.toISOString().replace(/[:.]/g, "-"));
   if (client !== undefined) mkdirSync(runDir, { recursive: true });
 
@@ -247,9 +302,28 @@ async function main(): Promise<number> {
   let plannedRequests = 0;
   let lastStartMs = 0;
   let stoppedByBudget = false;
+  let quotaStop: string | null = null;
   let harnessReserved = 0;
   let harnessReported = 0;
   const onceOnlyLines: string[] = [];
+
+  // Read before every request, never trusted from the last one, because
+  // another process may have recorded a lower count since. Any failure stops
+  // the probe rather than sending blind.
+  const quotaClear = async (): Promise<boolean> => {
+    if (quotaStop !== null) return false;
+    if (db === undefined) {
+      quotaStop = QUOTA_UNREAD;
+      return false;
+    }
+    try {
+      if (await quotaAllows(db, QLOO_QUOTA_FLOOR, new Date())) return true;
+      quotaStop = QUOTA_STOP;
+    } catch {
+      quotaStop = QUOTA_UNREAD;
+    }
+    return false;
+  };
 
   const saveRaw = (label: string, record: Record<string, unknown>) => {
     const file = join(runDir, `${String(sequence).padStart(3, "0")}-${slug(label)}.json`);
@@ -274,6 +348,7 @@ async function main(): Promise<number> {
       stoppedByBudget = true;
       return { kind: "budget" };
     }
+    if (!(await quotaClear())) return { kind: "budget" };
 
     const waitMs = lastStartMs + MIN_GAP_MS - Date.now();
     if (waitMs > 0) await delay(waitMs);
@@ -516,6 +591,10 @@ async function main(): Promise<number> {
         onceOnlyLines.push("harness: qloo_recommend skipped, its advertised input schema has no person target");
         return;
       }
+      if (!(await quotaClear())) {
+        onceOnlyLines.push("harness: qloo_recommend skipped, Qloo's own count is under the floor or could not be read");
+        return;
+      }
       if (stoppedByBudget || !budget.take(HARNESS_RECOMMEND_RESERVE)) {
         onceOnlyLines.push("harness: qloo_recommend skipped, not enough budget left");
         return;
@@ -553,7 +632,7 @@ async function main(): Promise<number> {
       await checkHarness(show, podcastId);
     }
     if (client !== undefined) console.log(`[${index + 1}/${shows.length}] ${show.name}: done, ${budget.used} requests so far`);
-    if (stoppedByBudget) break;
+    if (stoppedByBudget || quotaStop !== null) break;
   }
 
   if (client === undefined) {
@@ -576,7 +655,7 @@ async function main(): Promise<number> {
   console.log(renderTable(rows));
   console.log("");
   console.log("demographics ok: the podcast's result, then people with data out of people tried.");
-  console.log("A number in a cell is the HTTP status of a failed call. budget means the hard stop was hit.");
+  console.log("A number in a cell is the HTTP status of a failed call. budget means a hard stop was hit: --max-calls or Qloo's own count.");
   console.log("");
   for (const line of onceOnlyLines) console.log(line);
   console.log("");
@@ -598,8 +677,14 @@ async function main(): Promise<number> {
     `Calls used: ${budget.used} of ${maxCalls}: ${budget.used - harnessReserved} direct requests including retries, plus ${harnessReserved} reserved for the harness, which reported ${harnessReported}.`,
   );
   if (stoppedByBudget) console.log(`Stopped early: --max-calls ${maxCalls} reached.`);
+  if (quotaStop !== null) console.log(quotaStop);
   console.log(`Raw responses: ${runDir}`);
   return 0;
 }
 
-process.exitCode = await main();
+try {
+  process.exitCode = await main();
+} finally {
+  // An open pool would hold the process for its idle timeout after the table prints.
+  await openedDb?.close().catch(() => {});
+}

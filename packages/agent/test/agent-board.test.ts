@@ -1,12 +1,12 @@
-// Covers the pure board maths: trend state, the new-audience segment, reach
-// bands and the ranked board built from a run context, with its exclusions,
+// Covers the pure board maths: trend state, the new-audience segment, the
+// household-name reach label and the ranked board built from a run context, with its exclusions,
 // dropped ids and the fit floor for people only find_person returned. It
 // does not cover how
 // tools fill the context (agent-tools.test.ts), the prose check on angles
 // (agent-prose.test.ts), or whether the thresholds suit real Qloo data, which
 // only the live probe can show. Every row and name here is synthetic.
 import { describe, expect, it } from "vitest";
-import { bringsNewFrom, buildBoard, FIND_PERSON_FIT_FLOOR, reachFrom, risingFrom } from "../src/agent/board.js";
+import { bringsNewFrom, buildBoard, FIND_PERSON_FIT_FLOOR, HOUSEHOLD_NAME_AT, reachFrom, risingFrom } from "../src/agent/board.js";
 import { createRunContext, type Demographics, type RunContext, type TrendRow } from "../src/agent/context.js";
 
 const SHOW = { qlooId: "00000000-0000-4000-8000-000000000001", name: "Synthetic Show" };
@@ -107,14 +107,12 @@ describe("bringsNewFrom", () => {
 });
 
 describe("reachFrom", () => {
-  it("bands popularity, and a missing value is unknown, never bookable", () => {
-    expect(reachFrom(0.95)).toBe("household name");
-    expect(reachFrom(0.9499)).toBe("well known");
-    expect(reachFrom(0.8)).toBe("well known");
-    expect(reachFrom(0.79)).toBe("bookable");
-    expect(reachFrom(0)).toBe("bookable");
-    expect(reachFrom(null)).toBe("unknown");
-    expect(reachFrom(Number.NaN)).toBe("unknown");
+  it("gives household name at 0.97 and above, and none for every other value, missing data included", () => {
+    expect(HOUSEHOLD_NAME_AT).toBe(0.97);
+    for (const popularity of [0.97, 1.0]) expect(reachFrom(popularity), String(popularity)).toBe("household name");
+    for (const popularity of [0.969, 0.5, 0, null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(reachFrom(popularity), String(popularity)).toBe("none");
+    }
   });
 });
 
@@ -161,10 +159,10 @@ describe("buildBoard", () => {
 
     expect(board.map((entry) => [entry.name, entry.fit, entry.fitKnown, entry.fitRank, entry.reach])).toEqual([
       ["Synthetic C", 0.95, true, 1, "household name"],
-      ["Synthetic B", 0.8, true, 2, "bookable"],
-      ["Synthetic A", 0.8, true, 3, "well known"],
-      ["Synthetic E", 0.7, true, 4, "unknown"],
-      ["Synthetic D", 0, false, 5, "bookable"],
+      ["Synthetic B", 0.8, true, 2, "none"],
+      ["Synthetic A", 0.8, true, 3, "none"],
+      ["Synthetic E", 0.7, true, 4, "none"],
+      ["Synthetic D", 0, false, 5, "none"],
     ]);
   });
 

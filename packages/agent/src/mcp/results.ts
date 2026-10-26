@@ -1,7 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { withoutLinks } from "../agent/prose.js";
-import { parseBoardGuest } from "../server/runs.js";
+import { isShowableTag, withoutLinks } from "../agent/prose.js";
+import { MAX_BRIEF_QUESTIONS, parseBoardGuest, publicReach, storedBriefSchema, type PublicPastGuests } from "../server/runs.js";
 import { cleanText } from "../text/normalize.js";
 
 /** The only codes a tool ever answers with (D2.8). "Not yours" and "does not exist" are both not_found. */
@@ -34,11 +34,8 @@ const BRIEF_CHARS = 2_000;
 const MAX_TAGS = 5;
 const MAX_CANDIDATES = 10;
 const MAX_GUESTS = 50;
-const MAX_QUESTIONS = 5;
 // The same bound putBrief stores a whole brief under (MAX_BRIEF_JSON in
-// runs.ts), so a filled brief that fits in storage is read and cut by
-// cleanForCaller rather than refused as upstream_failed. It still bounds the
-// work spent cleaning one field.
+// runs.ts). It bounds the work spent cleaning one stored candidate field.
 const MAX_STORED_CHARS = 65_536;
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const APPLE_ID = /^[0-9]{1,20}$/;
@@ -65,7 +62,7 @@ const guest = z.strictObject({
   fit: z.number(),
   fitKnown: z.boolean(),
   fitRank: z.number().int().min(1),
-  reach: z.enum(["household name", "well known", "bookable", "unknown"]),
+  reach: z.literal("household name").nullable(),
   rising: z.enum(["rising", "steady", "falling", "unknown"]),
   bringsNew: capped(NAME_CHARS).nullable(),
   sharedTags: z.array(capped(TAG_CHARS)).max(MAX_TAGS),
@@ -75,10 +72,25 @@ const guest = z.strictObject({
 const brief = z.strictObject({
   why: capped(BRIEF_CHARS),
   angle: capped(BRIEF_CHARS),
-  questions: z.array(capped(BRIEF_CHARS)).max(MAX_QUESTIONS),
+  questions: z.array(capped(BRIEF_CHARS)).max(MAX_BRIEF_QUESTIONS),
   pitchSubject: capped(BRIEF_CHARS),
   pitchBody: capped(BRIEF_CHARS),
 });
+
+// How far the run's past-guest check reached and against which show's feed,
+// as the run page shows it. The feed's URL and the confirmed candidate's id
+// are never part of it.
+const pastGuests = z
+  .strictObject({
+    checked: z.boolean(),
+    episodes: z.number().int().min(0),
+    since: z.string().regex(/^\d{4}-\d{2}$/).nullable(),
+    source: z.enum(["directory", "linked", "pasted"]),
+    feedName: capped(NAME_CHARS).nullable(),
+    feedPublisher: capped(NAME_CHARS).nullable(),
+    archiveTitles: z.number().int().min(0),
+  })
+  .nullable();
 
 const findShowSuccess = z.strictObject({ candidates: z.array(candidate).min(1).max(MAX_CANDIDATES), source });
 
@@ -88,7 +100,7 @@ const showName = capped(NAME_CHARS);
 const guests = z.array(guest).min(1).max(MAX_GUESTS);
 const retryAfter = z.literal(RETRY_AFTER_SECONDS);
 const runSuccess = z.union([
-  z.strictObject({ status: z.literal("done"), runId: idText, runUrl, showName, guests, source }),
+  z.strictObject({ status: z.literal("done"), runId: idText, runUrl, showName, guests, pastGuests, source }),
   z.strictObject({ status: z.literal("running"), runId: idText, retryAfterSeconds: retryAfter, source }),
   z.strictObject({ status: z.literal("awaiting_confirm"), runId: idText, source }),
   z.strictObject({ status: z.literal("failed"), runId: idText, reason: errorCode, source }),
@@ -127,6 +139,7 @@ export const runOutput = z
     runUrl: runUrl.optional(),
     showName: showName.optional(),
     guests: z.array(guest).max(MAX_GUESTS).optional(),
+    pastGuests: pastGuests.optional(),
     retryAfterSeconds: retryAfter.optional(),
     reason: errorCode.optional(),
     source: source.optional(),
@@ -243,16 +256,23 @@ export function candidatesReply(items: ReadonlyArray<{ id: string; data: unknown
 /**
  * A done run's result from listBoard rows, in rank order: the run link, the
  * show name and each guest's server id, cleaned name, computed numbers,
- * rising state, brings-new label, shared tags and angle. The Qloo person id
- * and the rising points are never copied out (D5.5). A row that fails the
- * runner's board schema is left out (C6.5), and a board with no readable row
- * is upstream_failed. Trailing guests are dropped until the result fits in
- * 16 KiB, so no string is ever cut to fit (D5.2). Never throws.
+ * reach as publicReach shows it ("household name" or null), rising state,
+ * brings-new label, shared tags (each cleaned, then kept only when
+ * isShowableTag passes it today, so a row stored under older chip rules
+ * never shows a chip they now refuse, C3.10) and angle, plus `coverage`,
+ * the run's getPastGuests view, as pastGuests (null for a run with none),
+ * its feedName and feedPublisher cleaned like every other name.
+ * The Qloo person id, the rising points and any feed URL are never copied
+ * out (D5.5). A row that fails the runner's board schema is left out (C6.5),
+ * and a board with no readable row is upstream_failed. Trailing guests are
+ * dropped until the result fits in 16 KiB, so no string is ever cut to fit
+ * (D5.2). Never throws.
  */
 export function boardReply(
   runId: string,
   board: ReadonlyArray<{ id: string; data: unknown }>,
   appOrigin: string,
+  coverage: PublicPastGuests | null,
 ): CallToolResult {
   let show = "";
   const listed: Array<z.input<typeof guest>> = [];
@@ -268,15 +288,31 @@ export function boardReply(
       fit: row.fit,
       fitKnown: row.fitKnown,
       fitRank: row.fitRank,
-      reach: row.reach,
+      reach: publicReach(row.reach),
       rising: row.rising.state,
       bringsNew: row.bringsNew === null ? null : cleanForCaller(row.bringsNew.label, NAME_CHARS),
-      sharedTags: row.sharedTags.slice(0, MAX_TAGS).map((tag) => cleanForCaller(tag, TAG_CHARS)),
+      sharedTags: row.sharedTags
+        .slice(0, MAX_TAGS)
+        .map((tag) => cleanForCaller(tag, TAG_CHARS))
+        .filter(isShowableTag),
       angle: cleanForCaller(row.angle, ANGLE_CHARS),
     });
   }
   if (listed.length === 0) return errorReply("upstream_failed");
-  const value = { status: "done", runId, runUrl: runUrlOf(appOrigin, runId), showName: show, guests: listed, source: SOURCE };
+  // Picked by name, so a field added to the view later stays off this reply until it is added here.
+  const checked =
+    coverage === null
+      ? null
+      : {
+          checked: coverage.checked,
+          episodes: coverage.episodes,
+          since: coverage.since,
+          source: coverage.source,
+          feedName: coverage.feedName === null ? null : cleanForCaller(coverage.feedName, NAME_CHARS),
+          feedPublisher: coverage.feedPublisher === null ? null : cleanForCaller(coverage.feedPublisher, NAME_CHARS),
+          archiveTitles: coverage.archiveTitles,
+        };
+  const value = { status: "done", runId, runUrl: runUrlOf(appOrigin, runId), showName: show, guests: listed, pastGuests: checked, source: SOURCE };
   while (value.guests.length > 1 && bytesOf(value) > MAX_RESULT_BYTES) value.guests.pop();
   return reply(runOutput, value);
 }
@@ -296,22 +332,16 @@ export function failedRunReply(runId: string, errorCode: string | null): CallToo
   return reply(runOutput, { status: "failed", runId, reason: runFailureCode(errorCode), source: SOURCE });
 }
 
-const storedBrief = z.object({
-  why: storedText,
-  angle: storedText,
-  questions: z.array(storedText).max(MAX_QUESTIONS * 2),
-  pitch_subject: storedText,
-  pitch_body: storedText,
-});
-
 /**
  * write_brief's result for a stored brief. Every field is model prose with
  * names filled in by code, so each is cleaned and capped at 2,000
- * characters, and only the pitch body keeps its newlines. A stored brief
- * that fails its schema is upstream_failed (C6.5). Never throws.
+ * characters, and only the pitch body keeps its newlines. A filled brief
+ * that fits in storage is read and cut rather than refused. A stored brief
+ * that fails storedBriefSchema, the one the website's view reads with, is
+ * upstream_failed (C6.5). Never throws.
  */
 export function briefReply(runId: string, guestId: string, stored: unknown): CallToolResult {
-  const parsed = storedBrief.safeParse(stored);
+  const parsed = storedBriefSchema.safeParse(stored);
   if (!parsed.success) return errorReply("upstream_failed");
   const written = parsed.data;
   return reply(writeBriefOutput, {
@@ -321,7 +351,7 @@ export function briefReply(runId: string, guestId: string, stored: unknown): Cal
     brief: {
       why: cleanForCaller(written.why, BRIEF_CHARS),
       angle: cleanForCaller(written.angle, BRIEF_CHARS),
-      questions: written.questions.slice(0, MAX_QUESTIONS).map((question) => cleanForCaller(question, BRIEF_CHARS)),
+      questions: written.questions.slice(0, MAX_BRIEF_QUESTIONS).map((question) => cleanForCaller(question, BRIEF_CHARS)),
       pitchSubject: cleanForCaller(written.pitch_subject, BRIEF_CHARS),
       pitchBody: cleanForCaller(written.pitch_body, BRIEF_CHARS, true),
     },

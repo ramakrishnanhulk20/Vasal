@@ -14,11 +14,11 @@ export const syntheticBrief = (n: number) => ({
 });
 
 // Uses only the placeholders every board guest has, so it passes for a guest
-// with no shared tags too.
+// with no shared tags or no fit score too.
 export const BRIEF_DRAFT = {
-  why: "{{guest}} has {{fit}} with {{show}} listeners.",
+  why: "{{guest}} suits {{show}} listeners.",
   angle: "A talk about what {{show}} listeners enjoy.",
-  questions: ["One?", "Two?", "Three?", "Four?", "Five?"],
+  questions: ["Why?", "What changed?", "What stayed?", "Who inspired you?", "What next?"],
   pitch_subject: "{{show}} would love to have {{guest}}",
   pitch_body: "Hi team, could {{guest}} join {{show}} this month?",
 };

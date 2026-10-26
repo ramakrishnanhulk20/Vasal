@@ -1,6 +1,7 @@
 // Covers the Claude client wrapper against a fake SDK client: the request it
 // sends and the request options (timeout, signal, one retry), the token
-// reservation that comes before every call, each call's time limit, the
+// reservation that comes before every call and its settle once Claude
+// answers (not the meter's refund itself), each call's time limit, the
 // mapping of each SDK error class to a fixed code, refusal and truncation
 // stops, and checking structured replies. It does not cover the real SDK's
 // network behaviour, its retry timing, or how well any real model follows
@@ -186,6 +187,68 @@ describe("createAnthropicModel turn", () => {
     }
     expect(reserveTokens).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
+  });
+});
+
+describe("createAnthropicModel token settle (C5.1)", () => {
+  const schema = z.object({ a: z.string() });
+
+  function settling(respond: (options?: SdkOptions) => Promise<Anthropic.Message>, settle = vi.fn(async (_used: number) => {})) {
+    const { client, create } = fakeSdk(respond);
+    const reserveTokens = vi.fn(async (_n: number) => settle);
+    const model = createAnthropicModel({ apiKey: API_KEY, model: "claude-haiku-5-5", effort: "medium", reserveTokens, client });
+    return { model, create, reserveTokens, settle };
+  }
+
+  it("settles with input plus output tokens once Claude answers, a refusal too, and with the whole reservation when a count is missing", async () => {
+    const answered = settling(async () => message({ usage: { input_tokens: 1_200, output_tokens: 340 } }));
+    await answered.model.turn(turnInput());
+    expect(answered.settle.mock.calls).toEqual([[1_540]]);
+
+    const refused = settling(async () => message({ stop_reason: "refusal" }));
+    expect((await agentErrorOf(refused.model.turn(turnInput()))).code).toBe("MODEL_REFUSED");
+    expect(refused.settle.mock.calls).toEqual([[15]]);
+
+    for (const usage of [undefined, { input_tokens: 10 }, { input_tokens: 10, output_tokens: null }, { input_tokens: -1, output_tokens: 5 }]) {
+      const bare = settling(async () => message({ usage, content: [{ type: "text", text: '{"a":"b"}', citations: null }] }));
+      expect(await bare.model.structured({ system: "s", user: "u", schema, maxTokens: 100 })).toEqual({ a: "b" });
+      expect(bare.settle.mock.calls, JSON.stringify(usage)).toEqual([[bare.reserveTokens.mock.calls[0]![0]]]);
+    }
+  });
+
+  it("settles nothing when the call fails, and a settle that throws is only a fixed warning", async () => {
+    const failed = settling(async () => {
+      throw new RateLimitError(429, { error: { message: MARKER } }, MARKER, new Headers());
+    });
+    expect((await agentErrorOf(failed.model.turn(turnInput()))).code).toBe("MODEL_RATE_LIMIT");
+    expect(failed.settle).not.toHaveBeenCalled();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const broken = settling(
+        async () => message(),
+        vi.fn(async (_used: number) => {
+          throw new Error(`${MARKER} ${API_KEY}`);
+        }),
+      );
+      expect((await broken.model.turn(turnInput())).id).toBe("msg_synthetic");
+      expect(warn.mock.calls).toEqual([["token settle failed"]]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still works with a reserveTokens that answers true, which has nothing to settle", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { model, create } = build(async () => message({ content: [{ type: "text", text: '{"a":"b"}', citations: null }] }));
+      expect((await model.turn(turnInput())).id).toBe("msg_synthetic");
+      expect(await model.structured({ system: "s", user: "u", schema, maxTokens: 100 })).toEqual({ a: "b" });
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

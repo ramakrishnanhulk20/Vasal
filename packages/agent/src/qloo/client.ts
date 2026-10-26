@@ -15,6 +15,9 @@ export type RawQlooRequest = { path: RawQlooPath; params: ReadonlyArray<readonly
 export const RawQlooBody = z.record(z.string(), z.unknown());
 export type RawQlooBody = z.infer<typeof RawQlooBody>;
 
+/** Qloo's own monthly count as one reply's headers gave it, and when that reply arrived. */
+export type QlooQuota = { remaining: number; limit: number; seenAt: Date };
+
 export type QlooClientOptions = {
   apiKey: string;
   baseUrl: URL;
@@ -22,6 +25,7 @@ export type QlooClientOptions = {
   timeoutMs?: number;
   maxRetries?: number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  onQuota?: (quota: QlooQuota) => void | Promise<void>;
 };
 
 /** Per-call settings any Qloo call path accepts. `signal` ends the call when it fires. */
@@ -48,6 +52,8 @@ const CODE_FOR_STATUS: Partial<Record<number, QlooErrorCode>> = {
   401: "QLOO_AUTH",
   403: "QLOO_FORBIDDEN_TYPE",
   404: "QLOO_NOT_FOUND",
+  // A request timeout clears on its own like a 5xx, so it is retried.
+  408: "QLOO_UPSTREAM",
   429: "QLOO_RATE_LIMIT",
 };
 
@@ -68,7 +74,29 @@ const MAX_RAW_QUERY_CHARS = 3_000;
 // surrogate into U+FFFD, so the text sent would differ from the text checked.
 const LONE_SURROGATE = /[\uD800-\uDFFF]/u;
 
-const isRetryableStatus = (status: number) => status === 429 || (status >= 500 && status <= 599);
+const isRetryableStatus = (status: number) => status === 408 || status === 429 || (status >= 500 && status <= 599);
+
+// Any other 4xx says Qloo refused this request as sent, so it would fail the
+// same way again. QLOO_UPSTREAM is the code the meter retries, so a 400 must
+// never become it (C5.2).
+function codeForStatus(status: number): QlooErrorCode {
+  return CODE_FOR_STATUS[status] ?? (status >= 400 && status <= 499 ? "QLOO_BAD_INPUT" : "QLOO_UPSTREAM");
+}
+
+// Digits only, so a sign, a decimal point, an exponent or a second value
+// joined by a comma all read as no count. Fifteen digits stay a safe integer.
+const QUOTA_COUNT = /^[0-9]{1,15}$/;
+
+function quotaCount(value: string | null): number | null {
+  return value !== null && QUOTA_COUNT.test(value) ? Number(value) : null;
+}
+
+// Headers.get matches names case-insensitively, so any capitalisation Qloo sends is read.
+function quotaOf(headers: Headers, seenAt: Date): QlooQuota | null {
+  const remaining = quotaCount(headers.get("x-month-ratelimit-remaining"));
+  const limit = quotaCount(headers.get("x-month-ratelimit-limit"));
+  return remaining === null || limit === null ? null : { remaining, limit, seenAt };
+}
 
 /**
  * Builds the one GET request for a raw harness request. The client sends
@@ -146,6 +174,10 @@ function retryDelayMs(retryAfter: string | null, retryIndex: number): number {
  * redirect points. Each attempt has its own timeout (default 20 s). Only 429
  * and 5xx are retried, at most `maxRetries` times (default 2), waiting
  * Retry-After seconds when given (capped at 10 s), else 500 ms then 1500 ms.
+ * A final 401 throws QLOO_AUTH, 403 QLOO_FORBIDDEN_TYPE, 404 QLOO_NOT_FOUND,
+ * 429 QLOO_RATE_LIMIT, any other 4xx QLOO_BAD_INPUT (never retried, here or
+ * by the meter), and any other status, 5xx included, QLOO_UPSTREAM, as does
+ * a network failure.
  *
  * A call's options.signal is combined with each attempt's own timeout, so
  * whichever fires first cuts the attempt off, body read included. Once the
@@ -158,6 +190,14 @@ function retryDelayMs(retryAfter: string | null, retryIndex: number): number {
  * body is capped at 1,000,000 bytes and must be a JSON object. A refused
  * request throws QLOO_BAD_INPUT before anything is sent, and an answer that
  * is not a JSON object throws QLOO_SCHEMA.
+ *
+ * After every reply, whatever its status and whether or not its body could be
+ * read, X-Month-RateLimit-Remaining and X-Month-RateLimit-Limit are read
+ * (names in any case). When both are plain digits, `onQuota` gets them with
+ * the time the reply arrived, and the attempt waits for it to finish before
+ * it returns or throws, so a stored count is in place before the next request.
+ * A missing or malformed header calls nothing. An onQuota that throws is
+ * ignored. Header values are never logged.
  *
  * Throws QlooError("QLOO_KEY_MISSING") for an empty key and
  * QlooError("QLOO_BAD_INPUT") for a non-https base URL or bad limits.
@@ -174,6 +214,17 @@ export function createQlooClient(cfg: QlooClientOptions): QlooClient {
   if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) throw new QlooError("QLOO_BAD_INPUT");
 
   const headers = { Accept: "application/json", "X-Api-Key": cfg.apiKey };
+  const { onQuota } = cfg;
+
+  async function report(quota: QlooQuota | null): Promise<void> {
+    if (quota === null || onQuota === undefined) return;
+    try {
+      await onQuota(quota);
+    } catch {
+      // The reply is already paid for, so a count that failed to store must
+      // not fail the call too. The next reply stores a fresh one.
+    }
+  }
 
   // One attempt, including reading the body, under its own timeout and the
   // caller's signal. Any failure becomes a fixed code; the underlying error
@@ -185,8 +236,10 @@ export function createQlooClient(cfg: QlooClientOptions): QlooClient {
   ): Promise<{ response: Response; body: string | undefined }> {
     const own = AbortSignal.timeout(timeoutMs);
     const signal = caller === undefined ? own : AbortSignal.any([caller, own]);
+    let quota: QlooQuota | null = null;
     try {
       const response = await fetchImpl(request.url, { method: request.method, headers, redirect: "error", signal });
+      quota = quotaOf(response.headers, new Date());
       if (!response.ok) {
         await response.body?.cancel().catch(() => undefined);
         return { response, body: undefined };
@@ -195,6 +248,9 @@ export function createQlooClient(cfg: QlooClientOptions): QlooClient {
     } catch (err) {
       if (err instanceof QlooError) throw err;
       throw new QlooError(signal.aborted ? "QLOO_TIMEOUT" : "QLOO_UPSTREAM");
+    } finally {
+      // After the body, so storing the count never eats into the attempt's timeout.
+      await report(quota);
     }
   }
 
@@ -237,7 +293,7 @@ export function createQlooClient(cfg: QlooClientOptions): QlooClient {
         }
         continue;
       }
-      throw new QlooError(CODE_FOR_STATUS[response.status] ?? "QLOO_UPSTREAM", response.status);
+      throw new QlooError(codeForStatus(response.status), response.status);
     }
   }
 

@@ -11,8 +11,19 @@ import { StoreError } from "../store/errors.js";
 import { cleanText, normalizeName } from "../text/normalize.js";
 import { reachFrom, risingFrom, strongestSegments } from "./board.js";
 import type { Demographics, RunContext, SharedTag, StepSummary } from "./context.js";
-import { isPastGuest, sameName } from "./past-guests.js";
-import { ACCUSATIONS_RULE, checkProse, isShowableTag, type ProseCheck, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "./prose.js";
+import { isPastGuest, matchKey, sameName } from "./past-guests.js";
+import {
+  ACCUSATIONS_RULE,
+  checkProse,
+  FAMILY_RULE,
+  isShowableTag,
+  isShowableTagId,
+  type ProseCheck,
+  RELEASE_CLAIM_RULE,
+  SENSITIVE_TRAITS_RULE,
+  TREND_CLAIM_WORDS,
+  withoutLinks,
+} from "./prose.js";
 
 export type ToolName =
   | "people_for_show"
@@ -94,6 +105,12 @@ const RELEASE_DATE_PROPERTY: Record<ReleaseKind, "release_date" | "publication_d
 const UPCOMING_DAYS = 730;
 const RELEASE_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 const RELEASE_YEAR = /^[1-9]\d{3}$/;
+// A title of one word once articles go ("Up", "Wicked", "The Studio") is an
+// everyday word, so matching it would refuse ordinary angles. The phrase
+// check in checkProse still covers a claim about one.
+const MIN_RELEASE_TITLE_WORDS = 2;
+const RELEASE_TITLE_ARTICLES: ReadonlySet<string> = new Set(["the", "a", "an"]);
+const MAX_HINT_TITLE_CHARS = 120;
 
 // Taken from ProseCheck's reasons, so a new prose reason fails to compile
 // until PICK_HINTS has a hint for it.
@@ -111,6 +128,8 @@ export const PICK_HINTS: Record<RejectReason, string> = Object.freeze({
   trend_claim: `Qloo has no trend data right now, so do not call anyone ${TREND_CLAIM_WORDS}. A past breakout role or album is fine.`,
   sensitive_trait: SENSITIVE_TRAITS_RULE,
   accusation: ACCUSATIONS_RULE,
+  release_claim: RELEASE_CLAIM_RULE,
+  family_claim: FAMILY_RULE,
 });
 
 const PersonId = z.string().min(1).max(64);
@@ -177,7 +196,7 @@ export function researchTools(opts: ToolOptions): Anthropic.Tool[] {
     toolDefinition(
       "audience_of",
       "Who a person's fans are: the age bands and genders where their audience is strongest. " +
-        "Use it to find guests who would bring the show listeners it does not reach yet. " +
+        "The app compares it with the show's own audience to find an audience group this guest's fans lean toward more than the show's listeners do. " +
         `At most ${TOOL_LIMITS.audience_of} calls per run.`,
       { personId: PERSON_ID_PROPERTY },
     ),
@@ -309,10 +328,18 @@ function compareOf(data: unknown): QlooCompareResult {
 // different tag families on a show and a person, so a name both sides carry
 // counts as shared too. Every name goes through cleanField and then
 // normalizeName before it is matched or deduplicated, so both sides of each
-// comparison come out of the same normaliser.
+// comparison come out of the same normaliser. A tag counts only when its id
+// is in a family that may be shown, and a name matched across the sides only
+// when both sides' tags are, so a show's genre tag never stands in for a
+// person's identity tag of the same name. A side tag with no string id is
+// dropped.
 function sharedTagsOf({ tags, a, b }: QlooCompareResult): SharedTag[] {
+  const showable = (tag: Readonly<Record<string, unknown>>) => {
+    const id = tag["tag_id"];
+    return typeof id === "string" && isShowableTagId(id);
+  };
   const keyOf = (name: string) => normalizeName(cleanField(name, MAX_NAME_CHARS));
-  const personSide = new Set(b.map((tag) => keyOf(tag.name)));
+  const personSide = new Set(b.filter(showable).map((tag) => keyOf(tag.name)));
   const seen = new Set<string>();
   const shared: SharedTag[] = [];
   const add = (raw: string, score: number | null) => {
@@ -322,8 +349,8 @@ function sharedTagsOf({ tags, a, b }: QlooCompareResult): SharedTag[] {
     seen.add(key);
     shared.push({ name, score });
   };
-  for (const tag of tags) add(tag.name, isFiniteNumber(tag.query?.score) ? tag.query.score : null);
-  for (const tag of a) if (personSide.has(keyOf(tag.name))) add(tag.name, null);
+  for (const tag of tags) if (showable(tag)) add(tag.name, isFiniteNumber(tag.query?.score) ? tag.query.score : null);
+  for (const tag of a) if (showable(tag) && personSide.has(keyOf(tag.name))) add(tag.name, null);
   return shared;
 }
 
@@ -443,6 +470,38 @@ function isUpcoming(entity: QlooEntity, kind: ReleaseKind, today: Date): boolean
   return span.first >= start && span.last <= start + UPCOMING_DAYS * DAY_MS;
 }
 
+// Both titles and angles go through this one function (C8.3). matchKey turns
+// every dash, colon and other mark into a space, so "Mission: Impossible –
+// The Final Reckoning" and "Mission Impossible - The Final Reckoning" give
+// the same words, and dropping articles on both sides lets "the" come and go.
+function releaseWords(text: string): string[] {
+  return matchKey(text)
+    .split(" ")
+    .filter((word) => word !== "" && !RELEASE_TITLE_ARTICLES.has(word));
+}
+
+function rememberRelease(ctx: RunContext, title: string): void {
+  const words = releaseWords(title);
+  if (words.length < MIN_RELEASE_TITLE_WORDS) return;
+  const key = words.join(" ");
+  if (!ctx.releaseTitles.has(key)) ctx.releaseTitles.set(key, title);
+}
+
+// Padding both sides with a space makes the search hold whole words in a row,
+// so "Dune Part Three" is found in "her work on dune part three" but "Big
+// Shot" is not found in "big shots".
+function releaseNamed(ctx: RunContext, angle: string): string | null {
+  const text = ` ${releaseWords(angle).join(" ")} `;
+  for (const [key, title] of ctx.releaseTitles) if (text.includes(` ${key} `)) return title;
+  return null;
+}
+
+// The title already reached the model in upcoming_releases' result, cleaned
+// there (C2.8), so naming it back adds nothing new and tells the model exactly
+// what to leave out.
+const releaseTitleHint = (title: string): string =>
+  `Do not name the upcoming title "${cleanField(title, MAX_HINT_TITLE_CHARS)}": Qloo does not say who is in it.`;
+
 const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
   const popularityMax = POPULARITY_MAX[input.reach];
   const op: QlooOperation = {
@@ -479,7 +538,7 @@ const peopleForShow: Handler<"people_for_show"> = async (ctx, qloo, input) => {
 const audienceOf: Handler<"audience_of"> = async (ctx, qloo, input) => {
   if (!ctx.people.has(input.personId)) return refusal(ctx, "audience_of", "UNKNOWN_PERSON", "refused: person not found in this run");
   // The show's own audience is fetched once per run, so the board can tell
-  // which listeners a guest would bring that the show does not have.
+  // which audience group a guest's fans lean toward more than the show's do.
   if (ctx.showDemographics === null) ctx.showDemographics = await demographicsOf(qloo, ctx.show.qlooId);
   const audience = await demographicsOf(qloo, input.personId);
   if (audience === null) return refusal(ctx, "audience_of", "NO_DATA", "no audience data for this person");
@@ -519,7 +578,8 @@ const sharedTaste: Handler<"shared_taste"> = async (ctx, qloo, input) => {
   });
   // The one place shared tags are stored, so the board, the brief and the
   // model all see only names that are whole and say nothing about who the
-  // person is (C3.10).
+  // person is (C3.10): sharedTagsOf keeps only showable tag families, and
+  // each name kept must pass isShowableTag as well.
   const tags = sharedTagsOf(compareOf(data)).filter((tag) => [...tag.name].length <= MAX_TAG_CHARS && isShowableTag(tag.name));
   ctx.compares.set(input.personId, tags);
   const top = [...tags]
@@ -543,6 +603,9 @@ const upcomingReleases: Handler<"upcoming_releases"> = async (ctx, qloo, input, 
     .filter((entity) => isUpcoming(entity, input.kind, today))
     .map((entity) => cleanField(entity.name, MAX_TITLE_CHARS))
     .filter((title) => title !== "");
+  // Every title that counts is kept, including any listContent leaves out
+  // below, so an angle cannot name one the model saw some other way.
+  for (const title of titles) rememberRelease(ctx, title);
   step(ctx, "upcoming_releases", true, `found ${titles.length} upcoming ${RELEASE_WORDS[input.kind]}`);
   return { content: listContent("titles", titles), isError: false };
 };
@@ -666,6 +729,15 @@ const finishBoard: Handler<"finish_board"> = async (ctx, _qloo, input, _today, o
     // Cleaned before checkProse, so a link split by an invisible character is
     // found and removed whole instead of being joined back up by a later clean.
     const angle = cleanText(pick.angle, { maxChars: MAX_ANGLE_INPUT_CHARS });
+    // Checked before checkProse, so an angle naming a release gets the
+    // release hint even when the title also holds a number word. It reads the
+    // text with links already cut, the text the board stores, so a link
+    // wedged inside a title cannot hide it.
+    const release = releaseNamed(ctx, withoutLinks(angle).text);
+    if (release !== null) {
+      rejected.push({ index, reason: "release_claim", hint: releaseTitleHint(release) });
+      continue;
+    }
     // With no trend data behind the board, an angle may not call anyone rising.
     const check = checkProse(angle, { maxChars: MAX_ANGLE_CHARS, placeholders: [], noTrendClaims: !opts.trends });
     if (!check.ok) {
@@ -718,8 +790,12 @@ async function dispatch<K extends ToolName>(
  * schema, and a personId no tool returned in this run are each refused with
  * no Qloo call (C2.2). With opts.trends false, trend_of is refused as
  * NO_TREND_DATA with no Qloo call, and finish_board refuses an angle that
- * calls someone rising (reason "trend_claim"). Every attempt at a known tool
- * counts toward its limit.
+ * calls someone rising (reason "trend_claim"). finish_board always refuses,
+ * with reason "release_claim", an angle whose words hold, in a row, the words
+ * of any title upcoming_releases returned in this run, both taken under
+ * matchKey with "the", "a" and "an" dropped (C8.3), for every title left with
+ * at least two words; its hint names that title, cut to 120 characters. Every
+ * attempt at a known tool counts toward its limit.
  * Qloo requests are built from checked fields only (C2.3). Content is JSON of
  * at most 4,000 characters, and every Qloo name, tag and title and every
  * episode title in it has been through cleanText (C2.8). Angles are cleaned

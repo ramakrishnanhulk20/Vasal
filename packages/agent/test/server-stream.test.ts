@@ -1,6 +1,7 @@
 // Covers GET /runs/:id/events through app.request() on a migrated PGlite
 // database: replay after Last-Event-ID, the ways a stream ends, pings, the
-// per-run and site-wide stream caps and frame safety. It does not cover a
+// per-run and site-wide stream caps, frame safety and the reach a board or
+// Without Qloo event streams with. It does not cover a
 // real socket or a browser's EventSource (the live smoke uses curl), proxies
 // that buffer, or streams spread over several server processes, whose counts
 // are separate.
@@ -10,7 +11,7 @@ import type { AgentPort } from "../src/server/agent-port.js";
 import { createApp, type AppDeps } from "../src/server/app.js";
 import type { ServerConfig } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
-import { appendEvent, createRun, setRunStatus } from "../src/server/runs.js";
+import { appendEvent, createRun, listEventsAfter, setRunStatus } from "../src/server/runs.js";
 import { SSE_PING } from "../src/server/sse.js";
 import type { Db } from "../src/store/db.js";
 import { migratedPglite } from "./helpers/pglite.js";
@@ -245,6 +246,56 @@ describe("GET /runs/:id/events", () => {
     expect(frames).toHaveLength(2);
     expect(frames[0]!.lines).toHaveLength(3);
     expect(frames[0]!.data).toEqual({ tool: "feed", title });
+  });
+
+  it("streams a board event's reach as GET /runs/:id shows it: bookable, none or an unknown label as null, household name as is, the stored row unchanged", async () => {
+    const runId = await openRun();
+    const guest = (rank: number, reach: string) => ({
+      id: randomUUID(),
+      name: `Synthetic Guest ${rank}`,
+      fit: 0.5,
+      fitKnown: true,
+      fitRank: rank,
+      reach,
+      rising: "steady",
+    });
+    const stored = {
+      guests: [guest(1, "bookable"), guest(2, "none"), guest(3, "household name"), guest(4, "famous")],
+      pastGuests: { checked: true, skipped: 1, titles: 12, since: "2026-01", source: "directory", candidateId: randomUUID(), archiveTitles: 0 },
+    };
+    await appendEvent(db, runId, "board", stored, NOW);
+    await appendEvent(db, runId, "done", {}, NOW);
+
+    const [board] = framesOf(await (await events(build(), runId)).text());
+    expect(board?.event).toBe("board");
+    const shown = [null, null, "household name", null];
+    expect(board?.data).toEqual({ ...stored, guests: stored.guests.map((row, index) => ({ ...row, reach: shown[index] })) });
+    expect((await listEventsAfter(db, runId, 0))[0]?.data).toEqual(stored);
+  });
+
+  it("streams a without_qloo event's reach the same way, and leaves its other fields as stored", async () => {
+    const runId = await openRun();
+    const guess = (name: string, reach: string) => ({ name, fit: 0.4, fitKnown: true, reach, pastGuest: false, host: false, onBoard: true });
+    const stored = {
+      status: "done",
+      guesses: [guess("Synthetic Guess 1", "bookable"), guess("Synthetic Guess 2", "none"), guess("Synthetic Guess 3", "household name")],
+      unresolved: 1,
+    };
+    await appendEvent(db, runId, "without_qloo", stored, NOW);
+    await appendEvent(db, runId, "done", {}, NOW);
+
+    const [flip] = framesOf(await (await events(build(), runId)).text());
+    expect(flip?.event).toBe("without_qloo");
+    expect(flip?.data).toEqual({
+      status: "done",
+      guesses: [
+        { ...guess("Synthetic Guess 1", "bookable"), reach: null },
+        { ...guess("Synthetic Guess 2", "none"), reach: null },
+        guess("Synthetic Guess 3", "household name"),
+      ],
+      unresolved: 1,
+    });
+    expect((await listEventsAfter(db, runId, 0))[0]?.data).toEqual(stored);
   });
 
   it("gives 404 for an unknown or malformed run id", async () => {

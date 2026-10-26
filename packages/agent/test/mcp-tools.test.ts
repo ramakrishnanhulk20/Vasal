@@ -33,9 +33,12 @@ import { createApp } from "../src/server/app.js";
 import { acquireInflightSlot } from "../src/server/caps.js";
 import type { ServerConfig } from "../src/server/config.js";
 import {
+  appendEvent,
+  claimBrief,
   claimRunStatus,
   createRun,
   finishRun,
+  getBriefClaim,
   getRun,
   listBoard,
   listCandidates,
@@ -240,6 +243,23 @@ function captureConsole(): string[] {
   }
   return lines;
 }
+
+// Records every statement a tool sends, inside transactions too.
+function recording(inner: Db) {
+  const texts: string[] = [];
+  const wrap = (target: Db): Db => ({
+    query: <R = Record<string, unknown>>(text: string, params?: unknown[]) => {
+      texts.push(text);
+      return target.query<R>(text, params);
+    },
+    transaction: <T>(fn: (handle: Db) => Promise<T>) => target.transaction((handle) => fn(wrap(handle))),
+    close: () => target.close(),
+  });
+  return { db: wrap(inner), texts };
+}
+
+// The site's run places and MCP's share, not a key's own calls in flight.
+const SLOT_TABLE = /\binflight\b/;
 
 function deferred() {
   let release = (): void => {};
@@ -473,6 +493,23 @@ describe("find_show (F11)", () => {
     expect((await db.query("SELECT count(*)::int AS n FROM runs")).rows).toEqual([{ n: 1 }]);
     expect(await slots()).toEqual({ mcp: 0, runs: 0 });
   });
+
+  it("answers a key already at its 20 daily finds budget_exhausted 10 times without once taking MCP's slot pair (audit A3-2)", async () => {
+    const agent = fakeAgent();
+    await presetCount("finds", 20);
+    const recorded = recording(db);
+    const client = await connect({ agent, db: recorded.db });
+
+    for (let i = 0; i < 10; i += 1) {
+      expect(out(await call(client, "find_show", { query: "SmartLess" }))).toEqual({ error: "budget_exhausted" });
+    }
+
+    expect(recorded.texts.length).toBeGreaterThan(0);
+    expect(recorded.texts.filter((text) => SLOT_TABLE.test(text))).toEqual([]);
+    expect(agent.startRun).not.toHaveBeenCalled();
+    expect(await counts()).toMatchObject({ finds: 20 });
+    expect((await db.query("SELECT count(*)::int AS n FROM runs")).rows).toEqual([{ n: 0 }]);
+  });
 });
 
 describe("book_guests (F12, D3.3, D3.4)", () => {
@@ -539,13 +576,19 @@ describe("book_guests (F12, D3.3, D3.4)", () => {
     await db.query("UPDATE inflight SET n = 0 WHERE slot = 'mcp'");
   });
 
-  it("refuses a fourth daily run with budget_exhausted, moving the claim back and giving both slots back (D3.6)", async () => {
+  it("refuses a fourth daily run that got past the early read with budget_exhausted, moving the claim back and giving both slots back (D3.6)", async () => {
     const agent = fakeAgent();
     const client = await connect({ agent });
     const { candidateId, runId } = await found(client);
     await presetCount("runs", 3);
+    // Plays a parallel call that used the third run between the early read and the count.
+    const staleRead: Db = {
+      query: (text, params) => (text.startsWith("SELECT runs AS n FROM mcp_token_daily") ? Promise.resolve({ rows: [] }) : db.query(text, params)),
+      transaction: (fn) => db.transaction(fn),
+      close: async () => {},
+    };
 
-    const result = await call(client, "book_guests", { candidateId });
+    const result = await call(await connect({ agent, db: staleRead }), "book_guests", { candidateId });
 
     expect(out(result)).toEqual({ error: "budget_exhausted" });
     expect((await getRun(db, runId))?.status).toBe("awaiting_confirm");
@@ -554,6 +597,25 @@ describe("book_guests (F12, D3.3, D3.4)", () => {
 
     await presetCount("runs", 2);
     expect(out(await call(client, "book_guests", { candidateId }))).toMatchObject({ status: "done", runId });
+    expect(await counts()).toMatchObject({ runs: 3 });
+  });
+
+  it("answers a key already at its 3 daily runs budget_exhausted 10 times without once taking MCP's slot pair or moving the run (audit A3-2)", async () => {
+    const agent = fakeAgent();
+    const { candidateId, runId } = await found(await connect({ agent }));
+    await presetCount("runs", 3);
+    const recorded = recording(db);
+    const client = await connect({ agent, db: recorded.db });
+
+    for (let i = 0; i < 10; i += 1) {
+      expect(out(await call(client, "book_guests", { candidateId }))).toEqual({ error: "budget_exhausted" });
+    }
+
+    expect(recorded.texts.length).toBeGreaterThan(0);
+    expect(recorded.texts.filter((text) => SLOT_TABLE.test(text))).toEqual([]);
+    expect(recorded.texts.filter((text) => /^\s*UPDATE runs\b/.test(text))).toEqual([]);
+    expect(agent.continueRun).not.toHaveBeenCalled();
+    expect((await getRun(db, runId))?.status).toBe("awaiting_confirm");
     expect(await counts()).toMatchObject({ runs: 3 });
   });
 
@@ -641,10 +703,23 @@ describe("get_board (F13)", () => {
 
     await claimRunStatus(db, waiting.runId, "awaiting_confirm", "running");
     await putBoard(db, waiting.runId, [1, 2, 3].map(boardRow));
+    const pastGuests = { checked: true, skipped: 2, titles: 40, since: "2019-09", source: "directory", candidateId: waiting.candidateId, archiveTitles: 0 };
+    await appendEvent(db, waiting.runId, "board", { guests: [], pastGuests });
     await finishRun(db, waiting.runId, "done", { name: "done", data: { guests: 3 } });
     const board = await call(client, "get_board", { runId: waiting.runId });
     expect(out(board)).toMatchObject({ status: "done", runId: waiting.runId, runUrl: `${APP_ORIGIN}/runs/${waiting.runId}` });
     expect(out(board)["guests"]).toHaveLength(3);
+    // Read from the run's board event, without its skipped count, candidate or feed (A2-6).
+    expect(out(board)["pastGuests"]).toEqual({
+      checked: true,
+      episodes: 40,
+      since: "2019-09",
+      source: "directory",
+      archiveTitles: 0,
+      feedName: "Synthetic Show 1",
+      feedPublisher: "Synthetic Publisher 1",
+    });
+    for (const hidden of [waiting.candidateId, "feeds.example", "skipped"]) expect(textOf(board)).not.toContain(hidden);
   });
 });
 
@@ -726,6 +801,54 @@ describe("write_brief (F13, D3.5)", () => {
     expect(await counts()).toMatchObject({ briefs: 2 });
   });
 
+  it("answers a brief the model budget refused budget_exhausted at once, and writes it on a later call with no attempt spent (audit A1-9)", async () => {
+    let budgetLeft = false;
+    const agent = fakeAgent({
+      writeBrief: async (runId, guestId) => {
+        if (!budgetLeft) {
+          await markBriefFailed(db, runId, guestId, "MODEL_BUDGET");
+          return;
+        }
+        await putBrief(db, runId, guestId, storedBrief);
+        await markBriefDone(db, runId, guestId);
+      },
+    });
+    // A wait long enough that answering only when it ran out would fail the time check below.
+    const client = await connect({ agent, waitMs: { book: 3_000, brief: 20_000 } });
+    const { runId, guestIds } = await booked(client);
+    const guestId = guestIds[0]!;
+
+    for (let i = 0; i < 2; i += 1) {
+      const startedAt = performance.now();
+      expect(out(await call(client, "write_brief", { runId, guestId }))).toEqual({ error: "budget_exhausted" });
+      expect(performance.now() - startedAt).toBeLessThan(10_000);
+      expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "deferred", attempts: 1, errorCode: "MODEL_BUDGET" });
+    }
+
+    budgetLeft = true;
+    expect(out(await call(client, "write_brief", { runId, guestId }))).toMatchObject({ status: "done", guestId });
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(agent.writeBrief).toHaveBeenCalledTimes(3);
+  });
+
+  it("reads a stored brief that fails its schema as missing: never returned, nothing spent (C6.5, audit A3-3)", async () => {
+    const agent = fakeAgent();
+    const client = await connect({ agent });
+    const { runId, guestIds } = await booked(client);
+    const guestId = guestIds[0]!;
+    // Stored the way the runner stores one, claim and all, with a field it could never have written.
+    await claimBrief(db, runId, guestId, 5);
+    await putBrief(db, runId, guestId, { ...storedBrief, why: 5, angle: MARKER });
+    await markBriefDone(db, runId, guestId);
+
+    const result = await call(client, "write_brief", { runId, guestId });
+
+    expect(out(result)).toEqual({ error: "upstream_failed" });
+    expect(textOf(result)).not.toContain(MARKER);
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await counts()).toMatchObject({ briefs: 0 });
+  });
+
   it("refuses a brief for a run that is not done, or a guest not on its board, before spending", async () => {
     const agent = fakeAgent();
     const client = await connect({ agent });
@@ -738,23 +861,38 @@ describe("write_brief (F13, D3.5)", () => {
     expect(await counts()).toMatchObject({ briefs: 0 });
   });
 
-  it("holds the daily brief cap and the per-run cap with budget_exhausted, claiming nothing (D3.6)", async () => {
+  it("counts the key's daily brief only after its own claim wins, and a refused count defers the claim with no attempt spent (D3.6, audit A1-N3)", async () => {
     const agent = fakeAgent();
     const client = await connect({ agent });
     const { runId, guestIds } = await booked(client);
+    const guestId = guestIds[0]!;
 
     await presetCount("briefs", 15);
-    expect(out(await call(client, "write_brief", { runId, guestId: guestIds[0]! }))).toEqual({ error: "budget_exhausted" });
-    expect((await db.query("SELECT count(*)::int AS n FROM run_brief_claims")).rows).toEqual([{ n: 0 }]);
+    const recorded = recording(db);
+    expect(out(await call(await connect({ agent, db: recorded.db }), "write_brief", { runId, guestId }))).toEqual({ error: "budget_exhausted" });
+    const claimedAt = recorded.texts.findIndex((text) => text.includes("INSERT INTO run_brief_claims"));
+    const countedAt = recorded.texts.findIndex((text) => text.includes("briefs = d.briefs + 1"));
+    expect(claimedAt).toBeGreaterThan(-1);
+    expect(countedAt).toBeGreaterThan(claimedAt);
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "deferred", attempts: 1, errorCode: "MCP_BRIEF_BUDGET" });
     expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await counts()).toMatchObject({ briefs: 15 });
 
     await presetCount("briefs", 0);
+    expect(out(await call(client, "write_brief", { runId, guestId }))).toMatchObject({ status: "done", guestId });
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(await counts()).toMatchObject({ briefs: 1 });
+
+    // The per-run cap refuses the sixth guest at its claim, before any count.
     const sixGuests = await createRun(db, { show: "x", exclude: [] }, new Date(), { surface: "mcp", tokenId });
     await setRunStatus(db, sixGuests, "running");
     const ids = await putBoard(db, sixGuests, [1, 2, 3, 4, 5, 6].map(boardRow));
     await finishRun(db, sixGuests, "done", { name: "done", data: { guests: 6 } });
-    for (const guestId of ids.slice(0, 5)) expect(out(await call(client, "write_brief", { runId: sixGuests, guestId }))).toMatchObject({ status: "done" });
+    for (const id of ids.slice(0, 5)) expect(out(await call(client, "write_brief", { runId: sixGuests, guestId: id }))).toMatchObject({ status: "done" });
+    expect(await counts()).toMatchObject({ briefs: 6 });
     expect(out(await call(client, "write_brief", { runId: sixGuests, guestId: ids[5]! }))).toEqual({ error: "budget_exhausted" });
+    expect(await counts()).toMatchObject({ briefs: 6 });
+    expect(await getBriefClaim(db, sixGuests, ids[5]!)).toBeNull();
   });
 
   it("with the unavailable agent, answers upstream_failed every time without counting the key's briefs or claiming (C5.8)", async () => {
@@ -993,9 +1131,9 @@ const RSS = `<?xml version="1.0"?><rss><channel><title>Synthetic Show</title>
 <item><title>Episode one</title><pubDate>Mon, 12 Oct 2026 08:00:00 GMT</pubDate></item>
 </channel></rss>`;
 const BRIEF_DRAFT = {
-  why: "{{guest}} has {{fit}} with {{show}} listeners. See https://evil.example now.",
+  why: "{{guest}} has a fit of {{fit}} with {{show}} listeners. See https://evil.example now.",
   angle: "A talk about {{tag1}}.",
-  questions: ["One?", "Two?", "Three?", "Four?", "Five?"],
+  questions: ["Why?", "What changed?", "What stayed?", "Who inspired you?", "What next?"],
   pitch_subject: "{{show}} would love to have {{guest}}",
   pitch_body: "Hi team, could {{guest}} join {{show}} this month?",
 };
@@ -1025,7 +1163,7 @@ function synthResponse(op: QlooOperation): unknown {
         population_percentile: 60,
       }));
     case "compare":
-      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
+      return { tags: [{ tag_id: "urn:tag:genre:media:synthetic", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
     default:
       return [];
   }

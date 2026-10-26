@@ -1,19 +1,24 @@
 // Covers the per-visitor daily cap, the site-wide in-progress slots and MCP's
-// share of them on PGlite. It does not cover races between separate
-// connections (PGlite has one connection, so simultaneous calls are
-// serialised; the cross-connection race is proven later on hosted Postgres),
-// the vasal_app grants (mcp-usage.test.ts covers the MCP ones), or pruning
-// old counter rows, which is an operator job.
+// share of them, the release retry and the reconcile, on PGlite. It does not
+// cover races between separate connections (PGlite has one connection, so
+// simultaneous calls are serialised; the cross-connection race is proven
+// later on hosted Postgres), a reconcile at the moment a run takes or gives
+// back its place, the vasal_app grants (mcp-usage.test.ts covers the MCP
+// ones), or pruning old counter rows, which is an operator job.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { issueToken } from "../src/mcp/tokens.js";
 import {
   acquireInflightSlot,
   acquireMcpRunSlots,
   countVisitorRun,
+  reconcileInflight,
   releaseInflightSlot,
   releaseMcpRunSlots,
   resetInflight,
+  visitorRunsAtCap,
 } from "../src/server/caps.js";
 import { ServerError } from "../src/server/errors.js";
+import { createRun, setRunStatus, type RunStatus } from "../src/server/runs.js";
 import { visitorKey } from "../src/net/visitor-key.js";
 import type { Db } from "../src/store/db.js";
 import { migratedPglite } from "./helpers/pglite.js";
@@ -105,6 +110,44 @@ describe("countVisitorRun (C5.3)", () => {
   it("reports a database failure as SRV_UNAVAILABLE", async () => {
     await db.close();
     expect(await codeOf(countVisitorRun(db, hashOf("203.0.113.9"), 5, DAY))).toBe("SRV_UNAVAILABLE");
+    db = await migratedPglite();
+  });
+});
+
+describe("visitorRunsAtCap (C5.8)", () => {
+  async function counters(): Promise<unknown[]> {
+    return (await db.query("SELECT visitor_hash, window_start, runs FROM visitor_counters ORDER BY visitor_hash, window_start")).rows;
+  }
+
+  it("says yes only once the visitor's count for this UTC day has reached the cap, and changes nothing", async () => {
+    const alice = hashOf("203.0.113.9");
+    const bob = hashOf("2001:db8:1:2::1");
+    expect(await visitorRunsAtCap(db, alice, 2, DAY)).toBe(false);
+
+    expect(await countVisitorRun(db, alice, 2, DAY)).toBe(true);
+    expect(await visitorRunsAtCap(db, alice, 2, DAY)).toBe(false);
+    expect(await countVisitorRun(db, alice, 2, DAY)).toBe(true);
+    const stored = await counters();
+
+    expect(await visitorRunsAtCap(db, alice, 2, LATE_SAME_DAY)).toBe(true);
+    expect(await visitorRunsAtCap(db, alice, 3, DAY)).toBe(false);
+    expect(await visitorRunsAtCap(db, alice, 2, NEXT_DAY)).toBe(false);
+    expect(await visitorRunsAtCap(db, bob, 2, DAY)).toBe(false);
+    expect(await counters()).toEqual(stored);
+  });
+
+  it("refuses what countVisitorRun refuses, and fails closed on a database failure", async () => {
+    const alice = hashOf("203.0.113.9");
+    for (const hash of ["203.0.113.9", "", alice.toUpperCase(), `${alice}0`]) {
+      expect(await codeOf(visitorRunsAtCap(db, hash, 5, DAY))).toBe("SRV_BAD_INPUT");
+    }
+    for (const cap of [0, -1, 1.5, 101, Number.NaN]) {
+      expect(await codeOf(visitorRunsAtCap(db, alice, cap, DAY))).toBe("SRV_BAD_INPUT");
+    }
+    expect(await codeOf(visitorRunsAtCap(db, alice, 5, new Date(Number.NaN)))).toBe("SRV_BAD_INPUT");
+
+    await db.close();
+    expect(await codeOf(visitorRunsAtCap(db, alice, 5, DAY))).toBe("SRV_UNAVAILABLE");
     db = await migratedPglite();
   });
 });
@@ -217,5 +260,88 @@ describe("MCP's share of the in-progress slots (D3.3)", () => {
     await resetInflight(db, 0, "mcp");
 
     expect([await inflight("mcp"), await inflight()]).toEqual([0, 1]);
+  });
+});
+
+describe("release retries", () => {
+  // Fails the first `failures` statements or transactions, then passes them to the real database.
+  function flaky(failures: number): { flakyDb: Db; tries: () => number } {
+    let tries = 0;
+    const blip = () => {
+      tries += 1;
+      return tries <= failures;
+    };
+    const flakyDb: Db = {
+      query: (text, params) => (blip() ? Promise.reject(new Error("blip")) : db.query(text, params)),
+      transaction: (fn) => (blip() ? Promise.reject(new Error("blip")) : db.transaction(fn)),
+      close: async () => {},
+    };
+    return { flakyDb, tries: () => tries };
+  }
+
+  it("gives the place back on the third try after two failed decrements, and rethrows after a third", async () => {
+    for (let i = 0; i < 2; i += 1) expect(await acquireInflightSlot(db, 3)).toBe(true);
+    const twice = flaky(2);
+    const started = Date.now();
+
+    await releaseInflightSlot(twice.flakyDb);
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(450);
+    expect([twice.tries(), await inflight()]).toEqual([3, 1]);
+    const always = flaky(3);
+    expect(await codeOf(releaseInflightSlot(always.flakyDb))).toBe("SRV_UNAVAILABLE");
+    expect([always.tries(), await inflight()]).toEqual([3, 1]);
+  });
+
+  it("retries the MCP pair's release the same way", async () => {
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+    const twice = flaky(2);
+
+    await releaseMcpRunSlots(twice.flakyDb);
+
+    expect([twice.tries(), await inflight("mcp"), await inflight()]).toEqual([3, 0, 0]);
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+    expect(await codeOf(releaseMcpRunSlots(flaky(3).flakyDb))).toBe("SRV_UNAVAILABLE");
+    expect([await inflight("mcp"), await inflight()]).toEqual([1, 1]);
+  });
+});
+
+describe("reconcileInflight (G23)", () => {
+  async function runIn(status: RunStatus, surface: "web" | "mcp" = "web"): Promise<void> {
+    const origin = surface === "mcp" ? { surface, tokenId: (await issueToken(db)).id } : undefined;
+    const runId = await createRun(db, { show: "Synthetic Show", exclude: [] }, DAY, origin);
+    if (status !== "queued") await setRunStatus(db, runId, status, undefined, DAY);
+  }
+
+  it("lowers a leaked place with no run behind it to 0, for the site and for MCP", async () => {
+    await db.query("UPDATE inflight SET n = CASE slot WHEN 'runs' THEN 2 ELSE 1 END");
+    await runIn("awaiting_confirm");
+    await runIn("done", "mcp");
+
+    expect(await reconcileInflight(db)).toEqual({ runs: { before: 2, after: 0 }, mcp: { before: 1, after: 0 } });
+    expect([await inflight(), await inflight("mcp")]).toEqual([0, 0]);
+  });
+
+  it("keeps every place a queued or running run holds", async () => {
+    await runIn("running");
+    await runIn("queued", "mcp");
+    await runIn("failed");
+    await db.query("UPDATE inflight SET n = CASE slot WHEN 'runs' THEN 3 ELSE 1 END");
+
+    expect(await reconcileInflight(db)).toEqual({ runs: { before: 3, after: 2 }, mcp: { before: 1, after: 1 } });
+  });
+
+  it("never raises a counter, even with more runs going than it counts", async () => {
+    await runIn("running");
+    await runIn("running", "mcp");
+    await runIn("queued", "mcp");
+
+    expect(await reconcileInflight(db)).toEqual({ runs: { before: 0, after: 0 }, mcp: { before: 0, after: 0 } });
+    expect([await inflight(), await inflight("mcp")]).toEqual([0, 0]);
+  });
+
+  it("fails as SRV_UNAVAILABLE when a counter row is missing", async () => {
+    await db.query("DELETE FROM inflight WHERE slot = 'mcp'");
+    expect(await codeOf(reconcileInflight(db))).toBe("SRV_UNAVAILABLE");
   });
 });

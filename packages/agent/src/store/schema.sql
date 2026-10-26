@@ -17,6 +17,16 @@ CREATE TABLE IF NOT EXISTS qloo_cache (
   expires_at timestamptz NOT NULL
 );
 
+-- One row: Qloo's own monthly count from the newest reply recorded here. It
+-- counts every call made with the key, including ones this meter never saw,
+-- such as a local script's, so the meter can stop under a floor.
+CREATE TABLE IF NOT EXISTS qloo_quota (
+  id smallint PRIMARY KEY CHECK (id = 1),
+  remaining integer NOT NULL,
+  quota_limit integer NOT NULL,
+  seen_at timestamptz NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_flags (
   name text PRIMARY KEY,
   value boolean NOT NULL
@@ -136,16 +146,25 @@ INSERT INTO inflight (slot, n) VALUES ('mcp', 0) ON CONFLICT DO NOTHING;
 -- One row per brief a run has been asked to write. The claim is taken before
 -- the model is called and holds no brief text, so two requests at once spend
 -- once and a run's briefs stay capped (C5.8). A failed brief may be claimed
--- once more; the attempts check makes a third model call unstorable.
+-- once more; the attempts check makes a third model call unstorable. A claim
+-- a budget refused is deferred: it spent no attempt and may be claimed again.
 CREATE TABLE IF NOT EXISTS run_brief_claims (
   run_id uuid NOT NULL REFERENCES runs (id),
   guest_id uuid NOT NULL,
-  status text NOT NULL CHECK (status IN ('pending', 'failed', 'done')),
+  status text NOT NULL CONSTRAINT run_brief_claims_status_check CHECK (status IN ('pending', 'failed', 'done', 'deferred')),
   attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 2),
   error_code text,
   created_at timestamptz NOT NULL,
   PRIMARY KEY (run_id, guest_id)
 );
+
+-- CREATE TABLE IF NOT EXISTS leaves an existing table's checks as they were,
+-- so the status check is dropped and added again on every migrate. A table
+-- made before 'deferred' had the same name for it, the one Postgres gives an
+-- unnamed column check.
+ALTER TABLE run_brief_claims DROP CONSTRAINT IF EXISTS run_brief_claims_status_check;
+ALTER TABLE run_brief_claims ADD CONSTRAINT run_brief_claims_status_check
+  CHECK (status IN ('pending', 'failed', 'done', 'deferred'));
 
 -- The finished runs the home page shows, in order. Only the operator writes
 -- here, through the promote command after reading the run's board. The app
@@ -155,3 +174,70 @@ CREATE TABLE IF NOT EXISTS showcase_runs (
   position integer NOT NULL UNIQUE CHECK (position BETWEEN 1 AND 12),
   promoted_at timestamptz NOT NULL
 );
+
+-- Once a run is on the showcase, the app role cannot add, change or delete
+-- any of its rows, whatever its grants say or its code does (C6.6). The
+-- check is on the role's name, so the owner can still correct or prune a
+-- promoted run. An update is checked against the row's run before and after,
+-- so a row can be moved neither off a promoted run nor onto one. The
+-- showcase is named with its schema, and temporary tables are searched last,
+-- so a temporary table called showcase_runs cannot stand in for it. Row
+-- triggers do not fire on TRUNCATE, which the app role holds no grant for.
+CREATE OR REPLACE FUNCTION refuse_promoted_write() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  old_run uuid;
+  new_run uuid;
+BEGIN
+  IF current_user = 'vasal_app' THEN
+    IF TG_TABLE_NAME = 'runs' THEN
+      IF TG_OP <> 'INSERT' THEN
+        old_run := OLD.id;
+      END IF;
+      IF TG_OP <> 'DELETE' THEN
+        new_run := NEW.id;
+      END IF;
+    ELSE
+      IF TG_OP <> 'INSERT' THEN
+        old_run := OLD.run_id;
+      END IF;
+      IF TG_OP <> 'DELETE' THEN
+        new_run := NEW.run_id;
+      END IF;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.showcase_runs WHERE run_id = old_run OR run_id = new_run) THEN
+      RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'A run on the showcase is read-only to the app role.';
+    END IF;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON runs;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON runs
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON run_events;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON run_events
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON run_candidates;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON run_candidates
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON run_board;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON run_board
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON run_briefs;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON run_briefs
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();
+
+DROP TRIGGER IF EXISTS refuse_promoted_write ON run_brief_claims;
+CREATE TRIGGER refuse_promoted_write BEFORE INSERT OR UPDATE OR DELETE ON run_brief_claims
+  FOR EACH ROW EXECUTE FUNCTION refuse_promoted_write();

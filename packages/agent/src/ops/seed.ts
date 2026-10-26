@@ -1,8 +1,21 @@
+import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
+import type { OperatorArchive } from "../agent/context.js";
 import { DEFAULT_LIMITS } from "../agent/loop.js";
 import { createAnthropicModel, type ModelClient } from "../agent/model.js";
 import { resolveShow } from "../agent/resolve.js";
-import { createAgentRunner, FEED_TIMEOUT_MS, fetchShowFeed, runContextFor, type AgentFeeds } from "../agent/runner.js";
+// CandidateRow is the very schema continueRun reads a stored candidate with,
+// so the name printed is the show the runner researches, and a row the
+// runner would refuse counts as missing here too (C6.5).
+import {
+  CandidateRow,
+  createAgentRunner,
+  FEED_TIMEOUT_MS,
+  fetchShowFeed,
+  runContextFor,
+  type AgentFeeds,
+  type OperatorInput,
+} from "../agent/runner.js";
 import { guessWithoutQloo, publisherForPrompt, WITHOUT_QLOO_UNAVAILABLE, type WithoutQlooEvent } from "../agent/without-qloo.js";
 import { lookupShow, searchShows } from "../feeds/lookup.js";
 import { parseFeed } from "../feeds/rss.js";
@@ -27,12 +40,15 @@ import {
   type StoredBoardGuest,
 } from "../server/runs.js";
 import type { Db } from "../store/db.js";
-import { reserve, waitForQlooSlot } from "../store/meter.js";
+import { reserveWithReceipt, settleToUsage, waitForQlooSlot } from "../store/meter.js";
+import { recordQuota } from "../store/quota.js";
 import { cleanText } from "../text/normalize.js";
 import { isWritable, readBriefs, type RunBriefs } from "./promote.js";
 
 /** The Qloo day share the seed spends from. Every call also counts against qloo:month and the per-second limit (C5.1). */
 export const SEED_QLOO_DAY = "qloo:day:offline";
+/** The offline share's own month under qloo:month, reserved with every seed Qloo call, so offline work never takes more than its part of the month (C5.1). */
+export const SEED_QLOO_MONTH = "qloo:month:offline";
 /** The model-token share the seed spends from, the backtest's offline share, so seeding never uses tokens live runs need. */
 export const SEED_MODEL_DAY = "anthropic:day:offline";
 /** The run's error code when the operator's pick is not one of the run's stored, readable candidates. */
@@ -41,6 +57,97 @@ export const SEED_PICK_MISSING = "SEED_PICK_MISSING";
 export const SEED_UNEXPECTED_STATUS = "SEED_UNEXPECTED_STATUS";
 /** The preview's code when the error it caught carries no fixed code of its own. */
 export const SEED_PREVIEW_FAILED = "SEED_PREVIEW_FAILED";
+
+/** The most lines an operator's archive file may hold. */
+export const MAX_ARCHIVE_LINES = 10_000;
+/** The most characters (code points) one archive line may hold. */
+export const MAX_ARCHIVE_LINE_CHARS = 1_000;
+// Four UTF-8 bytes per character at most, plus a CRLF per line, so a file
+// over this cannot be within both caps and is refused before it is read.
+const MAX_ARCHIVE_BYTES = MAX_ARCHIVE_LINES * (MAX_ARCHIVE_LINE_CHARS * 4 + 2);
+
+export type ArchiveProblem = "ARCHIVE_UNREADABLE" | "ARCHIVE_NOT_UTF8" | "ARCHIVE_TOO_MANY_LINES" | "ARCHIVE_LINE_TOO_LONG" | "ARCHIVE_MALFORMED";
+
+const ARCHIVE_MESSAGES: Record<ArchiveProblem, (line: number | null) => string> = {
+  ARCHIVE_UNREADABLE: () => "The archive file could not be read, so none of it was used.",
+  ARCHIVE_NOT_UTF8: () => "The archive file is not UTF-8 text, so none of it was used.",
+  ARCHIVE_TOO_MANY_LINES: () => "The archive file has more than 10,000 lines, so none of it was used.",
+  ARCHIVE_LINE_TOO_LONG: (line) => `Line ${line} of the archive file is longer than 1,000 characters, so none of it was used.`,
+  ARCHIVE_MALFORMED: (line) => `Line ${line} of the archive file is not "title | description" with a title, so none of it was used.`,
+};
+
+/** Why an archive file was refused. Its message is fixed text and a line number, never the file's own text. */
+export class ArchiveError extends Error {
+  readonly code: ArchiveProblem;
+  readonly line: number | null;
+  constructor(code: ArchiveProblem, line: number | null = null) {
+    super(ARCHIVE_MESSAGES[code](line));
+    this.name = "ArchiveError";
+    this.code = code;
+    this.line = line;
+  }
+}
+
+/**
+ * Reads an operator's archive text: one older episode per line, written
+ * "title | description", where the description may be empty. The line is
+ * split at its last "|", so a title that holds a "|" keeps it, and only a
+ * description's own "|" moves words into the title, whose looser rule only
+ * ever leaves more people out. Both sides are trimmed, a leading byte-order
+ * mark is dropped, CRLF and LF line ends both work, and a blank line is
+ * skipped but counted. The whole text is refused, with ArchiveError and the
+ * first line at fault, when it has more than 10,000 lines
+ * (ARCHIVE_TOO_MANY_LINES), a line longer than 1,000 characters
+ * (ARCHIVE_LINE_TOO_LONG), or a line with no "|" or an empty title
+ * (ARCHIVE_MALFORMED). Pure.
+ */
+export function parseArchive(text: string): OperatorArchive {
+  const body = text.startsWith("\uFEFF") ? text.slice(1) : text;
+  const lines = body.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.length > MAX_ARCHIVE_LINES) throw new ArchiveError("ARCHIVE_TOO_MANY_LINES");
+  const titles: string[] = [];
+  const descriptions: string[] = [];
+  lines.forEach((raw, index) => {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if ([...line].length > MAX_ARCHIVE_LINE_CHARS) throw new ArchiveError("ARCHIVE_LINE_TOO_LONG", index + 1);
+    if (line.trim() === "") return;
+    const bar = line.lastIndexOf("|");
+    const title = bar === -1 ? "" : line.slice(0, bar).trim();
+    if (title === "") throw new ArchiveError("ARCHIVE_MALFORMED", index + 1);
+    titles.push(title);
+    const description = line.slice(bar + 1).trim();
+    if (description !== "") descriptions.push(description);
+  });
+  return Object.freeze({ titles: Object.freeze(titles), descriptions: Object.freeze(descriptions) });
+}
+
+/**
+ * Reads the UTF-8 archive file at `path` and parses it with parseArchive.
+ * A file larger than any file within both caps could be is refused before
+ * it is read, and one that is not valid UTF-8 is refused whole. Nothing from
+ * it is stored or printed. Throws ArchiveError: ARCHIVE_UNREADABLE for a
+ * missing, unreadable or oversized file, ARCHIVE_NOT_UTF8, or
+ * parseArchive's own codes.
+ */
+export async function readArchive(path: string): Promise<OperatorArchive> {
+  let bytes: Uint8Array;
+  try {
+    const info = await stat(path);
+    if (!info.isFile() || info.size > MAX_ARCHIVE_BYTES) throw new ArchiveError("ARCHIVE_UNREADABLE");
+    bytes = await readFile(path);
+  } catch (error) {
+    if (error instanceof ArchiveError) throw error;
+    throw new ArchiveError("ARCHIVE_UNREADABLE");
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ArchiveError("ARCHIVE_NOT_UTF8");
+  }
+  return parseArchive(text);
+}
 
 /**
  * One show the preview offers, ranked from 1 in the order a run would store
@@ -79,22 +186,6 @@ export type SeedOutcome =
   | { kind: "failed"; runId: string | null; code: string };
 
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
-const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
-
-// The limits continueRun reads a stored candidate with (CandidateRow in
-// agent/runner.ts), so the name printed is the show the runner researches,
-// and a row the runner would refuse counts as missing here too (C6.5).
-const CandidateRow = z
-  .object({
-    appleId: z.string().max(20).nullable(),
-    name: z.string().min(1).max(200),
-    publisher: z.string().max(200),
-    feedHandleSource: z.enum(["directory", "visitor"]),
-    feedUrl: z.string().max(8_192).nullable(),
-    qlooId: z.string().regex(QLOO_ID),
-    qlooName: z.string().min(1).max(200),
-  })
-  .strict();
 
 // A run holds at most 500 events (appendEvent in server/runs.ts), so one page
 // this size always reaches its done event.
@@ -137,11 +228,14 @@ async function closeFailed(db: Db, runId: string, code: string): Promise<SeedOut
 /**
  * The seed's meter, bound the way scripts/backtest.ts binds its own.
  * waitForQlooSlot reserves one Qloo call on `target` from qloo:day:offline,
- * qloo:month and the current second's bucket, all or nothing, waiting while
- * only the second is full (waitForQlooSlot in store/meter.ts), so a seed
- * shares the month and per-second limits of every process on the database
- * (C5.1). reserveModelTokens reserves `amount` from anthropic:day:offline on
- * `db`. Nothing else is ever charged: not qloo:day, not the MCP shares, not
+ * qloo:month:offline, qloo:month and the current second's bucket, all or
+ * nothing, waiting while only the second is full (waitForQlooSlot in
+ * store/meter.ts), so a seed shares the month and per-second limits of every
+ * process on the database and never takes more than the offline share of the
+ * month (C5.1). reserveModelTokens reserves `amount` from anthropic:day:offline on
+ * `db` (reserveWithReceipt) and resolves to the settle callback, which
+ * moves the reservation to the tokens the call really used (settleToUsage).
+ * Nothing else is ever charged: not qloo:day, not the MCP shares, not
  * anthropic:day. Each resolves false, charging nothing, when a bucket is
  * full, missing or expired. Neither runs the server's start-up sweep,
  * touches an in-flight counter or promotes a run. Each rejects with what the
@@ -150,12 +244,16 @@ async function closeFailed(db: Db, runId: string, code: string): Promise<SeedOut
  */
 export function seedMeterHooks(db: Db): {
   waitForQlooSlot: (target: Db, signal?: AbortSignal) => Promise<boolean>;
-  reserveModelTokens: (amount: number) => Promise<boolean>;
+  reserveModelTokens: (amount: number) => Promise<false | ((used: number) => Promise<void>)>;
 } {
   return {
     // The signal is the run's deadline, so a seed run never waits for a slot past it (C2.4).
-    waitForQlooSlot: (target, signal) => waitForQlooSlot(target, { dayKey: SEED_QLOO_DAY, ...(signal === undefined ? {} : { signal }) }),
-    reserveModelTokens: (amount) => reserve(db, [{ key: SEED_MODEL_DAY, amount }]),
+    waitForQlooSlot: (target, signal) =>
+      waitForQlooSlot(target, { dayKey: SEED_QLOO_DAY, extraKeys: [SEED_QLOO_MONTH], ...(signal === undefined ? {} : { signal }) }),
+    reserveModelTokens: async (amount) => {
+      const receipt = await reserveWithReceipt(db, [{ key: SEED_MODEL_DAY, amount }]);
+      return receipt === null ? false : settleToUsage(db, receipt);
+    },
   };
 }
 
@@ -166,7 +264,9 @@ export function seedMeterHooks(db: Db): {
  * find_person's harness spends through) and `deps.model` for every surface,
  * so whatever surface a run records, it spends only through the meter those
  * parts were built with; from createSeedAgent that is qloo:day:offline,
- * qloo:month and anthropic:day:offline. preview(show) runs only the show
+ * qloo:month:offline, qloo:month and anthropic:day:offline. `deps.operator`, the --host names
+ * and --archive episodes of this seed, goes to that runner, so its run
+ * leaves those people out too. preview(show) runs only the show
  * lookup startRun runs (resolveShow, with no exclusions), which spends one
  * metered Qloo search per directory match, and returns the candidates ranked
  * from 1. preview writes nothing to the runs tables. model, qloo and feeds
@@ -179,7 +279,7 @@ export function seedMeterHooks(db: Db): {
  */
 export function seedAgentFrom(
   db: Db,
-  deps: { qloo: MeteredQloo; harness: MeteredRawQloo; model: ModelClient; feeds: AgentFeeds; trends: boolean },
+  deps: { qloo: MeteredQloo; harness: MeteredRawQloo; model: ModelClient; feeds: AgentFeeds; trends: boolean; operator?: OperatorInput },
 ): SeedAgent {
   const runner = createAgentRunner({
     db,
@@ -188,6 +288,7 @@ export function seedAgentFrom(
     modelFor: () => deps.model,
     feeds: deps.feeds,
     trends: deps.trends,
+    ...(deps.operator === undefined ? {} : { operator: deps.operator }),
   });
   return {
     async preview(show) {
@@ -207,10 +308,12 @@ export function seedAgentFrom(
  * and the directory lookup, feed fetcher and feed parser main.ts gives the
  * server, so a seed run is researched exactly as a visitor's is (C9.2). The
  * meter is seedMeterHooks, so every Qloo call, find_person's harness
- * requests included, charges qloo:day:offline and qloo:month, every model
+ * requests included, charges qloo:day:offline, qloo:month:offline and
+ * qloo:month, every model
  * call anthropic:day:offline, and nothing else (C5.1). It never runs the
  * server's start-up sweep, touches an in-flight counter or promotes a run,
- * and it makes no network call until preview or the runner is used. Throws QlooError QLOO_KEY_MISSING for a blank Qloo key
+ * and it makes no network call until preview or the runner is used.
+ * `opts.operator` is passed on to seedAgentFrom. Throws QlooError QLOO_KEY_MISSING for a blank Qloo key
  * and QLOO_BAD_INPUT for a base URL that is not https, and AgentError
  * MODEL_KEY_MISSING for a blank Anthropic key.
  */
@@ -223,12 +326,13 @@ export function createSeedAgent(
     model: string;
     effort: "low" | "medium" | "high";
     trends: boolean;
+    operator?: OperatorInput;
   },
 ): SeedAgent {
   const hooks = seedMeterHooks(db);
   // No retries inside the client, so every Qloo attempt takes its own slot
   // from the shared meter (C5.1, C5.2).
-  const client = createQlooClient({ apiKey: opts.qlooApiKey, baseUrl: opts.qlooBaseUrl, maxRetries: 0 });
+  const client = createQlooClient({ apiKey: opts.qlooApiKey, baseUrl: opts.qlooBaseUrl, maxRetries: 0, onQuota: (quota) => recordQuota(db, quota) });
   const qloo = createMeteredQloo({ client, db, baseUrl: opts.qlooBaseUrl, waitForSlot: hooks.waitForQlooSlot });
   const model = createAnthropicModel({
     apiKey: opts.anthropicApiKey,
@@ -236,7 +340,14 @@ export function createSeedAgent(
     effort: opts.effort,
     reserveTokens: hooks.reserveModelTokens,
   });
-  return seedAgentFrom(db, { qloo, harness: qloo, model, feeds: { searchShows, lookupShow, safeFetch, parseFeed }, trends: opts.trends });
+  return seedAgentFrom(db, {
+    qloo,
+    harness: qloo,
+    model,
+    feeds: { searchShows, lookupShow, safeFetch, parseFeed },
+    trends: opts.trends,
+    ...(opts.operator === undefined ? {} : { operator: opts.operator }),
+  });
 }
 
 /**
@@ -298,7 +409,7 @@ export async function writeBriefs(db: Db, runner: Pick<AgentPort, "ready" | "wri
  * transaction (finishRun). A run something else moved before the claim is
  * left alone and returns SEED_UNEXPECTED_STATUS. Spending goes only through
  * the agent's meter, which from createSeedAgent is qloo:day:offline,
- * qloo:month and anthropic:day:offline. It never runs the server's start-up
+ * qloo:month:offline, qloo:month and anthropic:day:offline. It never runs the server's start-up
  * sweep (failInterruptedRuns and the resets after it), never takes an
  * in-flight slot or a visitor count, and never promotes; the operator does
  * that with ops promote. Throws ServerError("SRV_BAD_INPUT") for a show
@@ -433,8 +544,8 @@ export async function planGuesses(db: Db, runId: string, pick?: number): Promise
  * appends the result as a "without_qloo" event, or { status: "unavailable" }
  * on any error or once the deadline has passed. Spending is at most 1 model
  * call, 8 Qloo searches and 1 insights call through `agent`; from
- * createSeedAgent that is qloo:day:offline, qloo:month and
- * anthropic:day:offline. Throws ServerError from the run store and whatever
+ * createSeedAgent that is qloo:day:offline, qloo:month:offline, qloo:month
+ * and anthropic:day:offline. Throws ServerError from the run store and whatever
  * fetchShowFeed rethrows.
  */
 export async function addGuesses(db: Db, agent: Pick<SeedAgent, "model" | "qloo" | "feeds">, runId: string, pick?: number): Promise<GuessesOutcome> {

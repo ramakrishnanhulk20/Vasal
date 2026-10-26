@@ -20,6 +20,7 @@ import {
   claimBrief,
   claimRunStatus,
   createRun,
+  failInterruptedRuns,
   getBriefClaim,
   getRun,
   listBoard,
@@ -211,6 +212,12 @@ function storedGuest(n: number, sharedTags: string[], overrides: Record<string, 
   };
 }
 
+// What the brief routes show for syntheticBrief(n): its five named fields only.
+function shownBrief(n: number) {
+  const { why, angle, questions, pitch_subject: pitchSubject, pitch_body: pitchBody } = syntheticBrief(n);
+  return { why, angle, questions, pitchSubject, pitchBody };
+}
+
 describe("run store additions", () => {
   it("lists the board in rank order and the candidates with the ids that were issued", async () => {
     const { runId, guestIds } = await runWithBoard([{ name: "first" }, { name: "second" }, { name: "third" }]);
@@ -291,6 +298,34 @@ describe("GET /health", () => {
     expect(await (await app.request("/health")).json()).toEqual({ ok: true, liveRuns: false });
     await setFlag(db, "live_runs", true);
     expect(await snapshot()).toBe(before);
+  });
+
+  it("answers 503 { ok: false } when the database query rejects, with nothing of the error (audit A3-N3)", async () => {
+    const down: Db = {
+      query: () => Promise.reject(new Error(MARKER)),
+      transaction: () => Promise.reject(new Error(MARKER)),
+      close: async () => {},
+    };
+    const res = await build({ db: down }).app.request("/health");
+    expect(res.status).toBe(503);
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({ ok: false });
+    expect(text).not.toContain(MARKER);
+  });
+
+  it("answers 503 { ok: false } when the database has not answered within 2 seconds", async () => {
+    const hung: Db = {
+      query: () => new Promise(() => {}),
+      transaction: () => new Promise(() => {}),
+      close: async () => {},
+    };
+    const startedAt = performance.now();
+    const res = await build({ db: hung }).app.request("/health");
+    const took = performance.now() - startedAt;
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ ok: false });
+    expect(took).toBeGreaterThanOrEqual(1_900);
+    expect(took).toBeLessThan(5_000);
   });
 });
 
@@ -482,6 +517,25 @@ describe("POST /runs", () => {
     expect(agent.startRun).toHaveBeenCalledTimes(2);
   });
 
+  it("refuses a visitor already at the cap with VISITOR_LIMIT before taking a place, sending nothing to inflight (C5.8)", async () => {
+    const counting = countingDb(db);
+    const { app, agent } = build({ db: counting.db, config: { runsPerVisitorPerDay: 2 } });
+    expect((await start(app)).status).toBe(202);
+    expect((await start(app)).status).toBe(202);
+    await settled(0);
+    const before = await snapshot();
+    counting.texts.length = 0;
+
+    const third = await start(app);
+
+    expect(third.status).toBe(429);
+    expect(await third.json()).toEqual({ error: "VISITOR_LIMIT" });
+    expect(counting.texts.filter((text) => /\binflight\b/i.test(text))).toEqual([]);
+    expect(counting.texts.filter((text) => !/^\s*SELECT\b/i.test(text))).toEqual([]);
+    expect(await snapshot()).toBe(before);
+    expect(agent.startRun).toHaveBeenCalledTimes(2);
+  });
+
   it("counts two IPv6 addresses in one /64 as one visitor", async () => {
     const { app } = build({ config: { runsPerVisitorPerDay: 2 } });
     expect((await start(app, undefined, { [IP_HEADER]: "2001:db8:1:2::1" })).status).toBe(202);
@@ -586,6 +640,7 @@ describe("GET /runs/:id", () => {
       board: [],
       kolam: null,
       withoutQloo: null,
+      pastGuests: null,
     });
     expect(JSON.stringify(await (await app.request(`/runs/${runId}`)).json())).not.toContain("feeds.example");
 
@@ -619,7 +674,7 @@ describe("GET /runs/:id", () => {
 
     const text = await (await app.request(`/runs/${runId}`)).text();
     const body = JSON.parse(text) as { board: unknown[] };
-    const shown = { fitKnown: true, reach: "bookable", angle: "A synthetic angle." };
+    const shown = { fitKnown: true, reach: null, angle: "A synthetic angle." };
     expect(body.board).toEqual([
       { ...shown, id: guestIds[0], name: "Synthetic Guest 1", fit: 0.01, fitRank: 1, rising: "rising", bringsNew: "younger listeners", sharedTags: ["jazz"] },
       { ...shown, id: guestIds[1], name: "Synthetic Guest 2", fit: 0.02, fitRank: 2, rising: "steady", bringsNew: null, sharedTags: [] },
@@ -673,11 +728,13 @@ describe("GET /runs/:id", () => {
     const flip = {
       status: "done",
       guesses: [
-        { name: "Synthetic Guess 1", fit: 0.42, fitKnown: true, reach: "well known", pastGuest: true, onBoard: false },
-        { name: "Synthetic Guess 2", fit: null, fitKnown: false, reach: "unknown", pastGuest: false, onBoard: true },
+        { name: "Synthetic Guess 1", fit: 0.42, fitKnown: true, reach: "household name", pastGuest: true, host: false, onBoard: false },
+        { name: "Synthetic Guess 2", fit: null, fitKnown: false, reach: "unknown", pastGuest: false, host: true, onBoard: true },
       ],
       unresolved: 3,
     };
+    // A guess stored with an older reach label shows no label.
+    const shownFlip = { ...flip, guesses: [flip.guesses[0]!, { ...flip.guesses[1]!, reach: null }] };
     const { runId } = await runWithBoard([storedGuest(1, [])]);
     const flipOf = async (id: string) => ((await (await app.request(`/runs/${id}`)).json()) as { withoutQloo: unknown }).withoutQloo;
 
@@ -685,7 +742,11 @@ describe("GET /runs/:id", () => {
     await appendEvent(db, runId, "without_qloo", { status: "unavailable" }, NOW);
     expect(await flipOf(runId)).toEqual({ status: "unavailable" });
     await appendEvent(db, runId, "without_qloo", flip, NOW);
-    expect(await flipOf(runId)).toEqual(flip);
+    expect(await flipOf(runId)).toEqual(shownFlip);
+    // A flip stored before hosts were told apart has no host field, and shows none.
+    const older = { ...flip, guesses: flip.guesses.map(({ host: _host, ...guess }) => guess) };
+    await appendEvent(db, runId, "without_qloo", older, NOW);
+    expect(await flipOf(runId)).toEqual({ ...shownFlip, guesses: shownFlip.guesses.map((guess) => ({ ...guess, host: false })) });
 
     // A later event that is not exactly the runner's shape hides the flip
     // rather than passing an extra field on.
@@ -695,6 +756,8 @@ describe("GET /runs/:id", () => {
       { ...flip, guesses: [{ ...first, personId: MARKER }] },
       { ...flip, guesses: [{ ...first, fit: 0.5, fitKnown: false }] },
       { ...flip, guesses: [{ ...first, reach: MARKER }] },
+      { ...flip, guesses: [{ ...first, host: true }] },
+      { ...flip, guesses: [{ ...first, host: MARKER }] },
       { status: "done", guesses: flip.guesses },
       { status: "unavailable", reason: MARKER },
     ];
@@ -710,6 +773,54 @@ describe("GET /runs/:id", () => {
     await setRunStatus(db, running, "running", undefined, NOW);
     await appendEvent(db, running, "without_qloo", flip, NOW);
     expect(await flipOf(running)).toBeNull();
+  });
+
+  it("says how far a done run checked for past guests, and which kind of feed, never the feed itself (A2-6, C1.5)", async () => {
+    const { app } = build();
+    const runId = await createRun(db, INPUT, NOW);
+    const [candidateId] = await putCandidates(db, runId, [
+      {
+        appleId: null,
+        name: "Synthetic Show",
+        publisher: "feeds.example",
+        feedHandleSource: "visitor",
+        feedUrl: `https://feeds.example/${MARKER}.xml`,
+        qlooId: "00000000-0000-4000-8000-000000000500",
+        qlooName: "Synthetic Show",
+      },
+    ]);
+    await setRunStatus(db, runId, "running", undefined, NOW);
+    await putBoard(db, runId, [storedGuest(1, [])]);
+    const pastGuests = { checked: true, skipped: 3, titles: 312, since: "2019-09", source: "pasted", candidateId, archiveTitles: 2 };
+    await appendEvent(db, runId, "board", { guests: [], pastGuests }, NOW);
+    const shown = async () => ((await (await app.request(`/runs/${runId}`)).json()) as { pastGuests: unknown }).pastGuests;
+
+    // Like the board, the check shows only once the run is done (C6.4).
+    expect(await shown()).toBeNull();
+    await setRunStatus(db, runId, "done", undefined, NOW);
+    expect(await shown()).toEqual({
+      checked: true,
+      episodes: 312,
+      since: "2019-09",
+      source: "pasted",
+      archiveTitles: 2,
+      feedName: "Synthetic Show",
+      feedPublisher: "feeds.example",
+    });
+    const text = await (await app.request(`/runs/${runId}`)).text();
+    for (const hidden of [MARKER, "skipped", `"candidateId"`]) expect(text).not.toContain(hidden);
+
+    // An event from before the check recorded its feed takes the stored candidate's source.
+    await appendEvent(db, runId, "board", { guests: [], pastGuests: { checked: true, skipped: 0, titles: 40, since: null } }, NOW);
+    expect(await shown()).toEqual({
+      checked: true,
+      episodes: 40,
+      since: null,
+      source: "pasted",
+      archiveTitles: 0,
+      feedName: "Synthetic Show",
+      feedPublisher: "feeds.example",
+    });
   });
 
   it("gives 404 for a non-UUID, an unknown id or a re-spelled id, and marks run responses noindex and no-store (C6.1, C3.8)", async () => {
@@ -812,13 +923,15 @@ describe("GET /showcase (C5.4, C6.3)", () => {
         name: `Synthetic Guest ${n}`,
         fit: n / 100,
         fitKnown: true,
-        reach: "well known",
+        reach: null,
         rising: "steady",
         bringsNew: null,
         sharedTags: [],
       })),
       // No guest shares a tag, so there is nothing to draw.
       kolam: null,
+      // This run has no board event, so there is no past-guest check to report.
+      pastGuests: null,
     });
     expect(body.runs[1]!.guests.map((shown) => shown.id)).toEqual(first.guestIds.slice(0, 3));
     expect(text).not.toContain(unpromoted.runId);
@@ -1127,6 +1240,75 @@ describe("POST /runs/:id/confirm", () => {
     expect(onTime.agent.continueRun).toHaveBeenCalledExactlyOnceWith(fresh.runId, fresh.candidateIds[0]);
     await settled(0);
   });
+
+  it("keeps a run awaiting its confirm through the restart sweep, so the visitor can still confirm it (audit A1-N2)", async () => {
+    const { app, agent } = build();
+    const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }]);
+
+    expect(await failInterruptedRuns(db)).toBe(0);
+    expect((await getRun(db, runId))?.status).toBe("awaiting_confirm");
+
+    const res = await postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(agent.continueRun).toHaveBeenCalledExactlyOnceWith(runId, candidateIds[0]);
+    await settled(0);
+  });
+
+  it("answers a confirm on a done run 409 NOT_AWAITING with live runs on, never reading the kill switch or touching a slot (audit A3-1)", async () => {
+    const counting = countingDb(db);
+    const { app, agent } = build({ db: counting.db });
+    const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }]);
+    await setRunStatus(db, runId, "running");
+    await setRunStatus(db, runId, "done");
+    const before = await snapshot();
+
+    for (let i = 0; i < 10; i += 1) {
+      const res = await postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "NOT_AWAITING" });
+    }
+
+    expect(counting.texts.length).toBeGreaterThan(0);
+    expect(counting.texts.filter((text) => /inflight|app_flags/.test(text))).toEqual([]);
+    expect(await snapshot()).toBe(before);
+    expect(agent.continueRun).not.toHaveBeenCalled();
+  });
+
+  it("still gives the loser of two racing confirms 409 from the status claim, and its slot back", async () => {
+    // Holds each status claim until both confirms hold a slot, so both are
+    // past the early status check when the claim decides between them.
+    const texts: string[] = [];
+    let slotsTaken = 0;
+    let bothHoldSlots = (): void => {};
+    const gate = new Promise<void>((resolve) => (bothHoldSlots = resolve));
+    const wrap = (target: Db): Db => ({
+      query: async <R = Record<string, unknown>>(text: string, params?: unknown[]) => {
+        texts.push(text);
+        if (text.startsWith("UPDATE runs SET status = $3")) await gate;
+        const result = await target.query<R>(text, params);
+        if (text.startsWith("UPDATE inflight SET n = n + 1")) {
+          slotsTaken += 1;
+          if (slotsTaken === 2) bothHoldSlots();
+        }
+        return result;
+      },
+      transaction: <T>(fn: (handle: Db) => Promise<T>) => target.transaction((handle) => fn(wrap(handle))),
+      close: () => target.close(),
+    });
+    const { app, agent } = build({ db: wrap(db) });
+    const { runId, candidateIds } = await awaitingRun([{ title: "SmartLess" }]);
+    const confirm = () => postJson(app, `/runs/${runId}/confirm`, { candidateId: candidateIds[0] });
+
+    const results = await Promise.all([confirm(), confirm()]);
+
+    expect(results.map((res) => res.status).sort()).toEqual([202, 409]);
+    expect(await results.find((res) => res.status === 409)!.json()).toEqual({ error: "NOT_AWAITING" });
+    expect(texts.filter((text) => text.startsWith("UPDATE runs SET status = $3"))).toHaveLength(2);
+    expect(agent.continueRun).toHaveBeenCalledExactlyOnceWith(runId, candidateIds[0]);
+    await settled(0);
+    expect(texts.filter((text) => text.startsWith("UPDATE inflight SET n = n - 1"))).toHaveLength(2);
+  });
 });
 
 describe("the website's doors on an MCP run (D4.1)", () => {
@@ -1215,11 +1397,11 @@ describe("POST /runs/:id/brief", () => {
     const { runId, guestIds } = await runWithBoard([{ name: "guest" }]);
     await db.query(
       "INSERT INTO run_briefs (run_id, guest_id, data, created_at) VALUES ($1::uuid, $2::uuid, $3::json, $4::timestamptz)",
-      [runId, guestIds[0], JSON.stringify({ text: "stored" }), NOW.toISOString()],
+      [runId, guestIds[0], JSON.stringify(syntheticBrief(1)), NOW.toISOString()],
     );
     const res = await postJson(app, `/runs/${runId}/brief`, { guestId: guestIds[0] });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ brief: { text: "stored" } });
+    expect(await res.json()).toEqual({ brief: shownBrief(1) });
     expect(agent.writeBrief).not.toHaveBeenCalled();
   });
 
@@ -1228,7 +1410,7 @@ describe("POST /runs/:id/brief", () => {
     const { runId, guestIds } = await runWithBoard([{ name: "stored" }, { name: "new" }]);
     await db.query(
       "INSERT INTO run_briefs (run_id, guest_id, data, created_at) VALUES ($1::uuid, $2::uuid, $3::json, $4::timestamptz)",
-      [runId, guestIds[0], JSON.stringify({ text: "stored" }), NOW.toISOString()],
+      [runId, guestIds[0], JSON.stringify(syntheticBrief(1)), NOW.toISOString()],
     );
     await setFlag(db, "live_runs", false);
     expect((await postJson(app, `/runs/${runId}/brief`, { guestId: guestIds[0] })).status).toBe(200);
@@ -1294,6 +1476,49 @@ describe("POST /runs/:id/brief", () => {
     expect(lines.map((text) => JSON.parse(text) as unknown)).toEqual([line, line]);
     expect(agent.writeBrief).toHaveBeenCalledTimes(2);
     expect((await getRun(db, runId))?.status).toBe("done");
+  });
+
+  it("treats a brief a budget refused as never asked for: GET says none, POST asks again only with live runs on, and no attempt is spent (audit A1-9)", async () => {
+    // Refuses the way the real runner does when the model budget is used up.
+    let budgetLeft = false;
+    const writeBrief: AgentPort["writeBrief"] = async (runId, guestId) => {
+      if (!budgetLeft) {
+        await markBriefFailed(db, runId, guestId, "MODEL_BUDGET");
+        return;
+      }
+      await putBrief(db, runId, guestId, syntheticBrief(1));
+      await markBriefDone(db, runId, guestId);
+    };
+    const { app, agent } = build({ agent: { writeBrief } });
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, [])]);
+    const guestId = guestIds[0]!;
+    const ask = () => postJson(app, `/runs/${runId}/brief`, { guestId });
+    const read = async () => (await app.request(`/runs/${runId}/briefs/${guestId}`)).json();
+    const deferredAfter = async (calls: number) =>
+      vi.waitFor(async () => {
+        expect(agent.writeBrief).toHaveBeenCalledTimes(calls);
+        expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "deferred", attempts: 1, errorCode: "MODEL_BUDGET" });
+      }, SETTLE);
+
+    expect((await ask()).status).toBe(202);
+    await deferredAfter(1);
+    expect(await read()).toEqual({ status: "none" });
+
+    await setFlag(db, "live_runs", false);
+    const off = await ask();
+    expect(off.status).toBe(503);
+    expect(await off.json()).toEqual({ error: "LIVE_RUNS_OFF" });
+    expect(agent.writeBrief).toHaveBeenCalledTimes(1);
+    await setFlag(db, "live_runs", true);
+
+    expect((await ask()).status).toBe(202);
+    await deferredAfter(2);
+
+    budgetLeft = true;
+    expect((await ask()).status).toBe(202);
+    await vi.waitFor(async () => expect(await read()).toEqual({ status: "done", brief: shownBrief(1) }), SETTLE);
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(agent.writeBrief).toHaveBeenCalledTimes(3);
   });
 
   it("with live runs off, answers a twice-failed brief 409 and a pending one 202, and refuses only new model spend with 503 (C5.7)", async () => {
@@ -1394,10 +1619,10 @@ describe("briefs on a promoted run (C6.3)", () => {
     for (const [index, guestId] of guestIds.entries()) {
       const posted = await postJson(app, `/runs/${runId}/brief`, { guestId });
       expect(posted.status).toBe(200);
-      expect(await posted.json()).toEqual({ brief: syntheticBrief(index + 1) });
+      expect(await posted.json()).toEqual({ brief: shownBrief(index + 1) });
       const read = await app.request(`/runs/${runId}/briefs/${guestId}`);
       expect(read.status).toBe(200);
-      expect(await read.json()).toEqual({ status: "done", brief: syntheticBrief(index + 1) });
+      expect(await read.json()).toEqual({ status: "done", brief: shownBrief(index + 1) });
     }
     expect(agent.writeBrief).not.toHaveBeenCalled();
   });
@@ -1412,7 +1637,7 @@ describe("GET /runs/:id/briefs/:guestId", () => {
     await claimBrief(db, runId, guestIds[2]!, 5, NOW);
     await markBriefFailed(db, runId, guestIds[2]!, "MODEL_TIMEOUT");
     await claimBrief(db, runId, guestIds[3]!, 5, NOW);
-    await putBrief(db, runId, guestIds[3]!, { text: "stored" }, NOW);
+    await putBrief(db, runId, guestIds[3]!, syntheticBrief(4), NOW);
     await markBriefDone(db, runId, guestIds[3]!);
     const before = await snapshot();
 
@@ -1420,7 +1645,7 @@ describe("GET /runs/:id/briefs/:guestId", () => {
       { status: "none" },
       { status: "pending" },
       { status: "failed", code: "MODEL_TIMEOUT" },
-      { status: "done", brief: { text: "stored" } },
+      { status: "done", brief: shownBrief(4) },
     ];
     for (const [i, body] of expected.entries()) {
       const res = await app.request(`/runs/${runId}/briefs/${guestIds[i]}`, { headers: { origin: APP_ORIGIN } });
@@ -1462,5 +1687,151 @@ describe("GET /runs/:id/briefs/:guestId", () => {
       expect(res.headers.get("x-robots-tag")).toBe("noindex");
       expect(res.headers.get("cache-control")).toBe("no-store");
     }
+  });
+});
+
+describe("the brief a visitor reads (C6.5, audit A3-3)", () => {
+  it("shows only the five named fields and the first 5 questions, on POST and GET alike", async () => {
+    const { app, agent } = build();
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, [])]);
+    const guestId = guestIds[0]!;
+    const questions = ["One?", "Two?", "Three?", "Four?", "Five?", "Six?", "Seven?"];
+    await putBrief(db, runId, guestId, { ...syntheticBrief(1), questions, internal: MARKER }, NOW);
+    const shown = { ...shownBrief(1), questions: questions.slice(0, 5) };
+
+    const posted = await postJson(app, `/runs/${runId}/brief`, { guestId });
+    expect(posted.status).toBe(200);
+    const postedText = await posted.text();
+    expect(JSON.parse(postedText)).toEqual({ brief: shown });
+    const read = await app.request(`/runs/${runId}/briefs/${guestId}`);
+    const readText = await read.text();
+    expect(JSON.parse(readText)).toEqual({ status: "done", brief: shown });
+    for (const text of [postedText, readText]) {
+      for (const absent of [MARKER, "internal", "removed", "pitch_subject", "Six?"]) expect(text, absent).not.toContain(absent);
+    }
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+  });
+
+  it("reads a stored brief that fails its schema as missing: GET reports the claim, POST goes on to claim it", async () => {
+    const { app, agent } = build();
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, [])]);
+    const guestId = guestIds[0]!;
+    await putBrief(db, runId, guestId, { ...syntheticBrief(1), why: 5, angle: MARKER }, NOW);
+    const read = async () => {
+      const text = await (await app.request(`/runs/${runId}/briefs/${guestId}`)).text();
+      expect(text).not.toContain(MARKER);
+      return JSON.parse(text) as unknown;
+    };
+
+    expect(await read()).toEqual({ status: "none" });
+    const posted = await postJson(app, `/runs/${runId}/brief`, { guestId });
+    expect(posted.status).toBe(202);
+    const postedText = await posted.text();
+    expect(postedText).not.toContain(MARKER);
+    expect(JSON.parse(postedText)).toEqual({ status: "pending" });
+    expect(agent.writeBrief).toHaveBeenCalledExactlyOnceWith(runId, guestId);
+    expect(await read()).toEqual({ status: "pending" });
+  });
+
+  // A done claim is never claimed again, so these two would otherwise wait at pending for good.
+  async function doneButUnreadable(): Promise<{ runId: string; guestId: string }> {
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, [])]);
+    const guestId = guestIds[0]!;
+    await claimBrief(db, runId, guestId, 5, NOW);
+    await putBrief(db, runId, guestId, { ...syntheticBrief(1), why: 5, angle: MARKER }, NOW);
+    await markBriefDone(db, runId, guestId);
+    return { runId, guestId };
+  }
+
+  // The brief and claim reads in the order the route made them.
+  const briefReads = (texts: string[]) =>
+    texts.filter((text) => /FROM run_brief(s|_claims) /.test(text)).map((text) => (text.includes("FROM run_briefs ") ? "brief" : "claim"));
+
+  it("answers GET for a done claim whose stored brief fails its schema as failed with BRIEF_UNREADABLE, from storage alone", async () => {
+    const counting = countingDb(db);
+    const { app, agent } = build({ db: counting.db });
+    const { runId, guestId } = await doneButUnreadable();
+    const before = await snapshot();
+
+    const res = await app.request(`/runs/${runId}/briefs/${guestId}`);
+
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(MARKER);
+    expect(JSON.parse(text)).toEqual({ status: "failed", code: "BRIEF_UNREADABLE" });
+    // Unreadable on a read made after the done claim was read, not only on the first.
+    expect(briefReads(counting.texts)).toEqual(["brief", "claim", "brief"]);
+    expect(await snapshot()).toBe(before);
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+  });
+
+  it("answers POST for a done claim whose stored brief fails its schema 409 BRIEF_FAILED with BRIEF_UNREADABLE, never 202, live runs on or off", async () => {
+    const counting = countingDb(db);
+    const { app, agent } = build({ db: counting.db });
+    const { runId, guestId } = await doneButUnreadable();
+    const before = await snapshot();
+
+    for (const live of [true, false]) {
+      await setFlag(db, "live_runs", live);
+      counting.texts.length = 0;
+      const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
+      expect(res.status, `live ${live}`).toBe(409);
+      const text = await res.text();
+      expect(text).not.toContain(MARKER);
+      expect(JSON.parse(text)).toEqual({ error: "BRIEF_FAILED", code: "BRIEF_UNREADABLE" });
+      expect(briefReads(counting.texts)).toEqual(["brief", "claim", "brief"]);
+    }
+    await setFlag(db, "live_runs", true);
+
+    expect(await snapshot()).toBe(before);
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "done", attempts: 1, errorCode: null });
+  });
+
+  // The runner finishing between the route's first brief read and its claim
+  // read: that read sees no brief, and the claim it reads next is done. The
+  // runner stores the brief before it marks the claim done, as here.
+  async function briefLandsDuringFirstRead(): Promise<{ racing: Db; runId: string; guestId: string }> {
+    const { runId, guestIds } = await runWithBoard([storedGuest(1, [])]);
+    const guestId = guestIds[0]!;
+    await claimBrief(db, runId, guestId, 5, NOW);
+    let landed = false;
+    const racing: Db = {
+      query: async <R = Record<string, unknown>>(text: string, params?: unknown[]) => {
+        const result = await db.query<R>(text, params);
+        if (!landed && text.includes("FROM run_briefs ")) {
+          landed = true;
+          await putBrief(db, runId, guestId, syntheticBrief(1), NOW);
+          await markBriefDone(db, runId, guestId);
+        }
+        return result;
+      },
+      transaction: (fn) => db.transaction(fn),
+      close: async () => {},
+    };
+    return { racing, runId, guestId };
+  }
+
+  it("answers GET done for a brief the runner finished between the route's brief and claim reads, never failed (audit R2)", async () => {
+    const { racing, runId, guestId } = await briefLandsDuringFirstRead();
+    const { app, agent } = build({ db: racing });
+
+    const res = await app.request(`/runs/${runId}/briefs/${guestId}`);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "done", brief: shownBrief(1) });
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+  });
+
+  it("answers POST 200 with a brief the runner finished between the route's brief and claim reads, never 409 (audit R2)", async () => {
+    const { racing, runId, guestId } = await briefLandsDuringFirstRead();
+    const { app, agent } = build({ db: racing });
+
+    const res = await postJson(app, `/runs/${runId}/brief`, { guestId });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ brief: shownBrief(1) });
+    expect(agent.writeBrief).not.toHaveBeenCalled();
+    expect(await getBriefClaim(db, runId, guestId)).toEqual({ status: "done", attempts: 1, errorCode: null });
   });
 });

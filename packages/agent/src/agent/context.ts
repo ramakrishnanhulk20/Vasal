@@ -17,19 +17,28 @@ export type SharedTag = { name: string; score: number | null };
 export type StepSummary = { tool: ToolName | "unknown"; ok: boolean; summary: string };
 
 /** One episode as the feed gave it, for the past-guest check. publishedAt is an ISO date or null. */
-export type PastGuestEpisode = { title: string; publishedAt: string | null };
+export type PastGuestEpisode = { title: string; publishedAt: string | null; description?: string | null };
+
+/**
+ * Older episodes an operator supplies for one run, for a show whose feed no
+ * longer reaches its first episodes. They only ever leave people out; the
+ * model never sees them and they never count as the feed's titles.
+ */
+export type OperatorArchive = { readonly titles: readonly string[]; readonly descriptions: readonly string[] };
 
 /**
  * How far the past-guest check reached. checked is true only when the feed
  * gave at least one episode title; titles is how many it gave, and since is
  * the month of the oldest dated one as "YYYY-MM", or null when none is dated.
- * The index also holds the names the show goes by, so its hosts are left out
- * even when checked is false.
+ * archiveTitles is how many titles an operator's archive added (0 for any
+ * run a visitor starts). The index also holds the names the show goes by,
+ * so its hosts are left out even when checked is false.
  */
 export type PastGuestCheck = {
   readonly checked: boolean;
   readonly titles: number;
   readonly since: string | null;
+  readonly archiveTitles: number;
   readonly index: PastGuestIndex;
   readonly skipped: Set<string>;
 };
@@ -63,6 +72,12 @@ export type RunContext = {
   // whose input a pasted feed's titles can steer, so the board asks more of
   // them.
   readonly listedForShow: Set<string>;
+  // Qloo never says who is in a release, so an angle that names one of these
+  // titles guesses at a real person's next work (A2-5). Only titles of two or
+  // more words once articles are dropped are kept: the key is those words
+  // under matchKey, joined by single spaces, and the value is the first title
+  // upcoming_releases gave with that key, cleaned, for the hint to name.
+  readonly releaseTitles: Map<string, string>;
 };
 
 const YEAR_MONTH = /^\d{4}-\d{2}$/;
@@ -89,13 +104,19 @@ function oldestMonth(episodes: readonly PastGuestEpisode[]): string | null {
  * fetches them.
  *
  * pastGuestEpisodes is every episode the feed gave, used only to leave past
- * guests out; undefined or null means the feed could not be read. An episode
- * whose title is blank is not counted. pastGuests.checked is true only when
- * at least one title is left, titles is that count and since the oldest
- * dated one's month. showRunners are the names the show goes by (its
- * directory name, publisher, Qloo name and feed title); they join the titles
- * in the index whether or not any title was given, so a host is left out
- * either way, and they never count as titles.
+ * guests out; undefined or null means the feed could not be read. Their
+ * titles join the index as titles and their descriptions as descriptions
+ * (pastGuestIndex), and neither is ever shown to the model from here. An
+ * episode whose title is blank is not counted, though its description is
+ * still checked. pastGuests.checked is true only when at least one title is
+ * left, titles is that count and since the oldest dated one's month.
+ * showRunners are the show's host entries: the names the show goes by (its
+ * directory name, publisher, Qloo name and feed title), its feed's authors
+ * and any host the operator named. They join the index as hosts whether or
+ * not any title was given, so a host is left out either way, and they never
+ * count as titles. `archive` is an operator's older episodes: its titles
+ * join the index as titles and its descriptions as descriptions, counted
+ * only in archiveTitles, never in titles, checked or since.
  */
 export function createRunContext(input: {
   show: { qlooId: string; name: string };
@@ -104,10 +125,15 @@ export function createRunContext(input: {
   showDemographics?: Demographics | null;
   pastGuestEpisodes?: readonly PastGuestEpisode[] | null;
   showRunners?: readonly string[];
+  archive?: OperatorArchive | null;
 }): RunContext {
-  const episodes = (input.pastGuestEpisodes ?? []).filter((episode) => episode.title.trim() !== "");
+  const given = input.pastGuestEpisodes ?? [];
+  const episodes = given.filter((episode) => episode.title.trim() !== "");
   const titles = episodes.map((episode) => episode.title);
-  const entries = [...titles, ...(input.showRunners ?? []).filter((name) => name.trim() !== "")];
+  const archiveTitles = (input.archive?.titles ?? []).filter((title) => title.trim() !== "");
+  const descriptions = [...given.map((episode) => episode.description ?? ""), ...(input.archive?.descriptions ?? [])].filter((text) => text.trim() !== "");
+  const hosts = (input.showRunners ?? []).filter((name) => name.trim() !== "");
+  const empty = titles.length === 0 && archiveTitles.length === 0 && descriptions.length === 0 && hosts.length === 0;
   return {
     show: Object.freeze({ qlooId: input.show.qlooId, name: input.show.name }),
     episodeTitles: Object.freeze([...input.episodeTitles]),
@@ -123,10 +149,12 @@ export function createRunContext(input: {
       checked: titles.length > 0,
       titles: titles.length,
       since: oldestMonth(episodes),
-      index: entries.length > 0 ? pastGuestIndex(entries) : NO_PAST_GUESTS,
+      archiveTitles: archiveTitles.length,
+      index: empty ? NO_PAST_GUESTS : pastGuestIndex({ titles: [...titles, ...archiveTitles], descriptions, hosts }),
       skipped: new Set(),
     },
     dropped: new Set(),
     listedForShow: new Set(),
+    releaseTitles: new Map(),
   };
 }

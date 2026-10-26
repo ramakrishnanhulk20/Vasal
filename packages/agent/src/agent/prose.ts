@@ -5,7 +5,7 @@ export type ProseCheck = {
   ok: boolean;
   text: string;
   removed: { links: number; emails: number };
-  reason?: "digits" | "too_long" | "empty" | "trend_claim" | "sensitive_trait" | "accusation";
+  reason?: "digits" | "too_long" | "empty" | "trend_claim" | "sensitive_trait" | "accusation" | "release_claim" | "family_claim";
 };
 
 // By default linkify-it treats a bare domain as a link only when its last
@@ -31,13 +31,31 @@ const PLACEHOLDER = /\{\{([A-Za-z_][A-Za-z0-9_]{0,39})\}\}/g;
 // superscript and Roman numeral digits all read as figures on screen. This
 // also keeps out phone numbers written in digits (C3.5).
 const NUMBER_CHARACTER = /\p{N}/u;
-// The digits hint used to ask for numbers in words, and a figure in words is
-// still a made-up figure (C3.4). A run of four or more digit words spells out
-// a phone number (C3.5). Only words that almost always state a figure are
-// listed, so "one plain conversation" and "two hosts" pass. Matched
-// case-insensitively on word boundaries.
+// A figure in words is still a made-up figure (C3.4): "her second Emmy", "a
+// decade on tour" and "won twice" all state a count the data never gave.
+// Refused, case-insensitively on word boundaries: the cardinals two to
+// nineteen; the tens twenty to ninety, which also refuses a tens word joined
+// to a unit by a hyphen or a space ("twenty-five", "forty two"); the
+// ordinals second to nineteenth, twentieth to ninetieth, hundredth,
+// thousandth, millionth, billionth and trillionth; hundred, thousand,
+// million, billion and trillion, singular or plural; decade, decades,
+// century, centuries, twice, thrice, dozen, dozens, percent and "per cent",
+// so "half a century" and "a quarter century" are caught too; double,
+// triple, quadruple and quintuple, with or without a final "d", "s" or
+// "ing" ("a double Emmy winner", "she doubled her audience", "her sales
+// triples", "doubling every year"), except "doubles" right before tennis,
+// match or partner; sextuple, septuple and octuple; halve, halved, halves
+// and halving; any word that ends in "fold" after at least one letter
+// ("twofold", "tenfold"), which also refuses "unfold", "manifold" and
+// "scaffold" at the cost of one rewrite, as "mid-century" does; "one time"
+// or "one-time"; and a run of four or more digit words, which spells out a
+// phone number (C3.5). "One", "first", "single", "zero", "half" and
+// "quarter" on their own pass ("half the fun", "a quarter of the episode"),
+// and so do longer words that start with a listed one, such as "seconds",
+// "secondary", "tenths" and "sextupled". A tens word fused to its unit with
+// no gap ("fortytwo") is not caught.
 const NUMBER_WORDS =
-  /\b(?:hundreds?|thousands?|millions?|billions?|trillions?|dozens?|percent|per\s+cent|(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)[\s\p{Pd}]+times?|(?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)[\s\p{Pd},.]+){3,}(?:zero|oh|one|two|three|four|five|six|seven|eight|nine))\b/iu;
+  /\b(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|thirtieth|fortieth|fiftieth|sixtieth|seventieth|eightieth|ninetieth|hundredth|thousandth|millionth|billionth|trillionth|hundreds?|thousands?|millions?|billions?|trillions?|decades?|centur(?:y|ies)|twice|thrice|dozens?|percent|per\s+cent|doubl(?:e|ed|ing)|doubles(?![\s\p{Pd}]+(?:tennis|match|partner)\b)|tripl(?:e|ed|es|ing)|quadrupl(?:e|ed|es|ing)|quintupl(?:e|ed|es|ing)|sextuple|septuple|octuple|halv(?:e|ed|es|ing)|\p{L}+fold|one[\s\p{Pd}]+times?|(?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)[\s\p{Pd},.]+){3,}(?:zero|oh|one|two|three|four|five|six|seven|eight|nine))\b/iu;
 const SPACE_RUN = /[^\S\r\n]{2,}/g;
 /** The words the prompts and finish_board's hint name, kept next to TREND_CLAIM so the two cannot drift apart. */
 export const TREND_CLAIM_WORDS = "rising, on the rise, trending, up and coming, a breakout, buzzy, surging or growing in popularity";
@@ -76,6 +94,50 @@ export const ACCUSATIONS_RULE = "Do not mention arrests, charges, lawsuits, accu
 // case-insensitively on word boundaries.
 const ACCUSATION =
   /\b(?:arrest(?:s|ed)?|convicted|convictions?|accused|accusations?|allegations?|allegedly|lawsuits?|sued|indicted|indictments?|charged\s+with|scandals?|overdosed?|overdoses|jailed|imprisoned|incarcerated|fraud|abused|abusers?|misconduct|harass(?:ed|ment))\b/iu;
+/** The sentence the prompts and finish_board's hint share. */
+export const RELEASE_CLAIM_RULE =
+  "Qloo does not say who is in a release, so never write that someone has a film, show, book or album coming out. Pick them for it if you like, but write the angle about their work so far.";
+// upcoming_releases lists titles only and Qloo never says who is in one, so
+// "her new film" or "his album is on the way" is a guess about a real
+// person's work (A2-5). Matched case-insensitively on word boundaries, each
+// gap any run of spaces or Unicode dashes. A lead word (upcoming,
+// forthcoming, new, latest, next, debut, coming) counts when a kind of work
+// is one of the next three words, so "the upcoming Dune sequel" and "his new
+// Netflix series" are caught; its gaps also take a comma, so "her upcoming,
+// untitled film" is caught too. A word in between may not be exactly to, on,
+// for, of, at, in, with, the, this, that, our, your or their, because those
+// start a phrase about something else, so "new to the show" and "new on this
+// show" pass; that also lets "the next of her books" through. A release verb
+// in the present (comes, coming, drops, dropping, releases, releasing,
+// arrives, arriving, lands, landing, hits, premieres, opens) counts right
+// before "in", "this", "next" or "later this", with "out" allowed between,
+// and then the name of a month, or week, month, year, season or a time of
+// year, so "comes out in May", "drops this fall" and "arrives later this
+// year" are caught; up to two words may also sit between the verb and "later
+// this" plus a time, or "in" plus a month's name, so "hits stores in March"
+// is caught. A verb in the past
+// ("came out in spring") is not a claim about what is coming. "Coming out
+// as" and "coming out story" are refused earlier as sensitive traits.
+// "Episode", "release" on its own, "before release", "an upcoming episode"
+// and "premier" pass. It does not catch every way to say it, such as "has a
+// film out soon"; the prompts forbid those too.
+const RELEASE_CLAIM =
+  /\b(?:coming[\s\p{Pd}]+out|on[\s\p{Pd}]+the[\s\p{Pd}]+way|out[\s\p{Pd}]+(?:this|next)[\s\p{Pd}]+(?:week|month|year|spring|summer|fall|autumn|winter)|due(?:[\s\p{Pd}]+out)?[\s\p{Pd}]+(?:this|next)[\s\p{Pd}]+(?:week|month|year|season|spring|summer|fall|autumn|winter)|(?:upcoming|forthcoming|new|latest|next|debut|coming)(?:[\s\p{Pd},]+(?!(?:to|on|for|of|at|in|with|the|this|that|our|your|their)(?![^\s\p{Pd},]))[^\s\p{Pd},]+){0,2}[\s\p{Pd},]+(?:films?|movies?|series|shows?|specials?|books?|memoirs?|novels?|albums?|records?|singles?|tours?|seasons?|documentar(?:y|ies)|projects?|sequels?|prequels?|reboots?|remakes?|spin\p{Pd}?offs?|adaptations?)|(?:comes|coming|drops|dropping|releases|releasing|arrives|arriving|lands|landing|hits|premieres|opens)(?:[\s\p{Pd}]+(?:out[\s\p{Pd}]+)?(?:in|this|next|later(?:[\s\p{Pd}]+this)?)[\s\p{Pd}]+(?:january|february|march|april|may|june|july|august|september|october|november|december|week|month|year|season|spring|summer|fall|autumn|winter)|(?:[\s\p{Pd}]+[^\s\p{Pd}]+){0,2}[\s\p{Pd}]+(?:later[\s\p{Pd}]+this[\s\p{Pd}]+(?:week|month|year|season|spring|summer|fall|autumn|winter)|in[\s\p{Pd}]+(?:january|february|march|april|may|june|july|august|september|october|november|december)))|slated[\s\p{Pd}]+(?:for|to)|set[\s\p{Pd}]+to[\s\p{Pd}]+(?:premiere|release|debut|open|drop)|premier(?:es?|ed|ing)|in[\s\p{Pd}]+theat(?:er|re)s|hits[\s\p{Pd}]+(?:theat(?:er|re)s|shelves))\b/iu;
+/** The sentence the prompts and finish_board's hint share. */
+export const FAMILY_RULE =
+  "Do not mention the guest's partner, marriage, children or other family: what a model remembers about a real person's family is often wrong.";
+// A model's memory of who a real person married, divorced or had children
+// with is often wrong, and the guest's team reads the pitch. Matched
+// case-insensitively on whole words, so "Sonic", "Babylon" and "sonnet"
+// pass. "Partner" and "family" pass too, because business
+// partners and family comedy are everyday topics; the prompts forbid those
+// claims instead. checkProse's NFC cleaning composes a typed accent first, so
+// "fiancé" arrives as one letter é. \b counts é as a non-word character and
+// would never match after it, so the accented forms end where no letter,
+// digit or underscore follows instead. A form not listed, such as "fiancés"
+// or "stepson", is not caught.
+const FAMILY_CLAIM =
+  /\b(?:wife|wives|husbands?|spouses?|marriages?|married|divorced?|fiancee?|girlfriends?|boyfriends?|motherhood|fatherhood|parenthood|parenting|kids?|children|sons?|daughters?|baby|babies|newborns?|widows?|widowed|widowers?)\b|\bfiancée?(?![\p{L}\p{N}_])/iu;
 // Ethnicity, religion and gender words. In prose they are everyday topics, so
 // only isShowableTag uses them. Matched case-insensitively on word
 // boundaries, so "Blackjack" and "Menswear" pass.
@@ -128,9 +190,10 @@ export function withoutLinks(text: string): { text: string; removed: ProseCheck[
  * email address linkify-it finds and counts them (C3.5); refuses with reason
  * "digits" if any number character is left outside a `{{name}}` placeholder
  * whose name is in `placeholders` (C3.4), and also if that text states a
- * figure in words ("three million", "a dozen", "ninety percent", "two-time")
- * or spells out four or more digits in a row, as a phone number would be
- * (C3.5). A placeholder not on that list is
+ * figure in words ("two", "ninety-five", "second", "a decade", "twice", "a
+ * dozen", "three million", "ninety percent", "double", "tenfold",
+ * "millionth") or spells out four or more digits in a row, as a phone
+ * number would be (C3.5); "one", "first" and "single" pass. A placeholder not on that list is
  * plain text, so any digit inside it fails. With `noTrendClaims`, the same
  * text outside the listed placeholders is refused with reason "trend_claim"
  * if it calls someone rising, on the rise, trending, up and coming, "a
@@ -141,7 +204,13 @@ export function withoutLinks(text: string): { text: string; removed: ProseCheck[
  * "diagnosed"; every prose check is about a real person, so this is not
  * optional. For the same reason it is always refused with reason
  * "accusation" if it reports an arrest, a charge, a lawsuit, an accusation
- * or a scandal, such as "arrested", "accused" or "lawsuit". These checks run
+ * or a scandal, such as "arrested", "accused" or "lawsuit", with reason
+ * "release_claim" if it says someone has a release coming, such as "coming
+ * out", "her new film", "the upcoming Dune sequel", "out next month", "due
+ * next year", "slated for spring", "set to premiere" or "premieres", and with reason
+ * "family_claim" if it names a spouse, a marriage, a child or a parenthood,
+ * such as "wife", "married", "kids" or "daughter"; "partner" and "family"
+ * pass. These checks run
  * before placeholders are filled, so a filled-in
  * value never trips them. Text left empty by removals is refused as
  * "empty". On refusal `text` is "", so failed prose cannot be shown by
@@ -173,22 +242,80 @@ export function checkProse(
   if (opts.noTrendClaims === true && TREND_CLAIM.test(outsidePlaceholders)) return refuse("trend_claim", removed);
   if (SENSITIVE_TRAIT.test(outsidePlaceholders)) return refuse("sensitive_trait", removed);
   if (ACCUSATION.test(outsidePlaceholders)) return refuse("accusation", removed);
+  if (RELEASE_CLAIM.test(outsidePlaceholders)) return refuse("release_claim", removed);
+  if (FAMILY_CLAIM.test(outsidePlaceholders)) return refuse("family_claim", removed);
 
   return { ok: true, text, removed };
+}
+
+// The tag families whose tags describe a work or a conversation: genres,
+// styles, tone, aesthetics, the host's manner and the kind of audience.
+// Families that describe a person (ethnicity, nationality, gender,
+// religion, residence, occupation, lifestyle, hobby) or hold free-form
+// topics (theme, keyword, category, archetype, characteristic) are left
+// out. An allowlist rather than a denylist, so a family Qloo adds later is
+// dropped until someone reads what it holds. The names in a family listed
+// here can still be sensitive ("African American" sits in genre:media), so
+// isShowableTag checks every name as well.
+const SHOWABLE_TAG_FAMILIES: ReadonlySet<string> = new Set([
+  "urn:tag:genre:media",
+  "urn:tag:genre:qloo",
+  "urn:tag:subgenre:qloo",
+  "urn:tag:style:qloo",
+  "urn:tag:content:qloo",
+  "urn:tag:emotional_tone:qloo",
+  "urn:tag:aesthetic_property:qloo",
+  "urn:tag:host:qloo",
+  "urn:tag:audience:qloo",
+]);
+// A chip sits next to a real person's name and reads as a fact about them,
+// and a dropped chip costs nothing, so chips use this broad topic net while
+// prose keeps its narrow lists. Matched case-insensitively on whole words,
+// so "Monumental", "Experimental" and "Dragon centric" pass, and harmless
+// names that use a listed word, such as "Space race film", are dropped too.
+const CHIP_TOPIC =
+  /\b(?:crimes?|criminal|sex|sexual|sexually|sexuality|erotica?|political|politically|politics|sociopolitical|sociopolitically|geopolitical|geopolitically|progressive|conservative|liberal|partisan|republicans?|democrats?|religions?|religious|faith|spiritual|spiritually|spirituality|health|mental|therapy|therapists?|anxiety|depression|cancer|illness(?:es)?|diseases?|disability|addiction|addictive|recovery|sobriety|race|racial|ethnic|ethnicity|immigrants?|asians?|gender|drag|environmental|environmentally|activism|activists?)\b/iu;
+// These two are harmless inside a longer name ("Mature storytelling"), but
+// standing alone beside a name they read as a claim about the person.
+const CHIP_WHOLE_NAME = /^\s*(?:socially[\s\p{Pd}]+conscious|mature)\s*$/iu;
+// A family is the first four parts of the id, and at least one lowercase
+// part follows it ("urn:tag:genre:media:comedy", and Qloo's own
+// "urn:tag:genre:media:media:action"). Any other shape, including a bare
+// family or a different case, gives no family.
+const TAG_ID = /^(urn:tag:[a-z_]+:[a-z_]+)(?::[a-z0-9_]+)+$/;
+
+/**
+ * Whether a Qloo tag id belongs to a family whose tags may be shown as taste
+ * chips: genre:media, genre:qloo, subgenre:qloo, style:qloo, content:qloo,
+ * emotional_tone:qloo, aesthetic_property:qloo, host:qloo and audience:qloo.
+ * False for every other family, such as theme, keyword, ethnicity, religion
+ * or gender, for a family not seen before, and for an id of any other shape.
+ * It says nothing about the tag's name; use isShowableTag for that too.
+ */
+export function isShowableTagId(tagId: string): boolean {
+  if (typeof tagId !== "string") return false;
+  const family = TAG_ID.exec(tagId)?.[1];
+  return family !== undefined && SHOWABLE_TAG_FAMILIES.has(family);
 }
 
 /**
  * Whether a Qloo tag name may be shown as a taste chip. A taste chip shown
  * next to a person reads as a fact about them, so identity words never
  * appear as chips: false when the name uses a word checkProse refuses as a
- * sensitive trait, or an ethnicity, religion or gender word such as "Black",
- * "Muslim" or "Women"; true otherwise. Words match whole, so "Blackjack" and
- * "Menswear" pass. A dropped chip costs nothing, so this errs toward
- * dropping: "Jack Black" and "Mad Men" go too. Check the name exactly as it
- * will be shown, since cutting a name can leave a new whole word at its end.
+ * sensitive trait or an accusation, an ethnicity, religion or gender word
+ * such as "Black", "Muslim" or "Women", or a crime, sex, politics, faith,
+ * health, addiction, race, gender or activism topic word such as "Mental
+ * Health", "Faith oriented" or "Political comedy", or is exactly "Socially
+ * conscious" or "Mature"; true otherwise. Words
+ * match whole, so "Blackjack", "Menswear" and "Experimental" pass. A dropped
+ * chip costs nothing, so this errs toward dropping: "Jack Black", "Mad Men"
+ * and "Space race film" go too. Check the name
+ * exactly as it will be shown, since cutting a name can leave a new whole
+ * word at its end. This is the second net under isShowableTagId, not a
+ * replacement for it.
  */
 export function isShowableTag(name: string): boolean {
-  return !SENSITIVE_TRAIT.test(name) && !IDENTITY_TAG.test(name);
+  return !SENSITIVE_TRAIT.test(name) && !IDENTITY_TAG.test(name) && !ACCUSATION.test(name) && !CHIP_TOPIC.test(name) && !CHIP_WHOLE_NAME.test(name);
 }
 
 /**

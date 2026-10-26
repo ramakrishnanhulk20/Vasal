@@ -1,10 +1,12 @@
-// Covers ops nightly in scripts/ops.ts on PGlite: prune runs whatever budgets
-// returned, and the night passes only when both steps did. It does not cover
-// the scheduler that starts it (Railway's cron), the process exit code, which
-// main and runToExit set from this result (ops-exit.test.ts covers
+// Covers ops nightly in scripts/ops.ts on PGlite: prune and reconcile run
+// whatever budgets returned, the reconcile frees a lost run place and prints
+// its counts, and the night passes only when every step did. It does not
+// cover the scheduler that starts it (Railway's cron), the process exit code,
+// which main and runToExit set from this result (ops-exit.test.ts covers
 // runToExit), or a step that throws.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readArgs, runNightly } from "../scripts/ops.js";
+import { acquireMcpRunSlots } from "../src/server/caps.js";
 import { cachePut } from "../src/store/cache.js";
 import type { Db } from "../src/store/db.js";
 import { migratedPglite } from "./helpers/pglite.js";
@@ -46,7 +48,7 @@ describe("ops nightly", () => {
     expect(await cacheKeys()).toEqual([]);
     expect(lines).toContain("Budgets at 2027-03-01 03:00 UTC: no profile in scripts/budget-policy.json covers today, so nothing was set.");
     expect(lines.some((line) => line.startsWith("Pruned 1 expired cache rows"))).toBe(true);
-    expect(lines.at(-1)).toBe("Nightly: budgets failed, prune passed.");
+    expect(lines.at(-1)).toBe("Nightly: budgets failed, prune passed, reconcile passed.");
   });
 
   it("passes when budgets and prune both pass", async () => {
@@ -56,12 +58,32 @@ describe("ops nightly", () => {
     expect(await runNightly(db)).toBe(true);
 
     expect(lines).toContain("No problems.");
-    expect(lines.at(-1)).toBe("Nightly: budgets passed, prune passed.");
+    expect(lines).toContain("No place was lost.");
+    expect(lines.at(-1)).toBe("Nightly: budgets passed, prune passed, reconcile passed.");
   });
 
-  it("readArgs accepts nightly alone", () => {
+  it("frees a run place lost to a failed release, after budgets and prune, and prints the counts before and after", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-10T03:00:00.000Z"));
+    expect(await acquireMcpRunSlots(db, 1, 3)).toBe(true);
+
+    expect(await runNightly(db)).toBe(true);
+
+    const { rows } = await db.query<{ slot: string; n: number }>("SELECT slot, n FROM inflight ORDER BY slot");
+    expect(rows).toEqual([
+      { slot: "mcp", n: 0 },
+      { slot: "runs", n: 0 },
+    ]);
+    const order = ["$ ops budgets", "$ ops prune", "$ ops reconcile"].map((line) => lines.indexOf(line));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(order[0]).toBeGreaterThanOrEqual(0);
+    expect(lines).toEqual(expect.arrayContaining(["  site  1 before, 0 after", "  MCP   1 before, 0 after", "Freed 2 places that no run held."]));
+  });
+
+  it("readArgs accepts nightly and reconcile alone", () => {
     expect(readArgs(["nightly"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "nightly" } });
-    for (const argv of [["nightly", "extra"], ["nightly", "--yes"], ["nightly", "--pick", "1"]]) {
+    expect(readArgs(["reconcile"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "reconcile" } });
+    for (const argv of [["nightly", "extra"], ["nightly", "--yes"], ["nightly", "--pick", "1"], ["reconcile", "extra"], ["reconcile", "--yes"]]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
   });

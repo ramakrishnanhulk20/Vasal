@@ -1,7 +1,8 @@
 // Covers the operator's showcase commands in src/ops/promote.ts on PGlite,
 // which runs as its owner: the preview, promotion and its refusals including
 // a missing brief, moving a run, unpromoting, the list, isPromoted, reading a
-// run's briefs, and the terminal formatting. It does not cover the app role
+// run's briefs (a deferred claim written through seed's writeBriefs with a
+// fake runner), and the terminal formatting. It does not cover the app role
 // being refused writes (server-runs.test.ts), two operators promoting at once
 // on hosted Postgres (PGlite has one connection, so the table lock never
 // waits), or the argument parsing and exit codes of scripts/ops.ts (its
@@ -12,6 +13,7 @@ import {
   formatPreview,
   formatPromoted,
   isPromoted,
+  isWritable,
   listPromoted,
   previewRun,
   PromoteError,
@@ -19,10 +21,13 @@ import {
   readBriefs,
   unpromoteRun,
 } from "../src/ops/promote.js";
+import { writeBriefs } from "../src/ops/seed.js";
 import {
   claimBrief,
   createRun,
+  getBriefClaim,
   listShowcase,
+  markBriefDone,
   markBriefFailed,
   putBoard,
   putBrief,
@@ -306,5 +311,43 @@ describe("terminal formatting", () => {
     ]);
     expect(listed).toEqual([full[0], ...full.slice(-4)]);
     expect(full.join("\n")).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/u);
+  });
+});
+
+describe("a brief a budget refused (audit A1-9)", () => {
+  it("reads a deferred claim as no brief yet, on attempt 1 or 2, and the briefs command writes it", async () => {
+    const { runId, guestIds } = await runWith("done", [guest(1), guest(2), guest(3)], { briefs: 0 });
+    const [firstTry, secondTry, untouched] = guestIds as [string, string, string];
+    await claimBrief(db, runId, firstTry, 5, NOW);
+    await markBriefFailed(db, runId, firstTry, "MODEL_BUDGET");
+    await claimBrief(db, runId, secondTry, 5, NOW);
+    await markBriefFailed(db, runId, secondTry, "MODEL_TIMEOUT");
+    await claimBrief(db, runId, secondTry, 5, NOW);
+    await markBriefFailed(db, runId, secondTry, "QLOO_BUDGET");
+
+    const before = await readBriefs(db, runId);
+    expect(before.guests.map((entry) => entry.state)).toEqual([{ kind: "none" }, { kind: "none" }, { kind: "none" }]);
+    expect(before.guests.every((entry) => isWritable(entry.state))).toBe(true);
+    expect(formatBriefs(before, { full: false }).slice(1)).toEqual([
+      "     1. Synthetic Guest 1: no brief yet.",
+      "     2. Synthetic Guest 2: no brief yet.",
+      "     3. Synthetic Guest 3: no brief yet.",
+    ]);
+
+    const written: string[] = [];
+    const runner = {
+      ready: true,
+      writeBrief: async (id: string, guestId: string) => {
+        written.push(guestId);
+        await putBrief(db, id, guestId, syntheticBrief(1));
+        await markBriefDone(db, id, guestId);
+      },
+    };
+    const after = await writeBriefs(db, runner, runId);
+
+    expect([...written].sort()).toEqual([firstTry, secondTry, untouched].sort());
+    expect(after.guests.map((entry) => entry.state.kind)).toEqual(["written", "written", "written"]);
+    expect(await getBriefClaim(db, runId, firstTry)).toEqual({ status: "done", attempts: 1, errorCode: null });
+    expect(await getBriefClaim(db, runId, secondTry)).toEqual({ status: "done", attempts: 2, errorCode: null });
   });
 });

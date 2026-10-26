@@ -7,7 +7,7 @@ import { cleanText } from "../text/normalize.js";
 import { reachFrom, type Reach } from "./board.js";
 import type { RunContext } from "./context.js";
 import type { ModelClient } from "./model.js";
-import { isPastGuest, sameName } from "./past-guests.js";
+import { isHost, isPastGuest, sameName } from "./past-guests.js";
 import { WITHOUT_QLOO_SYSTEM } from "./prompts.js";
 import { hasDied } from "./tools.js";
 
@@ -18,6 +18,7 @@ export type WithoutQlooGuess = {
   fitKnown: boolean;
   reach: Reach;
   pastGuest: boolean;
+  host: boolean;
   onBoard: boolean;
 };
 
@@ -71,12 +72,14 @@ const GuessesSchema = z
   .strict();
 
 /**
- * The publisher the flip's prompt may carry: a directory show's publisher,
- * and null for a pasted feed, whose publisher is the hostname of the URL the
- * visitor typed, so no visitor-influenced text reaches the prompt (C2.7).
+ * The publisher the flip's prompt may carry: the publisher of a show a
+ * directory name search found (provenance "directory"), and null for every
+ * other provenance. A pasted feed's publisher is the hostname of the URL the
+ * visitor typed, and an Apple entry a visitor linked can carry any publisher
+ * name it likes, so no visitor-influenced text reaches the prompt (C2.7).
  */
-export function publisherForPrompt(show: { publisher: string; feedHandleSource: "directory" | "visitor" }): string | null {
-  return show.feedHandleSource === "directory" ? show.publisher : null;
+export function publisherForPrompt(show: { publisher: string; provenance: "directory" | "linked" | "pasted" }): string | null {
+  return show.provenance === "directory" ? show.publisher : null;
 }
 
 // Each value is a JSON string, so a title that reads like an instruction
@@ -166,8 +169,10 @@ async function scoreAll(
  * Returns the matched guesses in the model's order, each with Qloo's cleaned
  * name (at most 120 characters), fit (the affinity rounded to 2 decimals, or
  * null with fitKnown false), reach (reachFrom the fit answer's popularity,
- * else the search hit's), pastGuest (isPastGuest on ctx.pastGuests.index;
- * past guests are kept and flagged) and onBoard (the id is on `board`). The
+ * else the search hit's), host (isHost on ctx.pastGuests.index), pastGuest
+ * (isPastGuest on that index, and false for a host, so a host is flagged
+ * only as a host; past guests and hosts are kept and flagged) and onBoard
+ * (the id is on `board`). The
  * model's own strings are never returned, and neither is any Qloo id. Reads
  * ctx and changes nothing in it.
  *
@@ -219,12 +224,14 @@ export async function guessWithoutQloo(deps: {
     .filter((person) => !dead.has(person.personId))
     .map((person): WithoutQlooGuess => {
       const score = scores.get(person.personId);
+      const host = isHost(ctx.pastGuests.index, person.name);
       return {
         name: person.name,
         fit: score === undefined ? null : round2(score.affinity),
         fitKnown: score !== undefined,
         reach: reachFrom(score?.popularity ?? person.popularity),
-        pastGuest: isPastGuest(ctx.pastGuests.index, person.name),
+        pastGuest: !host && isPastGuest(ctx.pastGuests.index, person.name),
+        host,
         onBoard: onBoard.has(person.personId),
       };
     });

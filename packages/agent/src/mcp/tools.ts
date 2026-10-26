@@ -14,9 +14,12 @@ import {
   getBrief,
   getBriefClaim,
   getCandidateForToken,
+  getPastGuests,
   getRunForToken,
   listBoard,
   listCandidates,
+  markBriefFailed,
+  MCP_BRIEF_BUDGET,
   setRunStatus,
   type RunInput,
   type RunRecord,
@@ -38,7 +41,7 @@ import {
   runOutput,
   writeBriefOutput,
 } from "./results.js";
-import { countTokenUse, MCP_LIMITS } from "./usage.js";
+import { countTokenUse, MCP_LIMITS, tokenUseAtCap } from "./usage.js";
 
 /** What the tools act with. `tokenId` is the key row id from the request's own check, never the key. */
 export type ToolDeps = {
@@ -183,9 +186,16 @@ async function pollUntil(
  * run is left looking alive (C6.4). find_show holds MCP's slot pair
  * (acquireMcpRunSlots) from before it counts the find until its run's
  * candidates are read back, and answers busy at once, spending nothing, when
- * the pair is taken (D3.3, D3.7). write_brief with an agent that is not
- * ready answers upstream_failed before it counts or claims anything. Must be
- * called before the server connects. Never throws.
+ * the pair is taken (D3.3, D3.7). Before taking the pair, find_show and
+ * book_guests read the key's day (tokenUseAtCap) and answer
+ * budget_exhausted, taking nothing, for a key already at its cap; the
+ * atomic count after the pair stays the gate. write_brief with an agent that
+ * is not ready answers upstream_failed before it counts or claims anything.
+ * write_brief counts the key's daily brief only after its own claim
+ * succeeds, and a refused count defers that claim with MCP_BRIEF_BUDGET, so
+ * no attempt is spent. A claim the brief writer defers on a budget ends the
+ * wait as budget_exhausted. Must be called before the server connects.
+ * Never throws.
  */
 export function registerTools(server: McpServer, deps: ToolDeps): void {
   const { db, agent, config, now, waitMs, tokenId } = deps;
@@ -215,7 +225,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       }
     };
 
-  const boardOf = async (run: RunRecord): Promise<CallToolResult> => boardReply(run.id, await listBoard(db, run.id), config.appOrigin);
+  const boardOf = async (run: RunRecord): Promise<CallToolResult> =>
+    boardReply(run.id, await listBoard(db, run.id), config.appOrigin, await getPastGuests(db, run.id));
 
   // A failed run is answered with its caller code as the error.
   const bookingState = async (run: RunRecord): Promise<CallToolResult> => {
@@ -260,7 +271,10 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
         const stored = await getBrief(db, runId, guestId);
         if (stored !== null) return briefReply(runId, guestId, stored);
         const claim = await getBriefClaim(db, runId, guestId);
-        return claim?.status === "failed" ? errorReply("upstream_failed") : null;
+        if (claim?.status === "failed") return errorReply("upstream_failed");
+        // Nothing is writing a deferred brief, so waiting on would only end
+        // in a pending answer that is not true.
+        return claim?.status === "deferred" ? errorReply("budget_exhausted") : null;
       },
       pendingReply,
     );
@@ -270,6 +284,9 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
     { title: "Find a show", description: DESCRIPTIONS.find_show, inputSchema: LISTED.find_show, outputSchema: findShowOutput, annotations: SPENDS },
     guarded("find_show", findShowInput, async ({ query }) => {
       if (!(await liveRunsEnabled(db))) return errorReply("mcp_off");
+      // A key already at its daily finds would be refused only after taking
+      // the pair, so it could keep MCP's one place from every other key.
+      if (await tokenUseAtCap(db, tokenId, "finds", MCP_LIMITS.findsPerDay, now())) return errorReply("budget_exhausted");
       // startRun searches Apple or fetches a pasted feed, so it holds MCP's
       // one place among the site's run places, the pair book_guests takes:
       // every key together runs one lookup at a time and never crowds out
@@ -316,6 +333,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // another run (D3.4).
       if (run.status === "running" || run.status === "done" || run.status === "failed") return bookingState(run);
       if (!(await liveRunsEnabled(db))) return errorReply("mcp_off");
+      // The same early stop as find_show's, for a key out of daily runs.
+      if (await tokenUseAtCap(db, tokenId, "runs", MCP_LIMITS.runsPerDay, now())) return errorReply("budget_exhausted");
       if (!(await acquireMcpRunSlots(db, MCP_RUN_SLOTS, config.maxInflightRuns))) return errorReply("busy");
 
       let settled: Promise<void> | null = null;
@@ -375,7 +394,8 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       const stored = await getBrief(db, run.id, guestId);
       if (stored !== null) return briefReply(run.id, guestId, stored);
       // Mirrors the website's brief route: storage answers first, and only a
-      // brief never claimed, or one with a retry left, goes on to spend.
+      // brief never claimed, one a budget deferred, or one with a retry left,
+      // goes on to spend.
       const held = await getBriefClaim(db, run.id, guestId);
       if (held?.status === "pending") return waitForBrief(run.id, guestId, null);
       if (held?.status === "failed" && held.attempts === 2) return errorReply("upstream_failed");
@@ -386,13 +406,24 @@ export function registerTools(server: McpServer, deps: ToolDeps): void {
       // An agent with no keys would only fail the brief, so neither the key's
       // daily count nor the guest's claim is spent on it.
       if (agent.ready === false) return errorReply("upstream_failed");
-      if (!(await countTokenUse(db, tokenId, "briefs", MCP_LIMITS.briefsPerDay, now()))) return errorReply("budget_exhausted");
       // The claim is the one gate in front of the model, so parallel calls
       // make one model call (D3.5, C5.8).
       const claim = await claimBrief(db, run.id, guestId, BRIEFS_PER_RUN, now());
       if (claim === "limit") return errorReply("budget_exhausted");
       if (claim === "failed") return errorReply("upstream_failed");
-      return waitForBrief(run.id, guestId, claim === "claimed" ? briefInBackground(run.id, guestId) : null);
+      if (claim === "exists") return waitForBrief(run.id, guestId, null);
+      // Counted only once this call has won the claim, so a claim refused or
+      // already held never spends a daily brief. A count that is refused or
+      // fails defers the claim, spending no attempt, as book_guests moves its
+      // run back.
+      let counted = false;
+      try {
+        counted = await countTokenUse(db, tokenId, "briefs", MCP_LIMITS.briefsPerDay, now());
+      } finally {
+        if (!counted) await markBriefFailed(db, run.id, guestId, MCP_BRIEF_BUDGET);
+      }
+      if (!counted) return errorReply("budget_exhausted");
+      return waitForBrief(run.id, guestId, briefInBackground(run.id, guestId));
     }),
   );
 }

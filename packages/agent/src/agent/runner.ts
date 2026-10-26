@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { FeedError } from "../feeds/errors.js";
 import { FeedHandles } from "../feeds/handles.js";
-import type { ShowCandidate } from "../feeds/lookup.js";
+import { createDirectoryCache, type DirectoryLookup, type ShowCandidate } from "../feeds/lookup.js";
 import type { ParsedFeed } from "../feeds/rss.js";
 import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo, MeteredRawQloo } from "../qloo/metered.js";
@@ -21,14 +21,17 @@ import {
   putBrief,
   putCandidates,
   setRunStatus,
+  storedCandidateRow,
+  storedReach,
+  type FeedSource,
   type RunSurface,
 } from "../server/runs.js";
 import type { Db } from "../store/db.js";
-import { reserve, waitForQlooSlot } from "../store/meter.js";
+import { reserveWithReceipt, settleToUsage, waitForQlooSlot } from "../store/meter.js";
 import { cleanText } from "../text/normalize.js";
 import { buildBoard, type BoardEntry } from "./board.js";
 import { writeBrief as writeGuestBrief } from "./brief.js";
-import { createRunContext, type PastGuestCheck, type RunContext } from "./context.js";
+import { createRunContext, type OperatorArchive, type PastGuestCheck, type RunContext } from "./context.js";
 import { AgentError } from "./errors.js";
 import { DEFAULT_LIMITS, runResearch, stepFor, type StepEvent } from "./loop.js";
 import type { ModelClient } from "./model.js";
@@ -37,8 +40,8 @@ import { attachHarness, dropPerson, hasDied, runTool, type ToolName } from "./to
 import { guessWithoutQloo, publisherForPrompt, WITHOUT_QLOO_UNAVAILABLE, type WithoutQlooEvent } from "./without-qloo.js";
 
 export type AgentFeeds = {
-  searchShows: (term: string) => Promise<ShowCandidate[]>;
-  lookupShow: (appleId: string) => Promise<ShowCandidate | null>;
+  searchShows: (term: string, opts?: DirectoryLookup) => Promise<ShowCandidate[]>;
+  lookupShow: (appleId: string, opts?: DirectoryLookup) => Promise<ShowCandidate | null>;
   safeFetch: (url: URL, opts?: { totalTimeoutMs?: number }) => Promise<{ body: string }>;
   parseFeed: (xml: string) => ParsedFeed;
 };
@@ -56,19 +59,23 @@ const MAX_SHOW_NAME_CHARS = 200;
 const QLOO_ID = /^[A-Za-z0-9-]{8,64}$/;
 const FILL_TOOLS: readonly ToolName[] = ["audience_of", "trend_of", "shared_taste"];
 
-// Rows are read back through the same limits they were written under, and a
-// row that does not fit counts as missing (C6.5).
-const CandidateRow = z
-  .object({
-    appleId: z.string().max(20).nullable(),
-    name: z.string().min(1).max(200),
-    publisher: z.string().max(200),
-    feedHandleSource: z.enum(["directory", "visitor"]),
-    feedUrl: z.string().max(8_192).nullable(),
-    qlooId: z.string().regex(QLOO_ID),
-    qlooName: z.string().min(1).max(200),
-  })
-  .strict();
+/**
+ * What an operator may add to one run's past-guest check, and only from the
+ * ops commands: hosts the feed does not name, and older episodes the feed no
+ * longer reaches. Neither is stored or shown; the board event records only
+ * how many archive titles were added.
+ */
+export type OperatorInput = { readonly hosts?: readonly string[]; readonly archive?: OperatorArchive | null };
+
+/**
+ * A stored candidate as continueRun reads it back, through the same limits
+ * it was written under; a row that does not fit counts as missing (C6.5).
+ * It is storedCandidateRow, the one schema the ops commands and the
+ * past-guest view read candidates with too, so its provenance always comes
+ * out set: a row stored without one reads as "directory" when its
+ * feedHandleSource is "directory" and "pasted" otherwise.
+ */
+export const CandidateRow = storedCandidateRow;
 
 const BoardRow = z
   .object({
@@ -77,7 +84,7 @@ const BoardRow = z
     fit: z.number(),
     fitKnown: z.boolean(),
     fitRank: z.number().int().min(1),
-    reach: z.enum(["household name", "well known", "bookable", "unknown"]),
+    reach: storedReach,
     rising: z.object({ state: z.enum(["rising", "steady", "falling", "unknown"]), points: z.number().nullable() }).strict(),
     bringsNew: z.object({ segment: z.string().max(100), label: z.string().max(100), gap: z.number() }).strict().nullable(),
     sharedTags: z.array(z.string().max(200)).max(5),
@@ -145,12 +152,17 @@ export async function waitForSurfaceQlooSlot(db: Db, surface: RunSurface, signal
 
 /**
  * The model-token meter for one surface: reserves `amount` from that
- * surface's model bucket in SURFACE_BUDGETS. Passed to createAnthropicModel
- * as its reserveTokens. Throws ServerError("SRV_BAD_INPUT") for any surface
- * other than "web" or "mcp", and whatever reserve throws.
+ * surface's model bucket in SURFACE_BUDGETS (reserveWithReceipt). Passed to
+ * createAnthropicModel as its reserveTokens. Returns false, charging
+ * nothing, when the bucket refuses, and otherwise the settle callback
+ * settleToUsage gives, which moves the reservation to the tokens the call
+ * really used: what went unused comes back and an over-run is charged.
+ * Throws ServerError("SRV_BAD_INPUT") for any surface other than "web" or
+ * "mcp", and whatever reserveWithReceipt throws.
  */
-export async function reserveSurfaceTokens(db: Db, surface: RunSurface, amount: number): Promise<boolean> {
-  return reserve(db, [{ key: budgetOf(surface).modelKey, amount }]);
+export async function reserveSurfaceTokens(db: Db, surface: RunSurface, amount: number): Promise<false | ((used: number) => Promise<void>)> {
+  const receipt = await reserveWithReceipt(db, [{ key: budgetOf(surface).modelKey, amount }]);
+  return receipt === null ? false : settleToUsage(db, receipt);
 }
 
 function knownCode(error: unknown): string | null {
@@ -163,10 +175,11 @@ function knownCode(error: unknown): string | null {
  * episode the parser kept comes back, because a guest from years back is
  * still a past guest. Gives null on any FeedError, so the caller reports past
  * guests as not checked rather than implying there were none, and rethrows
- * anything else. continueRun and the ops backfill both read feeds this way.
+ * anything else. continueRun, the ops backfill and ops recheck all read
+ * feeds this way.
  */
 export async function fetchShowFeed(
-  feeds: AgentFeeds,
+  feeds: Pick<AgentFeeds, "safeFetch" | "parseFeed">,
   url: URL,
   source: "directory" | "visitor",
   totalTimeoutMs: number,
@@ -186,25 +199,37 @@ export async function fetchShowFeed(
  * The run context for one confirmed show and its feed (null when it could
  * not be read), built the one way continueRun and the ops backfill share.
  * The model is told the Qloo name, not the directory's or the visitor's text
- * (C2.7), and sees the newest 40 non-blank episode titles. Every episode the
- * feed gave, and every name the show goes by (directory name, publisher, Qloo
- * name, feed title), join the past-guest check, because a host is named there
- * and rarely in an episode title.
+ * (C2.7). For a candidate a directory search found (provenance "directory")
+ * it sees the newest 40 non-blank episode titles; for one the visitor linked
+ * or pasted (provenance "linked" or "pasted") it sees none, so
+ * recent_episode_titles and the flip share no title, because no search
+ * vouched for that feed and whoever wrote it may have written its titles
+ * for the model. Every episode the feed gave, whatever its provenance, joins the past-guest check, its title
+ * as a title and its description as a description. The host entries are
+ * every name the show goes by (directory name, publisher, Qloo name, feed
+ * title), the feed's authors and `operator.hosts`, the hosts the operator
+ * named for this run, because a host is named there and rarely in an episode
+ * title. `operator.archive` joins the check as createRunContext describes.
+ * None of the descriptions, authors, operator hosts or archive is shown to
+ * the model.
  */
 export function runContextFor(
-  show: { qlooId: string; qlooName: string; name: string; publisher: string },
+  show: { qlooId: string; qlooName: string; name: string; publisher: string; provenance: FeedSource },
   feed: ParsedFeed | null,
   exclusions: readonly string[],
+  operator: OperatorInput = {},
 ): RunContext {
+  const shown = show.provenance === "directory" ? (feed?.episodes ?? []) : [];
   return createRunContext({
     show: { qlooId: show.qlooId, name: show.qlooName },
-    episodeTitles: (feed?.episodes ?? [])
+    episodeTitles: shown
       .map((episode) => episode.title)
       .filter((title) => title !== "")
       .slice(0, MAX_EPISODE_TITLES),
     exclusions,
     pastGuestEpisodes: feed?.episodes ?? null,
-    showRunners: [show.name, show.publisher, show.qlooName, ...(feed === null ? [] : [feed.title])],
+    showRunners: [show.name, show.publisher, show.qlooName, ...(feed === null ? [] : [feed.title, ...feed.authors]), ...(operator.hosts ?? [])],
+    archive: operator.archive ?? null,
   });
 }
 
@@ -215,15 +240,23 @@ export function runContextFor(
  * reads a pasted feed's title through a handle), stores the candidates in
  * rank order, appends a "candidates" event that carries ids, names,
  * publishers and Qloo names but no URL, and moves the run to
- * awaiting_confirm. The feed URL stays in the stored candidate row.
+ * awaiting_confirm. The feed URL stays in the stored candidate row. Its
+ * directory searches and lookups pass the surface read back from the run's
+ * row, which holds an MCP run to MCP's own directory limit, and the shared
+ * hour-long directory cache (createDirectoryCache on this database).
  *
  * continueRun acts only on a candidate the server stored for that run
  * (C6.2). It fetches the candidate's feed only through a FeedHandles handle
  * issued for this run, and the model has no fetch tool at all (C1.5); on any
  * FeedError it carries on with no episode titles and says so in a step. The
- * model is shown the newest 40 titles, and every title the feed gave, plus
- * the show's directory name, publisher, Qloo name and feed title, is used to
- * leave past guests and hosts out of every tool result (isPastGuest). The
+ * model is shown the newest 40 titles of a feed a directory search found and
+ * none of one the visitor linked or pasted (runContextFor), and every title and description the
+ * feed gave, plus the show's host entries (its directory name, publisher,
+ * Qloo name and feed title, the feed's authors and `operator.hosts`), with
+ * `operator.archive`, is used to leave past guests and hosts out of every
+ * tool result (isPastGuest, through runContextFor). `operator` is only for
+ * an operator's runner, such as one ops seed builds for a single run; the
+ * server never sets it. The
  * feed step says how many titles were read and the month of the oldest
  * dated one, or that the feed gave none. It then runs the research loop,
  * fetches every pick's fit in one metered Qloo call so every fit on the
@@ -239,10 +272,14 @@ export function runContextFor(
  * error or once the deadline has passed, only a "without_qloo" event
  * { status: "unavailable" }. The flip never fails the run; a ServerError from
  * storing it loses only the flip. The board event carries pastGuests
- * { checked, skipped, titles, since } and the done event { checked, skipped }:
- * checked is false when the feed gave no title to check, skipped counts the
- * people left out as past guests, titles how many titles were checked and
- * since the oldest dated one's month ("YYYY-MM") or null. Fewer than 3
+ * { checked, skipped, titles, since, source, candidateId, archiveTitles } and
+ * the done event { checked, skipped }: checked is false when the feed gave
+ * no title to check, skipped counts the people left out as past guests or
+ * hosts, titles how many feed titles were checked, since the oldest dated
+ * one's month ("YYYY-MM") or null, source "directory", "linked" or "pasted",
+ * the confirmed candidate's provenance, candidateId that candidate's id,
+ * and archiveTitles how many titles operator.archive added (0 without one).
+ * No feed URL, host or archive text is ever in an event. Fewer than 3
  * guests fails with AGENT_BOARD_TOO_SMALL; nothing is padded. With `trends`
  * false the research loop is never offered trend_of and the fill skips it,
  * so no trend call is spent and every guest's rising state is "unknown".
@@ -286,8 +323,10 @@ export function createAgentRunner(deps: {
   feeds: AgentFeeds;
   trends: boolean;
   now?: () => Date;
+  operator?: OperatorInput;
 }): AgentPort {
   const { db, qlooFor, harnessFor, modelFor, feeds, trends } = deps;
+  const operator: OperatorInput = { hosts: [...(deps.operator?.hosts ?? [])], archive: deps.operator?.archive ?? null };
   const clock = deps.now ?? (() => new Date());
   const toolOptions = { trends };
   const fillTools = trends ? FILL_TOOLS : FILL_TOOLS.filter((tool) => tool !== "trend_of");
@@ -434,12 +473,16 @@ export function createAgentRunner(deps: {
 
   return {
     async startRun(runId, input) {
-      const qloo = qlooFor((await storedRun(runId)).surface);
+      const { surface } = await storedRun(runId);
+      const qloo = qlooFor(surface);
+      // The surface comes from the run's own row, so only a run stored as a
+      // website run gets the website's directory places (D3.7).
+      const lookup: DirectoryLookup = { cache: createDirectoryCache(db, clock), surface };
       await setRunStatus(db, runId, "running", undefined, clock());
       await failOnKnownError(runId, async () => {
         const shows = await resolveShow(input, {
-          searchShows: feeds.searchShows,
-          lookupShow: feeds.lookupShow,
+          searchShows: (term) => feeds.searchShows(term, lookup),
+          lookupShow: (appleId) => feeds.lookupShow(appleId, lookup),
           safeFetch: feeds.safeFetch,
           parseFeed: feeds.parseFeed,
           qloo,
@@ -481,7 +524,7 @@ export function createAgentRunner(deps: {
 
         const feedTimeoutMs = Math.max(1, Math.min(FEED_TIMEOUT_MS, deadline - clock().getTime()));
         const feed = await readFeed(runId, show.feedUrl, show.feedHandleSource, feedTimeoutMs);
-        const ctx = runContextFor(show, feed, run.input.exclude);
+        const ctx = runContextFor(show, feed, run.input.exclude, operator);
         attachHarness(ctx, { qloo: harnessFor(run.surface), signal: runClock.signal });
         if (feed !== null) await step(runId, feedStep(ctx.pastGuests));
 
@@ -534,10 +577,18 @@ export function createAgentRunner(deps: {
         }));
         const pastGuests = { checked: ctx.pastGuests.checked, skipped: ctx.pastGuests.skipped.size };
         const coverage = { titles: ctx.pastGuests.titles, since: ctx.pastGuests.since };
-        await appendEvent(db, runId, "board", { guests, pastGuests: { ...pastGuests, ...coverage } }, clock());
+        // Which feed was checked, by the provenance the server stored and the
+        // candidate it confirmed, never by its URL, so the public views can
+        // say it without the feed ever leaving the server (C1.5).
+        const provenance = {
+          source: show.provenance,
+          candidateId,
+          archiveTitles: ctx.pastGuests.archiveTitles,
+        };
+        await appendEvent(db, runId, "board", { guests, pastGuests: { ...pastGuests, ...coverage, ...provenance } }, clock());
         await addWithoutQloo(
           runId,
-          { model, qloo, ctx, board, publisher: publisherForPrompt(show) },
+          { model, qloo, ctx, board, publisher: publisherForPrompt({ publisher: show.publisher, provenance: show.provenance }) },
           { overTime, signal: runClock.signal },
         );
         // The done event keeps exactly { checked, skipped }: the seed command

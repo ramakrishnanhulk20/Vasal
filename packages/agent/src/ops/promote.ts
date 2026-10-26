@@ -68,8 +68,9 @@ export type RunPreview = {
 };
 export type PromotedRun = { runId: string; position: number; promotedAt: Date };
 /**
- * Where one board guest's brief stands. "none" has never been claimed and
- * "retry" failed on its first attempt, so the briefs command may write both;
+ * Where one board guest's brief stands. "none" has never been claimed, or
+ * its claim was deferred by a budget, and "retry" failed on its first
+ * attempt, so the briefs command may write both;
  * "failed" used both attempts, "pending" is held by a writer, and
  * "unreadable" is a row, claim or brief that does not read back (C6.5), so
  * none of those three can be written.
@@ -206,7 +207,9 @@ async function briefStateOf(db: Db, runId: string, row: BoardPreviewRow): Promis
   // row that fails it could never get a brief.
   if (row.guest === null) return { kind: "unreadable" };
   const claim = await getBriefClaim(db, runId, row.id);
-  if (claim === null) return { kind: "none" };
+  // A budget's refusal spent no attempt, and claimBrief takes a deferred
+  // claim again just as it takes a new one.
+  if (claim === null || claim.status === "deferred") return { kind: "none" };
   if (claim.status === "pending") return { kind: "pending" };
   if (claim.status === "failed") return claim.attempts === 1 ? { kind: "retry", code: claim.errorCode } : { kind: "failed", code: claim.errorCode };
   return { kind: "unreadable" };
@@ -228,7 +231,7 @@ export async function readBriefs(db: Db, runId: string): Promise<RunBriefs> {
   return { runId: preview.runId, status: preview.status, showName: preview.showName, guests };
 }
 
-/** True for the brief states the briefs command may claim and write: never claimed, or failed on the first attempt. */
+/** True for the brief states the briefs command may claim and write: never claimed or deferred, or failed on the first attempt. */
 export function isWritable(state: BriefState): boolean {
   return state.kind === "none" || state.kind === "retry";
 }

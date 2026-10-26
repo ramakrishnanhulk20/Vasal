@@ -1,13 +1,16 @@
 // Covers the run store on PGlite: ids, status rules, events, candidates, the
-// board, briefs, brief claims and their one retry, the restart sweeps for
-// runs and brief claims, the home-page showcase, including the app role's
-// grants on showcase_runs and run_brief_claims (roles.sql applied to
-// PGlite), and the surface a
+// board, how stored reach reads and shows, briefs, brief claims and their
+// one retry, the restart sweeps for
+// runs and brief claims and how they pass over promoted runs, the home-page
+// showcase, including the app role's grants on showcase_runs and
+// run_brief_claims and the lock on a promoted run's claims (roles.sql
+// applied to PGlite), and the surface a
 // run is charged to with the reads that act only for the key that made a
 // run. It does not cover races between separate
 // connections (PGlite has one), the other vasal_app grants, the shapes of
-// candidate and brief data (the routes and the agent own those), or the HTTP
-// routes that call these functions.
+// candidate and brief data (the routes and the agent own those) beyond the
+// candidate source the past-guest view reads, or the HTTP routes that call
+// these functions.
 import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { issueToken } from "../src/mcp/tokens.js";
@@ -23,6 +26,7 @@ import {
   getBriefClaim,
   getCandidate,
   getCandidateForToken,
+  getPastGuests,
   getRun,
   getRunForToken,
   listEventsAfter,
@@ -30,10 +34,15 @@ import {
   markBriefDone,
   markBriefFailed,
   parseBoardGuest,
+  publicBoardGuest,
+  publicPastGuests,
+  publicWithoutQloo,
   putBoard,
   putBrief,
   putCandidates,
   setRunStatus,
+  showcaseView,
+  storedReach,
   type RunEventName,
   type RunInput,
   type RunOrigin,
@@ -98,6 +107,38 @@ function recordingDb(): { db: Db; calls: string[] } {
     close: async () => {},
   };
   return { db: self, calls };
+}
+
+async function applyRoles(): Promise<void> {
+  const sql = await readFile(new URL("../src/store/roles.sql", import.meta.url), "utf8");
+  const statements = sql
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n")
+    // A semicolon inside the DO block's $$ body does not end a statement.
+    .split(/;(?=(?:[^$]*\$\$[^$]*\$\$)*[^$]*$)/)
+    .map((statement) => statement.trim())
+    .filter((statement) => statement !== "");
+  for (const statement of statements) await db.query(statement);
+}
+
+async function asApp<T>(work: () => Promise<T>): Promise<T> {
+  await db.query("SET ROLE vasal_app");
+  try {
+    return await work();
+  } finally {
+    await db.query("RESET ROLE");
+  }
+}
+
+// Straight into the table as the owner, the way the promote command writes,
+// so these tests can place runs that promoteRun itself would refuse.
+async function promote(runId: string, position: number): Promise<void> {
+  await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, $2, $3::timestamptz)", [
+    runId,
+    position,
+    LATER.toISOString(),
+  ]);
 }
 
 describe("createRun and getRun", () => {
@@ -529,7 +570,7 @@ describe("brief claims (C5.8)", () => {
     const run = await createRun(db, INPUT, NOW);
     const [first, second] = await putBoard(db, run, [{ name: "First" }, { name: "Second" }]);
     await claimBrief(db, run, first!, 1, NOW);
-    await markBriefFailed(db, run, first!, "QLOO_BUDGET");
+    await markBriefFailed(db, run, first!, "QLOO_UPSTREAM");
 
     expect(await claimBrief(db, run, second!, 1, NOW)).toBe("limit");
     expect(await claimBrief(db, run, first!, 1, NOW)).toBe("claimed");
@@ -572,8 +613,116 @@ describe("brief claims (C5.8)", () => {
   });
 });
 
+describe("brief claims a budget refused (audit A1-9)", () => {
+  async function claimRow(run: string, guest: string) {
+    const { rows } = await db.query<{ status: string; attempts: number; error_code: string | null; created_at: Date }>(
+      "SELECT status, attempts, error_code, created_at FROM run_brief_claims WHERE run_id = $1::uuid AND guest_id = $2::uuid",
+      [run, guest],
+    );
+    const row = rows[0]!;
+    return { status: row.status, attempts: row.attempts, error_code: row.error_code, created_at: new Date(row.created_at) };
+  }
+
+  it("defers a budget refusal on attempt 1 and leaves attempt 1 to claim again, as often as the budget refuses", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+
+    for (const code of ["MODEL_BUDGET", "QLOO_BUDGET", "MCP_BRIEF_BUDGET", "MODEL_BUDGET"]) {
+      expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("claimed");
+      expect(await markBriefFailed(db, run, guest!, code)).toBe(true);
+      expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "deferred", attempts: 1, errorCode: code });
+    }
+    // Nothing is writing a deferred brief, so the restart sweep has nothing to fail.
+    expect(await failStaleBriefClaims(db, 0, LATER)).toBe(0);
+
+    expect(await claimBrief(db, run, guest!, 5, LATER)).toBe("claimed");
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 1, error_code: null, created_at: LATER });
+    expect(await claimBrief(db, run, guest!, 5, LATER)).toBe("exists");
+    expect(await rowCount("run_brief_claims")).toBe(1);
+  });
+
+  it("defers a budget refusal on attempt 2 and leaves attempt 2 to claim again", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    await claimBrief(db, run, guest!, 5, NOW);
+    await markBriefFailed(db, run, guest!, "MODEL_TIMEOUT");
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("claimed");
+
+    expect(await markBriefFailed(db, run, guest!, "MODEL_BUDGET")).toBe(true);
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "deferred", attempts: 2, errorCode: "MODEL_BUDGET" });
+
+    expect(await claimBrief(db, run, guest!, 5, LATER)).toBe("claimed");
+    expect(await claimRow(run, guest!)).toEqual({ status: "pending", attempts: 2, error_code: null, created_at: LATER });
+    expect(await markBriefDone(db, run, guest!)).toBe(true);
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "done", attempts: 2, errorCode: null });
+  });
+
+  it("still spends the attempt on every failure that is not a budget's, including codes that only look like one", async () => {
+    const codes = ["MODEL_TIMEOUT", "AGENT_BAD_PROSE", "UNEXPECTED", "KEY_BUDGET", "MODEL_BUDGETS", "BUDGET"];
+    const run = await createRun(db, INPUT, NOW);
+    const guests = await putBoard(db, run, codes.map((code) => ({ code })));
+
+    for (const [index, code] of codes.entries()) {
+      await claimBrief(db, run, guests[index]!, 10, NOW);
+      expect(await markBriefFailed(db, run, guests[index]!, code)).toBe(true);
+      expect(await getBriefClaim(db, run, guests[index]!), code).toEqual({ status: "failed", attempts: 1, errorCode: code });
+    }
+  });
+
+  it("never fails a claim for good without two real failures, however many budget refusals come between", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [guest] = await putBoard(db, run, [{ name: "Guest" }]);
+    const attempt = async (code: string) => {
+      expect(await claimBrief(db, run, guest!, 5, NOW), code).toBe("claimed");
+      await markBriefFailed(db, run, guest!, code);
+    };
+
+    await attempt("MODEL_BUDGET");
+    await attempt("MODEL_TIMEOUT");
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "failed", attempts: 1, errorCode: "MODEL_TIMEOUT" });
+    await attempt("QLOO_BUDGET");
+    await attempt("MODEL_BUDGET");
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "deferred", attempts: 2, errorCode: "MODEL_BUDGET" });
+    await attempt("AGENT_BAD_PROSE");
+
+    expect(await claimBrief(db, run, guest!, 5, NOW)).toBe("failed");
+    expect(await getBriefClaim(db, run, guest!)).toEqual({ status: "failed", attempts: 2, errorCode: "AGENT_BAD_PROSE" });
+  });
+
+  it("holds none of the run's places while deferred, and takes one again like a new claim", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [first, second, third] = await putBoard(db, run, [{ n: 1 }, { n: 2 }, { n: 3 }]);
+    await claimBrief(db, run, first!, 2, NOW);
+    await markBriefFailed(db, run, first!, "MODEL_BUDGET");
+
+    expect(await claimBrief(db, run, second!, 2, NOW)).toBe("claimed");
+    expect(await claimBrief(db, run, third!, 2, NOW)).toBe("claimed");
+    expect(await claimBrief(db, run, first!, 2, NOW)).toBe("limit");
+    expect(await getBriefClaim(db, run, first!)).toEqual({ status: "deferred", attempts: 1, errorCode: "MODEL_BUDGET" });
+
+    await markBriefFailed(db, run, third!, "QLOO_BUDGET");
+    expect(await claimBrief(db, run, first!, 2, NOW)).toBe("claimed");
+    expect(await claimBrief(db, run, third!, 2, NOW)).toBe("limit");
+  });
+
+  it("reads a deferred row the code could not have written as missing, without spending (C6.5)", async () => {
+    const run = await createRun(db, INPUT, NOW);
+    const [noCode, realFailure] = await putBoard(db, run, [{ n: 1 }, { n: 2 }]);
+    const insert = `INSERT INTO run_brief_claims (run_id, guest_id, status, attempts, error_code, created_at)
+                    VALUES ($1::uuid, $2::uuid, 'deferred', 1, $3, $4::timestamptz)`;
+    await db.query(insert, [run, noCode, null, NOW.toISOString()]);
+    await db.query(insert, [run, realFailure, "MODEL_TIMEOUT", NOW.toISOString()]);
+
+    for (const guest of [noCode!, realFailure!]) {
+      expect(await getBriefClaim(db, run, guest)).toBeNull();
+      expect(await claimBrief(db, run, guest, 5, NOW)).toBe("exists");
+      expect((await claimRow(run, guest)).status).toBe("deferred");
+    }
+  });
+});
+
 describe("failInterruptedRuns (C6.4)", () => {
-  it("fails every open run with SERVER_RESTART and a failed event, and leaves ended runs alone", async () => {
+  it("fails every queued or running run with SERVER_RESTART and a failed event, and leaves waiting and ended runs alone", async () => {
     const queued = await runIn("queued");
     const awaiting = await runIn("awaiting_confirm");
     const running = await runIn("running");
@@ -582,10 +731,14 @@ describe("failInterruptedRuns (C6.4)", () => {
     await appendEvent(db, running, "step", { tool: "search" }, NOW);
     await appendEvent(db, running, "step", { tool: "feed" }, NOW);
     await appendEvent(db, done, "done", {}, NOW);
+    await appendEvent(db, awaiting, "candidates", { candidates: [] }, NOW);
 
-    expect(await failInterruptedRuns(db, LATER)).toBe(3);
+    expect(await failInterruptedRuns(db, LATER)).toBe(2);
 
-    for (const id of [queued, awaiting, running]) {
+    // It holds no slot and nothing works on it, so it waits for its confirm.
+    expect(await getRun(db, awaiting)).toMatchObject({ status: "awaiting_confirm", errorCode: null, finishedAt: null });
+    expect((await listEventsAfter(db, awaiting, 0)).map((event) => event.event)).toEqual(["candidates"]);
+    for (const id of [queued, running]) {
       expect(await getRun(db, id)).toMatchObject({ status: "failed", errorCode: "SERVER_RESTART", finishedAt: LATER });
       const events = await listEventsAfter(db, id, 0);
       expect(events.at(-1)).toEqual({ seq: events.length, event: "failed", data: { code: "SERVER_RESTART" } });
@@ -611,6 +764,22 @@ describe("failInterruptedRuns (C6.4)", () => {
 
     expect(await getRun(db, id)).toMatchObject({ status: "failed", errorCode: "SERVER_RESTART" });
     expect(await rowCount("run_events")).toBe(500);
+  });
+
+  it("as the app role, leaves a promoted run alone even one the owner moved back to running, and still fails the rest (C6.3, C6.6)", async () => {
+    const shown = await runIn("done");
+    const running = await runIn("running");
+    await promote(shown, 1);
+    // Only the owner can do this: promotion needs a done run, and the app role
+    // cannot change a promoted one.
+    await db.query("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = $1::uuid", [shown]);
+    await applyRoles();
+
+    expect(await asApp(() => failInterruptedRuns(db, LATER))).toBe(1);
+
+    expect(await getRun(db, shown)).toMatchObject({ status: "running", errorCode: null, finishedAt: null });
+    expect(await listEventsAfter(db, shown, 0)).toEqual([]);
+    expect(await getRun(db, running)).toMatchObject({ status: "failed", errorCode: "SERVER_RESTART", finishedAt: LATER });
   });
 });
 
@@ -665,6 +834,22 @@ describe("failStaleBriefClaims (C6.4)", () => {
     expect(await codeOf(failStaleBriefClaims(db, MINUTE, new Date(Number.NaN)))).toBe("SRV_BAD_INPUT");
     expect((await getBriefClaim(db, run, guest!))?.status).toBe("pending");
   });
+
+  it("as the app role, leaves a promoted run's stale claim pending without throwing, and still fails one on a run that is not promoted (C6.3, C6.6)", async () => {
+    const shown = await runIn("done");
+    const other = await runIn("done");
+    const [shownGuest] = await putBoard(db, shown, [{ n: 1 }]);
+    const [otherGuest] = await putBoard(db, other, [{ n: 2 }]);
+    await claimBrief(db, shown, shownGuest!, 10, ago(10 * MINUTE));
+    await claimBrief(db, other, otherGuest!, 10, ago(10 * MINUTE));
+    await promote(shown, 1);
+    await applyRoles();
+
+    expect(await asApp(() => failStaleBriefClaims(db, 5 * MINUTE, NOW))).toBe(1);
+
+    expect(await getBriefClaim(db, shown, shownGuest!)).toEqual({ status: "pending", attempts: 1, errorCode: null });
+    expect(await getBriefClaim(db, other, otherGuest!)).toEqual({ status: "failed", attempts: 1, errorCode: "SERVER_RESTART" });
+  });
 });
 
 describe("listShowcase (C6.3, C6.5)", () => {
@@ -688,7 +873,7 @@ describe("listShowcase (C6.3, C6.5)", () => {
     name: `Synthetic Guest ${n}`,
     fit: n / 100,
     fitKnown: n % 3 !== 0,
-    reach: "bookable",
+    reach: null,
     rising: "rising",
     bringsNew: n % 2 === 0 ? "listeners 25 to 29" : null,
     sharedTags: ["synthetic taste"],
@@ -700,16 +885,6 @@ describe("listShowcase (C6.3, C6.5)", () => {
     const guestIds = await putBoard(db, runId, guests);
     await setRunStatus(db, runId, status, status === "failed" ? "QLOO_LIMIT" : undefined, LATER);
     return { runId, guestIds };
-  }
-
-  // Straight into the table as the owner, the way the promote command writes,
-  // so these tests can place runs that promoteRun itself would refuse.
-  async function promote(runId: string, position: number): Promise<void> {
-    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, $2, $3::timestamptz)", [
-      runId,
-      position,
-      LATER.toISOString(),
-    ]);
   }
 
   it("lists promoted done runs by position with their top 3 guests, and skips every run it cannot show whole", async () => {
@@ -745,6 +920,7 @@ describe("listShowcase (C6.3, C6.5)", () => {
         showName: "Synthetic Show",
         finishedAt: LATER,
         guests: [shownGuest(three.guestIds[0]!, 5), shownGuest(three.guestIds[1]!, 6), shownGuest(three.guestIds[2]!, 7)],
+        pastGuests: null,
       },
       {
         runId: four.runId,
@@ -752,6 +928,7 @@ describe("listShowcase (C6.3, C6.5)", () => {
         showName: "Synthetic Show",
         finishedAt: LATER,
         guests: [shownGuest(four.guestIds[0]!, 1), shownGuest(four.guestIds[1]!, 2), shownGuest(four.guestIds[2]!, 3)],
+        pastGuests: null,
       },
     ]);
     expect(JSON.stringify(await listShowcase(db))).not.toContain(unpromoted.runId);
@@ -767,7 +944,7 @@ describe("listShowcase (C6.3, C6.5)", () => {
       showName: emoji.repeat(200),
     });
 
-    expect(parseBoardGuest(JSON.stringify(row))).toEqual(row);
+    expect(parseBoardGuest(JSON.stringify(row))).toEqual({ ...row, reach: "none" });
     for (const over of [
       { name: emoji.repeat(201) },
       { bringsNew: { segment: emoji.repeat(101), label: "x", gap: 0.4 } },
@@ -781,9 +958,13 @@ describe("listShowcase (C6.3, C6.5)", () => {
     }
   });
 
-  it("parses a guest whose reach is unknown, and refuses a reach label the runner never writes", () => {
-    expect(parseBoardGuest(JSON.stringify(guest(1, { reach: "unknown" })))?.reach).toBe("unknown");
-    expect(parseBoardGuest(JSON.stringify(guest(1, { reach: "famous" })))).toBeNull();
+  it("reads a row stored with an old bookable, well known or unknown reach as none, keeps household name and none, and refuses any other label", () => {
+    for (const reach of ["bookable", "well known", "unknown", "none"]) {
+      const row = guest(1, { reach });
+      expect(parseBoardGuest(JSON.stringify(row)), reach).toEqual({ ...row, reach: "none" });
+    }
+    expect(parseBoardGuest(JSON.stringify(guest(1, { reach: "household name" })))?.reach).toBe("household name");
+    for (const reach of ["famous", "Household Name", "", null]) expect(parseBoardGuest(JSON.stringify(guest(1, { reach }))), String(reach)).toBeNull();
   });
 
   it("gives an empty list when nothing is promoted", async () => {
@@ -792,26 +973,19 @@ describe("listShowcase (C6.3, C6.5)", () => {
     expect(await listShowcase(db)).toEqual([]);
   });
 
-  async function applyRoles(): Promise<void> {
-    const sql = await readFile(new URL("../src/store/roles.sql", import.meta.url), "utf8");
-    const statements = sql
-      .split(/\r?\n/)
-      .filter((line) => !line.trimStart().startsWith("--"))
-      .join("\n")
-      // A semicolon inside the DO block's $$ body does not end a statement.
-      .split(/;(?=(?:[^$]*\$\$[^$]*\$\$)*[^$]*$)/)
-      .map((statement) => statement.trim())
-      .filter((statement) => statement !== "");
-    for (const statement of statements) await db.query(statement);
-  }
-
-  it("lets the app role read the showcase and refuses it every write, and lets it retime a brief claim but never move its ids (C6.3, C6.6)", async () => {
+  it("lets the app role read the showcase and refuses it every write, and lets it retime a brief claim on a run that is not promoted but never on a promoted one, and never move a claim's ids (C6.3, C6.6)", async () => {
     const shown = await endedRun("done", [guest(1), guest(2), guest(3)]);
     const other = await endedRun("done", [guest(4), guest(5), guest(6)]);
     await promote(shown.runId, 1);
     const claimed = shown.guestIds[0]!;
-    await claimBrief(db, shown.runId, claimed, 5, NOW);
-    await markBriefFailed(db, shown.runId, claimed, "MODEL_TIMEOUT");
+    const retimed = other.guestIds[0]!;
+    for (const [runId, guestId] of [
+      [shown.runId, claimed],
+      [other.runId, retimed],
+    ] as const) {
+      await claimBrief(db, runId, guestId, 5, NOW);
+      await markBriefFailed(db, runId, guestId, "MODEL_TIMEOUT");
+    }
     await applyRoles();
     const writes: Array<[string, unknown[]]> = [
       ["INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 2, now())", [other.runId]],
@@ -826,20 +1000,27 @@ describe("listShowcase (C6.3, C6.5)", () => {
       await expect(db.query(text, params), text).rejects.toThrow(StoreError);
     }
     expect((await listShowcase(db)).map((run) => [run.runId, run.position])).toEqual([[shown.runId, 1]]);
-    // The retry is the app's own write of created_at.
-    expect(await claimBrief(db, shown.runId, claimed, 5, LATER)).toBe("claimed");
+    // The retry is the app's own write of created_at. A promoted run's rows
+    // are read-only to the app role (schema.sql), so the same retry there
+    // is refused.
+    expect(await claimBrief(db, other.runId, retimed, 5, LATER)).toBe("claimed");
+    expect(await codeOf(claimBrief(db, shown.runId, claimed, 5, LATER))).toBe("SRV_UNAVAILABLE");
+    // On the run that is not promoted, so only the grant can refuse these.
     const claimIdWrites: Array<[string, unknown[]]> = [
-      ["UPDATE run_brief_claims SET run_id = $2::uuid WHERE run_id = $1::uuid", [shown.runId, other.runId]],
-      ["UPDATE run_brief_claims SET guest_id = $2::uuid WHERE run_id = $1::uuid", [shown.runId, crypto.randomUUID()]],
+      ["UPDATE run_brief_claims SET run_id = $2::uuid WHERE run_id = $1::uuid", [other.runId, shown.runId]],
+      ["UPDATE run_brief_claims SET guest_id = $2::uuid WHERE run_id = $1::uuid", [other.runId, crypto.randomUUID()]],
     ];
     for (const [text, params] of claimIdWrites) {
       await expect(db.query(text, params), text).rejects.toThrow(StoreError);
     }
     await db.query("RESET ROLE");
-    const claim = await db.query<{ run_id: string; guest_id: string; created_at: Date }>(
-      "SELECT run_id::text AS run_id, guest_id::text AS guest_id, created_at FROM run_brief_claims",
+    const claims = await db.query<{ run_id: string; guest_id: string; status: string; created_at: Date }>(
+      "SELECT run_id::text AS run_id, guest_id::text AS guest_id, status, created_at FROM run_brief_claims ORDER BY created_at",
     );
-    expect(claim.rows.map((row) => [row.run_id, row.guest_id, new Date(row.created_at)])).toEqual([[shown.runId, claimed, LATER]]);
+    expect(claims.rows.map((row) => [row.run_id, row.guest_id, row.status, new Date(row.created_at)])).toEqual([
+      [shown.runId, claimed, "failed", NOW],
+      [other.runId, retimed, "pending", LATER],
+    ]);
     for (const [text, params] of claimIdWrites) await db.query(text, params);
 
     // The same statements work for the owner, so each refusal above was the grant, not the SQL.
@@ -849,6 +1030,197 @@ describe("listShowcase (C6.3, C6.5)", () => {
     expect(owner.rows).toEqual([{ runId: shown.runId, position: 1 }]);
     for (const [text, params] of writes) await db.query(text, params);
     expect(await rowCount("showcase_runs")).toBe(0);
+  });
+});
+
+describe("reach in stored rows and the public views", () => {
+  const boardRow = (n: number, reach: unknown) => ({
+    personId: `00000000-0000-4000-8000-0000000007${String(n).padStart(2, "0")}`,
+    name: `Synthetic Guest ${n}`,
+    fit: 0.5,
+    fitKnown: true,
+    fitRank: n,
+    reach,
+    rising: { state: "steady", points: 0 },
+    bringsNew: null,
+    sharedTags: [],
+    angle: "A synthetic angle.",
+    showName: "Synthetic Show",
+  });
+  const flipGuess = (reach: unknown) => ({ name: "Synthetic Guess", fit: 0.5, fitKnown: true, reach, pastGuest: false, host: false, onBoard: false });
+  const flip = (...reaches: unknown[]) => ({ status: "done", guesses: reaches.map(flipGuess), unresolved: 0 });
+
+  it("storedReach reads the four labels rows were written with and none, keeps only household name, and refuses anything else", () => {
+    for (const reach of ["bookable", "well known", "unknown", "none"]) expect(storedReach.parse(reach), reach).toBe("none");
+    expect(storedReach.parse("household name")).toBe("household name");
+    for (const reach of ["famous", "Bookable", "", null, 1]) expect(storedReach.safeParse(reach).success, String(reach)).toBe(false);
+  });
+
+  it("reads a flip guess stored with an old bookable, well known or unknown reach, and shows it with no reach label", () => {
+    for (const reach of ["bookable", "well known", "unknown", "none"]) {
+      expect(publicWithoutQloo(flip(reach)), reach).toEqual(flip(null));
+    }
+    expect(publicWithoutQloo(flip("famous"))).toBeNull();
+  });
+
+  it("shows reach null for a none guest and household name for a household name, on the board, the flip and the home page", () => {
+    const id = crypto.randomUUID();
+    expect(publicBoardGuest({ id, data: boardRow(1, "none") })?.reach).toBeNull();
+    expect(publicBoardGuest({ id, data: boardRow(1, "bookable") })?.reach).toBeNull();
+    expect(publicBoardGuest({ id, data: boardRow(1, "household name") })?.reach).toBe("household name");
+
+    expect(publicWithoutQloo(flip("household name", "none"))).toEqual(flip("household name", null));
+
+    const board = [boardRow(1, "household name"), boardRow(2, "none"), boardRow(3, "well known")].map((row) => {
+      const guest = parseBoardGuest(JSON.stringify(row));
+      return guest === null ? null : { id: crypto.randomUUID(), guest };
+    });
+    expect(showcaseView("done", board)?.guests.map((guest) => guest.reach)).toEqual(["household name", null, null]);
+  });
+
+  it("shows only the chips today's rules allow from a row stored before them, on the run page and the home page (C3.10)", () => {
+    const old = { ...boardRow(1, "none"), sharedTags: ["Mental Health", "Comedy"] };
+    expect(publicBoardGuest({ id: crypto.randomUUID(), data: old })?.sharedTags).toEqual(["Comedy"]);
+
+    const board = [old, boardRow(2, "none"), boardRow(3, "none")].map((row) => ({ id: crypto.randomUUID(), guest: parseBoardGuest(JSON.stringify(row))! }));
+    expect(showcaseView("done", board)?.guests[0]?.sharedTags).toEqual(["Comedy"]);
+  });
+});
+
+describe("the past-guest check the public views show (A2-6, C6.5)", () => {
+  const candidate = (feedHandleSource: "directory" | "visitor", over: Record<string, unknown> = {}) => ({
+    appleId: null,
+    name: "Synthetic Show",
+    publisher: "feeds.example",
+    feedHandleSource,
+    feedUrl: `https://feeds.example/${MARKER}.xml`,
+    qlooId: "00000000-0000-4000-8000-000000000500",
+    qlooName: "Synthetic Show",
+    ...over,
+  });
+  const check = (over: Record<string, unknown> = {}) => ({ checked: true, skipped: 2, titles: 312, since: "2019-09", ...over });
+  const event = (over: Record<string, unknown> = {}) => ({ guests: [], pastGuests: check(over) });
+  const stored = (data: unknown) => ({ id: crypto.randomUUID(), data });
+  const SHOWN = { checked: true, episodes: 312, since: "2019-09", source: "directory", feedName: "Synthetic Show", feedPublisher: "feeds.example", archiveTitles: 0 };
+
+  it("shows checked, episodes, since, the confirmed candidate's provenance, name and publisher, and archiveTitles, by name, and never the skipped count or the candidate id", () => {
+    for (const [source, fetched] of [["directory", "directory"], ["linked", "directory"], ["pasted", "visitor"]] as const) {
+      const confirmed = stored(candidate(fetched, { provenance: source, name: `Synthetic ${source}`, publisher: `Publisher​ ${source}` }));
+      const other = stored(candidate(fetched, { provenance: source, name: "Synthetic Other" }));
+
+      const shown = publicPastGuests(event({ source, candidateId: confirmed.id, archiveTitles: 4 }), [other, confirmed]);
+
+      expect(shown, source).toEqual({ ...SHOWN, source, feedName: `Synthetic ${source}`, feedPublisher: `Publisher ${source}`, archiveTitles: 4 });
+      for (const text of [confirmed.id, MARKER, "skipped"]) expect(JSON.stringify(shown), source).not.toContain(text);
+    }
+    const confirmed = stored(candidate("directory"));
+    expect(publicPastGuests(event({ checked: false, titles: 0, since: null, source: "directory", candidateId: confirmed.id }), [confirmed])).toEqual({
+      ...SHOWN,
+      checked: false,
+      episodes: 0,
+      since: null,
+    });
+  });
+
+  it("reads a confirmed candidate stored before provenance by its fetch source, and gives null when that row is missing, unreadable or disagrees with the event", () => {
+    const old = stored(candidate("directory"));
+    const oldPasted = stored(candidate("visitor"));
+    expect(publicPastGuests(event({ source: "directory", candidateId: old.id }), [old])).toEqual(SHOWN);
+    expect(publicPastGuests(event({ source: "pasted", candidateId: oldPasted.id }), [oldPasted])).toEqual({ ...SHOWN, source: "pasted" });
+
+    const linked = stored(candidate("directory", { provenance: "linked" }));
+    const refused: Array<[unknown, Array<{ id: string; data: unknown } | null>]> = [
+      [event({ source: "directory", candidateId: linked.id }), [linked]],
+      [event({ source: "linked", candidateId: old.id }), [old]],
+      [event({ source: "directory", candidateId: crypto.randomUUID() }), [old]],
+      [event({ source: "directory", candidateId: old.id }), [{ id: old.id, data: candidate("directory", { feedUrl: 5 }) }]],
+      [event({ source: "pasted", candidateId: old.id }), [{ id: old.id, data: candidate("directory", { provenance: "pasted" }) }]],
+      [event({ source: "directory", candidateId: old.id }), [null]],
+    ];
+    for (const [data, candidates] of refused) expect(publicPastGuests(data, candidates), JSON.stringify(data)).toBeNull();
+  });
+
+  it("gives an event with no candidate the provenance every stored candidate agrees on, a feed name only when there was one candidate, and null when they cannot say", () => {
+    expect(publicPastGuests(event(), [stored(candidate("directory")), stored(candidate("directory", { provenance: "directory" }))])).toEqual({
+      ...SHOWN,
+      feedName: null,
+      feedPublisher: null,
+    });
+    expect(publicPastGuests(event(), [stored(candidate("visitor"))])).toEqual({ ...SHOWN, source: "pasted" });
+    for (const candidates of [
+      [],
+      [stored(candidate("directory")), stored(candidate("visitor"))],
+      [stored(candidate("directory")), stored(candidate("directory", { provenance: "linked" }))],
+      [stored(candidate("directory")), null],
+      [stored(candidate("directory", { feedUrl: 5 }))],
+    ]) {
+      expect(publicPastGuests(event(), candidates), JSON.stringify(candidates)).toBeNull();
+    }
+  });
+
+  it("gives null for an event written before titles were counted, or any shape the runner never writes", () => {
+    const id = crypto.randomUUID();
+    const unfit = [
+      { guests: [], pastGuests: { checked: true, skipped: 0 } },
+      event({ feedUrl: MARKER }),
+      event({ source: "visitor", candidateId: id }),
+      event({ source: "directory" }),
+      event({ candidateId: id }),
+      event({ checked: true, titles: 0 }),
+      event({ since: "September 2019" }),
+      event({ archiveTitles: 10_001 }),
+      { guests: [], pastGuests: check(), extra: MARKER },
+      null,
+    ];
+    for (const data of unfit) expect(publicPastGuests(data, [{ id, data: candidate("directory") }]), JSON.stringify(data)).toBeNull();
+  });
+
+  it("reads the latest board event, with the run's own candidates for an older one, and gives null for a run with none", async () => {
+    const runId = await createRun(db, INPUT, NOW);
+    expect(await getPastGuests(db, runId)).toBeNull();
+    expect(await getPastGuests(db, "not-a-uuid")).toBeNull();
+
+    const [candidateId] = await putCandidates(db, runId, [candidate("visitor")]);
+    await appendEvent(db, runId, "board", event(), NOW);
+    expect(await getPastGuests(db, runId)).toEqual({ ...SHOWN, source: "pasted" });
+
+    await appendEvent(db, runId, "board", event({ source: "pasted", candidateId, titles: 40 }), NOW);
+    const latest = await getPastGuests(db, runId);
+    expect(latest).toEqual({ ...SHOWN, source: "pasted", episodes: 40 });
+    expect(JSON.stringify(latest)).not.toContain(MARKER);
+
+    await appendEvent(db, runId, "board", { guests: [], pastGuests: { checked: true, skipped: 0 } }, NOW);
+    expect(await getPastGuests(db, runId)).toBeNull();
+  });
+
+  it("carries each promoted run's check onto the home page", async () => {
+    const runId = await createRun(db, INPUT, NOW);
+    await setRunStatus(db, runId, "running", undefined, NOW);
+    await putCandidates(db, runId, [candidate("directory")]);
+    await putBoard(
+      db,
+      runId,
+      [1, 2, 3].map((n) => ({
+        personId: `00000000-0000-4000-8000-0000000007${String(n).padStart(2, "0")}`,
+        name: `Synthetic Guest ${n}`,
+        fit: 0.5,
+        fitKnown: true,
+        fitRank: n,
+        reach: "bookable",
+        rising: { state: "steady", points: 0 },
+        bringsNew: null,
+        sharedTags: [],
+        angle: "A synthetic angle.",
+        showName: "Synthetic Show",
+      })),
+    );
+    await appendEvent(db, runId, "board", event(), NOW);
+    await setRunStatus(db, runId, "done", undefined, LATER);
+    await db.query("INSERT INTO showcase_runs (run_id, position, promoted_at) VALUES ($1::uuid, 1, $2::timestamptz)", [runId, LATER.toISOString()]);
+
+    const [shown] = await listShowcase(db);
+    expect(shown?.pastGuests).toEqual(SHOWN);
+    expect(JSON.stringify(shown)).not.toContain(MARKER);
   });
 });
 

@@ -82,6 +82,20 @@ function jsonLength(value: unknown): number {
   return JSON.stringify(value)?.length ?? 0;
 }
 
+/** Called once after a call that Claude answered, with the tokens it billed. */
+type Settle = (used: number) => Promise<void>;
+type Spend = { reserved: number; settle: Settle | null };
+
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+// A count the reply leaves out is taken as the whole reservation, so a reply
+// with no usage gives nothing back (C5.1).
+function usedTokens(message: Anthropic.Message, reserved: number): number {
+  const input: unknown = message.usage?.input_tokens;
+  const output: unknown = message.usage?.output_tokens;
+  return isCount(input) && isCount(output) ? input + output : reserved;
+}
+
 /**
  * The input tokens a call sending `parts` is counted as: their summed JSON
  * length divided by CHARS_PER_TOKEN, rounded up. Every reservation uses it,
@@ -100,9 +114,15 @@ export function estimateInputTokens(parts: readonly unknown[]): number {
  *
  * Before every call it reserves max_tokens plus a third of the JSON length of
  * the system prompt, the messages and the tools (or output schema) through
- * `reserveTokens`, and makes no call if that is refused (C5.1). SDK errors
- * are mapped by class to a fixed AgentError code and nothing from them is
- * kept (C3.6, C4.1).
+ * `reserveTokens`, and makes no call if that is refused (C5.1). When
+ * `reserveTokens` returns a settle callback instead of true, it is called
+ * once after Claude answers, before any check of the reply, with
+ * usage.input_tokens plus usage.output_tokens, or with the whole reservation
+ * when either count is missing. A call that fails settles nothing, so its
+ * reservation stays spent. A settle that throws is logged as "token settle
+ * failed" and nothing else, and never fails the call. SDK errors are mapped
+ * by class to a fixed AgentError code and nothing from them is kept (C3.6,
+ * C4.1).
  *
  * turn() returns the full message. structured() asks for JSON matching
  * `schema` (sent as a JSON schema output format) and checks the reply with
@@ -129,7 +149,7 @@ export function createAnthropicModel(opts: {
   apiKey: string;
   model: string;
   effort: "low" | "medium" | "high";
-  reserveTokens: (n: number) => Promise<boolean>;
+  reserveTokens: (n: number) => Promise<boolean | ((used: number) => Promise<void>)>;
   client?: Anthropic;
 }): ModelClient {
   if (opts.apiKey.trim() === "") throw new AgentError("MODEL_KEY_MISSING");
@@ -145,30 +165,52 @@ export function createAnthropicModel(opts: {
     });
   const { model, effort } = opts;
 
-  const reserve = async (maxTokens: number, parts: unknown[], signal: AbortSignal | undefined): Promise<void> => {
+  const reserve = async (maxTokens: number, parts: unknown[], signal: AbortSignal | undefined): Promise<Spend> => {
     if (signal?.aborted === true) throw new AgentError("MODEL_TIMEOUT");
-    if (!(await opts.reserveTokens(maxTokens + estimateInputTokens(parts)))) throw new AgentError("MODEL_BUDGET");
+    const reserved = maxTokens + estimateInputTokens(parts);
+    const outcome = await opts.reserveTokens(reserved);
+    if (!outcome) throw new AgentError("MODEL_BUDGET");
+    return { reserved, settle: typeof outcome === "function" ? outcome : null };
   };
 
-  const send = async (params: Anthropic.MessageCreateParamsNonStreaming, timeoutMs: number, caller: AbortSignal | undefined): Promise<Anthropic.Message> => {
+  const settleFor = async (spend: Spend, message: Anthropic.Message): Promise<void> => {
+    if (spend.settle === null) return;
+    try {
+      await spend.settle(usedTokens(message, spend.reserved));
+    } catch {
+      // The whole reservation stays charged, which fails closed.
+      console.warn("token settle failed");
+    }
+  };
+
+  const send = async (
+    params: Anthropic.MessageCreateParamsNonStreaming,
+    timeoutMs: number,
+    caller: AbortSignal | undefined,
+    spend: Spend,
+  ): Promise<Anthropic.Message> => {
     // The SDK's own timeout covers each attempt only up to the response
     // headers. This deadline also covers the retry and the body.
     const deadline = AbortSignal.timeout(timeoutMs);
     const signal = caller === undefined ? deadline : AbortSignal.any([caller, deadline]);
+    let message: Anthropic.Message;
     try {
-      return await client.messages.create(params, { signal, timeout: timeoutMs, maxRetries: MAX_RETRIES });
+      message = await client.messages.create(params, { signal, timeout: timeoutMs, maxRetries: MAX_RETRIES });
     } catch (error) {
       // An abort while the body is read arrives as a plain fetch error, so
       // the fired signal, not the error's class, says it was the time limit.
       throw new AgentError(signal.aborted ? "MODEL_TIMEOUT" : codeFor(error));
     }
+    // A refusal or a truncated reply is still billed, so it settles too.
+    await settleFor(spend, message);
+    return message;
   };
 
   return {
     async turn({ system, messages, tools, maxTokens }, options = {}) {
       checkMaxTokens(maxTokens);
       const timeoutMs = checkedTimeout(options.timeoutMs);
-      await reserve(maxTokens, [system, messages, tools], options.signal);
+      const spend = await reserve(maxTokens, [system, messages, tools], options.signal);
       const message = await send(
         {
           model,
@@ -180,6 +222,7 @@ export function createAnthropicModel(opts: {
         },
         timeoutMs,
         options.signal,
+        spend,
       );
       if (message.stop_reason === "refusal") throw new AgentError("MODEL_REFUSED");
       return message;
@@ -193,7 +236,7 @@ export function createAnthropicModel(opts: {
       const timeoutMs = checkedTimeout(options.timeoutMs);
       const format = zodOutputFormat(schema);
       const messages: Anthropic.MessageParam[] = [{ role: "user", content: user }];
-      await reserve(maxTokens, [system, messages, format.schema], options.signal);
+      const spend = await reserve(maxTokens, [system, messages, format.schema], options.signal);
       const message = await send(
         {
           model,
@@ -204,6 +247,7 @@ export function createAnthropicModel(opts: {
         },
         timeoutMs,
         options.signal,
+        spend,
       );
       if (message.stop_reason === "refusal") throw new AgentError("MODEL_REFUSED");
       if (message.stop_reason === "max_tokens") throw new AgentError("MODEL_TRUNCATED");

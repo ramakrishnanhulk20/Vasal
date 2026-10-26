@@ -2,11 +2,15 @@
 // meter charges, the preview, a picked run end to end through the real agent
 // runner with the shared fakes, its briefs and the briefs command's writer,
 // the closes for a missing pick and a missing show, the guesses backfill that
-// adds the Without Qloo flip to a done run, and the seed, briefs and guesses
-// arguments of scripts/ops.ts. It does not cover createSeedAgent's real
+// adds the Without Qloo flip to a done run, the --archive file and the
+// past guest an archive line leaves out, and the seed, briefs, guesses and
+// recheck arguments of scripts/ops.ts. It does not cover createSeedAgent's real
 // Qloo, Anthropic, directory or feed calls (the operator's first live seed
 // does), runSeed's, runBriefs's and runGuesses's printed reports, or a
 // deploy's restart sweep failing a seed run or a brief mid-way.
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ZodType } from "zod";
@@ -17,7 +21,18 @@ import { WITHOUT_QLOO_SYSTEM } from "../src/agent/prompts.js";
 import { loadPolicy } from "../src/ops/policy.js";
 import { previewRun, readBriefs } from "../src/ops/promote.js";
 import { rollBuckets } from "../src/ops/roll.js";
-import { addGuesses, planGuesses, seedAgentFrom, seedMeterHooks, seedShow, writeBriefs, type SeedAgent } from "../src/ops/seed.js";
+import {
+  addGuesses,
+  ArchiveError,
+  parseArchive,
+  planGuesses,
+  readArchive,
+  seedAgentFrom,
+  seedMeterHooks,
+  seedShow,
+  writeBriefs,
+  type SeedAgent,
+} from "../src/ops/seed.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
 import {
@@ -37,7 +52,7 @@ import {
 } from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { usage } from "../src/store/meter.js";
-import { fakeFeeds, fakeModel, fakeQloo, harnessFrom } from "./helpers/agent-fakes.js";
+import { fakeFeeds, fakeModel, fakeQloo, harnessFrom, personId } from "./helpers/agent-fakes.js";
 import { BRIEF_DRAFT } from "./helpers/briefs.js";
 import { migratedPglite } from "./helpers/pglite.js";
 
@@ -55,9 +70,43 @@ afterEach(async () => {
   await db.close();
 });
 
-function fakeSeedAgent(feeds = fakeFeeds().feeds): SeedAgent {
-  const { qloo } = fakeQloo();
+function fakeSeedAgent(feeds = fakeFeeds().feeds, qloo = fakeQloo().qloo): SeedAgent {
   return seedAgentFrom(db, { qloo, harness: harnessFrom(qloo).harness, model: fakeModel(BRIEF_DRAFT).model, feeds, trends: false });
+}
+
+// The shared fake gives every show one Qloo podcast, and candidates that
+// share one collapse to the first, so this gives each show its own.
+function ownPodcasts(): MeteredQloo {
+  const { qloo } = fakeQloo();
+  return {
+    ...qloo,
+    async call<T>(op: QlooOperation, options?: Parameters<MeteredQloo["call"]>[1]) {
+      if (op.op !== "search" || !op.types.includes("urn:entity:podcast")) return qloo.call<T>(op, options);
+      const id = `00000000-0000-4000-8000-0000000005${op.query.slice(-1).padStart(2, "0")}`;
+      return { data: [{ entity_id: id, name: op.query }] as T, fromCache: false };
+    },
+  };
+}
+
+// The shared fake model's finish_board names every pick each time; this one
+// leaves out pick `left` the second time, so a board can still form once
+// the tools refuse a past guest.
+function droppingOnRetry(left: number): ModelClient {
+  const { model } = fakeModel(BRIEF_DRAFT);
+  let finishes = 0;
+  return {
+    ...model,
+    async turn(params, options) {
+      const reply = await model.turn(params, options);
+      const content = reply.content.map((block) => {
+        if (block.type !== "tool_use" || block.name !== "finish_board") return block;
+        finishes += 1;
+        const picks = [1, 2, 3, 4].filter((n) => n !== left).map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." }));
+        return finishes === 1 ? block : { ...block, input: { picks } };
+      });
+      return { ...reply, content };
+    },
+  };
 }
 
 // Seven guests in the runner's board shape, two more than a visitor's run
@@ -82,7 +131,7 @@ async function runCount(): Promise<number> {
 }
 
 describe("seed", () => {
-  it("seedMeterHooks charges only the offline buckets", async () => {
+  it("seedMeterHooks charges only the offline buckets, and settles the model share down to the tokens used", async () => {
     // A day inside the shipped policy, so the roll covers it whenever the suite runs.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-11-10T12:00:00.000Z"));
@@ -90,24 +139,56 @@ describe("seed", () => {
     const hooks = seedMeterHooks(db);
 
     expect(await hooks.waitForQlooSlot(db)).toBe(true);
-    expect(await hooks.reserveModelTokens(100)).toBe(true);
+    const settle = await hooks.reserveModelTokens(100);
+    if (settle === false) throw new Error("expected a settle callback");
 
-    const keys = ["qloo:day:offline", "qloo:month", "anthropic:day:offline", "qloo:day", "qloo:day:mcp", "anthropic:day", "anthropic:day:mcp"];
+    const keys = [
+      "qloo:day:offline",
+      "qloo:month:offline",
+      "qloo:month",
+      "anthropic:day:offline",
+      "qloo:day",
+      "qloo:day:mcp",
+      "qloo:month:mcp",
+      "anthropic:day",
+      "anthropic:day:mcp",
+    ];
     const used: Record<string, number | undefined> = {};
     for (const key of keys) used[key] = (await usage(db, key))?.used;
     expect(used).toEqual({
       "qloo:day:offline": 1,
+      "qloo:month:offline": 1,
       "qloo:month": 1,
       "anthropic:day:offline": 100,
       "qloo:day": 0,
       "qloo:day:mcp": 0,
+      "qloo:month:mcp": 0,
       "anthropic:day": 0,
       "anthropic:day:mcp": 0,
     });
+    await settle(35);
+    expect((await usage(db, "anthropic:day:offline"))?.used).toBe(35);
+    expect((await usage(db, "anthropic:day"))?.used).toBe(0);
+  });
+
+  it("refuses an offline Qloo slot once qloo:month:offline is full, while qloo:month and the offline day still have room (audit A1-5)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-10T12:00:00.000Z"));
+    expect((await rollBuckets(db, await loadPolicy(POLICY_FILE), new Date())).covered).toBe(true);
+    const offlineMonth = await usage(db, "qloo:month:offline");
+    expect(offlineMonth?.cap).toBe(3_000);
+    await db.query("UPDATE usage_buckets SET used = cap WHERE key = 'qloo:month:offline'");
+    const hooks = seedMeterHooks(db);
+
+    expect(await hooks.waitForQlooSlot(db)).toBe(false);
+
+    expect((await usage(db, "qloo:month:offline"))?.used).toBe(3_000);
+    expect(await usage(db, "qloo:month")).toEqual(expect.objectContaining({ cap: 32_000, used: 0 }));
+    expect(await usage(db, "qloo:day:offline")).toEqual(expect.objectContaining({ cap: 300, used: 0 }));
   });
 
   it("preview lists candidates in rank order and writes no run", async () => {
-    const outcome = await seedShow(db, fakeSeedAgent(), SHOW, undefined);
+    const outcome = await seedShow(db, fakeSeedAgent(fakeFeeds().feeds, ownPodcasts()), SHOW, undefined);
 
     expect(outcome).toEqual({
       kind: "preview",
@@ -158,7 +239,7 @@ describe("seed", () => {
     expect(after.guests.map((guest) => guest.state.kind)).toEqual(Array.from({ length: 7 }, () => "written"));
     for (const [index, guestId] of guestIds.entries()) {
       expect(await getBrief(db, runId, guestId)).toMatchObject({
-        why: `Synthetic Guest ${index + 1} has 50% fit with ${SHOW} listeners.`,
+        why: `Synthetic Guest ${index + 1} suits ${SHOW} listeners.`,
         pitch_subject: `${SHOW} would love to have Synthetic Guest ${index + 1}`,
       });
     }
@@ -264,13 +345,14 @@ describe("guesses (the Without Qloo backfill)", () => {
     const flip = {
       status: "done",
       guesses: [
-        { name: "Synthetic Guest 1", fit: 0.6, fitKnown: true, reach: "unknown", pastGuest: false, onBoard: true },
-        { name: "Synthetic Outsider", fit: 0.2, fitKnown: true, reach: "bookable", pastGuest: true, onBoard: false },
+        { name: "Synthetic Guest 1", fit: 0.6, fitKnown: true, reach: "none", pastGuest: false, host: false, onBoard: true },
+        { name: "Synthetic Outsider", fit: 0.2, fitKnown: true, reach: "none", pastGuest: true, host: false, onBoard: false },
       ],
       unresolved: 0,
     };
     expect(added).toEqual({ kind: "added", runId, flip });
-    expect(await getWithoutQloo(db, runId)).toEqual(flip);
+    // The public view shows no reach label for "none".
+    expect(await getWithoutQloo(db, runId)).toEqual({ ...flip, guesses: flip.guesses.map((guess) => ({ ...guess, reach: null })) });
     expect((await listEventsAfter(db, runId, 0)).at(-1)).toMatchObject({ event: "without_qloo", data: flip });
     expect(fetched.map((url) => url.href)).toEqual(["https://feeds.example/show-1.xml"]);
     expect(asked).toHaveLength(1);
@@ -342,14 +424,97 @@ describe("guesses (the Without Qloo backfill)", () => {
   });
 });
 
+describe("the seed's --archive file (C2.9)", () => {
+  it("reads title | description lines, splitting at the last bar, skipping blank lines and a byte-order mark", () => {
+    const archive = parseArchive("\uFEFFE436: Stewart Butterfield | Slack's founder\r\nE12 | Part two | \n\n  Ep 3: solo  |  \n");
+    expect(archive).toEqual({ titles: ["E436: Stewart Butterfield", "E12 | Part two", "Ep 3: solo"], descriptions: ["Slack's founder"] });
+    expect(parseArchive("")).toEqual({ titles: [], descriptions: [] });
+  });
+
+  it("takes 10,000 lines of 1,000 characters and refuses the whole file at 10,001 lines or a 1,001-character line", () => {
+    const line = (n: number) => `Episode ${n} | ${"d".repeat(1_000 - `Episode ${n} | `.length)}`;
+    const full = Array.from({ length: 10_000 }, (_, n) => line(n)).join("\n");
+    expect([...line(9_999)]).toHaveLength(1_000);
+    expect(parseArchive(full).titles).toHaveLength(10_000);
+    expect(() => parseArchive(`${full}\nOne more | `)).toThrow(new ArchiveError("ARCHIVE_TOO_MANY_LINES"));
+    const long = `First | \nSecond | ${"\u{1F600}".repeat(992)}`;
+    expect([...long.split("\n")[1]!]).toHaveLength(1_001);
+    expect(() => parseArchive(long)).toThrow(expect.objectContaining({ code: "ARCHIVE_LINE_TOO_LONG", line: 2 }));
+  });
+
+  it("refuses the whole file for a line with no bar or no title, naming the line and none of its text", () => {
+    for (const [text, line] of [
+      ["Fine | ok\nStewart Butterfield on Slack\nAlso fine | ", 2],
+      ["Fine | \n  | only a description", 2],
+    ] as const) {
+      let caught: unknown;
+      try {
+        parseArchive(text);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({ code: "ARCHIVE_MALFORMED", line });
+      expect((caught as Error).message).not.toMatch(/Butterfield|only a/);
+    }
+  });
+
+  it("refuses a file that is not UTF-8 or cannot be read, and reads one that is", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "vasal-archive-"));
+    try {
+      const good = path.join(dir, "good.txt");
+      await writeFile(good, "Synthetic Person 1 on the early days | \n", "utf8");
+      expect(await readArchive(good)).toEqual({ titles: ["Synthetic Person 1 on the early days"], descriptions: [] });
+      const latin = path.join(dir, "latin.txt");
+      await writeFile(latin, Buffer.from([0x45, 0x70, 0x20, 0xe9, 0x20, 0x7c, 0x0a]));
+      await expect(readArchive(latin)).rejects.toMatchObject({ code: "ARCHIVE_NOT_UTF8" });
+      await expect(readArchive(path.join(dir, "missing.txt"))).rejects.toMatchObject({ code: "ARCHIVE_UNREADABLE" });
+      await expect(readArchive(dir)).rejects.toMatchObject({ code: "ARCHIVE_UNREADABLE" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves off the board a past guest only an archive line names, and records only the line count", async () => {
+    const plain = await seedShow(db, fakeSeedAgent(), SHOW, 1);
+    if (plain.kind !== "done") throw new Error(`expected done, got ${JSON.stringify(plain)}`);
+    const plainNames = (await listBoard(db, plain.runId)).map((row) => (row.data as { name: string }).name);
+    expect(plainNames).toContain("Synthetic Person 1");
+
+    const archive = parseArchive("E1: Synthetic Person 1 on the early days | \nE2: a solo show | with Nobody Real\n");
+    const { qloo } = fakeQloo();
+    const agent = seedAgentFrom(db, {
+      qloo,
+      harness: harnessFrom(qloo).harness,
+      model: droppingOnRetry(1),
+      feeds: fakeFeeds().feeds,
+      trends: false,
+      operator: { archive },
+    });
+    const outcome = await seedShow(db, agent, SHOW, 1);
+
+    if (outcome.kind !== "done") throw new Error(`expected done, got ${JSON.stringify(outcome)}`);
+    expect((await listBoard(db, outcome.runId)).map((row) => (row.data as { name: string }).name)).toEqual([2, 3, 4].map((n) => `Synthetic Person ${n}`));
+    expect(outcome.pastGuests).toEqual({ checked: true, skipped: 1 });
+    const events = await listEventsAfter(db, outcome.runId, 0);
+    expect(events.find((event) => event.event === "board")?.data).toMatchObject({ pastGuests: { titles: 2, archiveTitles: 2 } });
+    expect(JSON.stringify(events)).not.toContain("early days");
+  });
+});
+
 describe("ops.ts seed arguments", () => {
   it("readArgs accepts and refuses seed arguments", () => {
-    expect(readArgs(["seed", "X"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "seed", show: "X", pick: undefined } });
-    expect(readArgs(["seed", "X", "--pick", "2"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "seed", show: "X", pick: 2 } });
+    const plain = { hosts: [], archive: undefined };
+    expect(readArgs(["seed", "X"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "seed", show: "X", pick: undefined, ...plain } });
+    expect(readArgs(["seed", "X", "--pick", "2"])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "seed", show: "X", pick: 2, ...plain } });
     expect(readArgs(["--tunnel", "55432", "seed", "X", "--pick", "1"])).toEqual({
       dev: false,
       tunnelPort: 55432,
-      command: { name: "seed", show: "X", pick: 1 },
+      command: { name: "seed", show: "X", pick: 1, ...plain },
+    });
+    expect(readArgs(["seed", "TWiST", "--pick", "1", "--host", " Jason Calacanis ", "--host", "Molly Wood", "--archive", "old.txt"])).toEqual({
+      dev: false,
+      tunnelPort: undefined,
+      command: { name: "seed", show: "TWiST", pick: 1, hosts: ["Jason Calacanis", "Molly Wood"], archive: "old.txt" },
     });
 
     for (const argv of [
@@ -363,6 +528,13 @@ describe("ops.ts seed arguments", () => {
       ["seed", "X", "--apply"],
       ["health", "--pick", "1"],
       ["promote", "00000000-0000-4000-8000-000000000700", "1", "--pick", "1"],
+      ["seed", "X", "--host", "  "],
+      ["seed", "X", "--host", "h".repeat(201)],
+      ["seed", "X", ...Array.from({ length: 11 }, (_, n) => ["--host", `Host ${n}`]).flat()],
+      ["seed", "X", "--archive", " "],
+      ["seed", "X", "--archive"],
+      ["guesses", "00000000-0000-4000-8000-000000000700", "--host", "Ann Lee"],
+      ["briefs", "00000000-0000-4000-8000-000000000700", "--archive", "old.txt"],
     ]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
@@ -392,6 +564,19 @@ describe("ops.ts seed arguments", () => {
     });
 
     for (const argv of [["guesses"], ["guesses", runId, "extra"], ["guesses", runId, "--apply"], ["guesses", runId, "--pick", "0"], ["guesses", runId, "--pick", "x"]]) {
+      expect(readArgs(argv), argv.join(" ")).toBeUndefined();
+    }
+  });
+
+  it("readArgs accepts recheck with a run id and the seed's --host and --archive, and refuses anything else", () => {
+    const runId = "00000000-0000-4000-8000-000000000700";
+    expect(readArgs(["recheck", runId])).toEqual({ dev: false, tunnelPort: undefined, command: { name: "recheck", runId, hosts: [], archive: undefined } });
+    expect(readArgs(["--dev", "recheck", runId, "--host", "Ann Lee", "--archive", "old.txt"])).toEqual({
+      dev: true,
+      tunnelPort: undefined,
+      command: { name: "recheck", runId, hosts: ["Ann Lee"], archive: "old.txt" },
+    });
+    for (const argv of [["recheck"], ["recheck", runId, "extra"], ["recheck", runId, "--yes"], ["recheck", runId, "--pick", "1"], ["recheck", runId, "--apply"]]) {
       expect(readArgs(argv), argv.join(" ")).toBeUndefined();
     }
   });

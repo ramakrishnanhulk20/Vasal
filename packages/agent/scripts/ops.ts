@@ -50,11 +50,37 @@ import {
 } from "../src/ops/promote.js";
 import { pruneExpired } from "../src/ops/prune.js";
 import { rollBuckets, type BucketRoll, type BucketState } from "../src/ops/roll.js";
-import { addGuesses, createSeedAgent, planGuesses, seedShow, writeBriefs, type GuessesRefusal, type SeedAgent } from "../src/ops/seed.js";
+import type { AgentFeeds, OperatorInput } from "../src/agent/runner.js";
+import { parseFeed } from "../src/feeds/rss.js";
+import { safeFetch } from "../src/net/safe-fetch.js";
+import { recheckRun, type RecheckFinding, type RecheckRefusal } from "../src/ops/recheck.js";
+import {
+  addGuesses,
+  ArchiveError,
+  createSeedAgent,
+  planGuesses,
+  readArchive,
+  seedShow,
+  writeBriefs,
+  type GuessesRefusal,
+  type SeedAgent,
+} from "../src/ops/seed.js";
 import type { AgentPort } from "../src/server/agent-port.js";
+import { acquireMcpRunSlots, reconcileInflight } from "../src/server/caps.js";
 import { loadAgentSettings, type AgentSettings } from "../src/server/config.js";
 import { ServerError } from "../src/server/errors.js";
-import { createRun, finishRun, listShowcase, markBriefDone, putBoard, putBrief, setRunStatus } from "../src/server/runs.js";
+import {
+  appendEvent,
+  createRun,
+  finishRun,
+  listEventsAfter,
+  listShowcase,
+  markBriefDone,
+  putBoard,
+  putBrief,
+  putCandidates,
+  setRunStatus,
+} from "../src/server/runs.js";
 import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
 import { liveRunsEnabled, setFlag } from "../src/store/flags.js";
@@ -74,8 +100,10 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   prune                   delete expired cache rows, per-second buckets, old visitor and MCP
                           counters, and agent keys expired over a week that no run points to,
                           and close runs left awaiting a confirm over an hour as CONFIRM_EXPIRED
-  nightly                 budgets, then prune, always both; exits 1 if either failed. The
-                          scheduled job runs this
+  nightly                 budgets, then prune, then reconcile, always all three; exits 1 if
+                          any failed. The scheduled job runs this
+  reconcile               lower the in-progress run counters to the runs that hold them, so
+                          a place lost to a failed release comes back without a restart
   flag live-runs on|off   switch live runs on the site on or off
   flag mcp on|off         switch the MCP door on or off: key issue and every MCP request
   health                  print the health report
@@ -84,24 +112,35 @@ const USAGE = `Usage: npx tsx scripts/ops.ts [--dev | --tunnel <port>] <command>
   mcp revoke-all          revoke every agent key at once
   promote <runId> <position> [--yes]
                           print a run's board; with --yes, put it on the home page at position 1 to 12
-  seed "<show>" [--pick N]
+  seed "<show>" [--pick N] [--host "Name"]... [--archive <file>]
                           preview the shows that match, writing nothing; with --pick, run the
                           real agent on candidate N, build a board and write and print every
                           guest's brief for promote. It spends only qloo:day:offline,
-                          qloo:month and anthropic:day:offline
+                          qloo:month:offline, qloo:month and anthropic:day:offline. Each --host (at most 10) names
+                          a host the feed does not, and --archive a UTF-8 file of older
+                          episodes, one "title | description" a line (at most 10,000 lines
+                          of 1,000 characters, refused whole otherwise); both leave those
+                          people off the board for this run only and are never stored
+  recheck <runId> [--host "Name"]... [--archive <file>]
+                          read a done run's board, flip and briefs, read its feed once, and
+                          list every guest who is now a past guest or host, every flip flag
+                          that changed and every text that fails today's prose check, writing
+                          nothing and spending nothing metered. Give it the same --host and
+                          --archive the seed used, or their people are not counted
   briefs <runId> [--yes]  list the board guests of a done run that lack a brief; with --yes,
                           write them with the real agent and print every brief in full. It
                           spends only anthropic:day:offline
   guesses <runId> [--pick N] [--yes] say whether a done run lacks its Without Qloo flip; with --yes, ask the
                           real model for guests with no Qloo data, score them with Qloo and add
-                          the flip. It spends only qloo:day:offline, qloo:month and
-                          anthropic:day:offline
+                          the flip. It spends only qloo:day:offline, qloo:month:offline,
+                          qloo:month and anthropic:day:offline
   unpromote <runId>       take a run off the home page
   showcase                list the runs on the home page
   selftest                with --dev only: budgets, health, flag live-runs off, health, then
-                          briefs with a synthetic writer, promote, list and unpromote a
-                          synthetic finished run, then flag mcp on, mcp list, mcp revoke and
-                          mcp revoke-all on synthetic keys
+                          health and reconcile on a synthetic lost place, then briefs with a
+                          synthetic writer, promote, list and unpromote a synthetic finished
+                          run, then recheck a synthetic run against a synthetic feed, then flag
+                          mcp on, mcp list, mcp revoke and mcp revoke-all on synthetic keys
 
 --dev uses a throwaway in-memory database with the schema applied and live
 runs on. Without it bootstrap needs BOOTSTRAP_DATABASE_URL, and every other
@@ -109,11 +148,11 @@ command except roles without --apply needs OWNER_DATABASE_URL.
 --tunnel <port> connects to 127.0.0.1:<port> instead, through a tunnel to the
 database PGDATABASE: bootstrap as PGUSER with PGPASSWORD, every other command
 as vasal_owner with VASAL_OWNER_PASSWORD.
---yes is accepted only by promote, briefs and guesses, --apply only by roles, and --pick only by seed and guesses (for guesses: the candidate rank the seed used, when several candidates share the show).`;
+--yes is accepted only by promote, briefs and guesses, --apply only by roles, --pick only by seed and guesses (for guesses: the candidate rank the seed used, when several candidates share the show), and --host and --archive only by seed and recheck.`;
 
 const PROMOTE_HINT = "Read the board above. Run again with --yes to put it on the home page.";
 
-type PlainCommand = "bootstrap" | "migrate" | "budgets" | "prune" | "nightly" | "health" | "showcase" | "selftest";
+type PlainCommand = "bootstrap" | "migrate" | "budgets" | "prune" | "nightly" | "reconcile" | "health" | "showcase" | "selftest";
 // One member per name, so a check on the name narrows the whole command.
 type Command =
   | { [Name in PlainCommand]: { name: Name } }[PlainCommand]
@@ -125,7 +164,8 @@ type Command =
   | { name: "briefs"; runId: string; yes: boolean }
   | { name: "guesses"; runId: string; yes: boolean; pick: number | undefined }
   | { name: "unpromote"; runId: string }
-  | { name: "seed"; show: string; pick: number | undefined };
+  | { name: "seed"; show: string; pick: number | undefined; hosts: string[]; archive: string | undefined }
+  | { name: "recheck"; runId: string; hosts: string[]; archive: string | undefined };
 
 type Switch = "live-runs" | "mcp";
 // Each switch the operator can flip, the app_flags row behind it, and how
@@ -141,6 +181,18 @@ const positionFrom = (text: string): number => (/^\d{1,2}$/.test(text) ? Number(
 const MAX_PICK = 10;
 // Counted in code points, the way createRun counts the show it is passed.
 const MAX_SEED_SHOW_CHARS = 200;
+// The feed's own author list keeps 4 of 200 characters (feeds/rss.ts); an
+// operator naming the hosts of one show needs no more than this.
+const MAX_HOSTS = 10;
+const MAX_HOST_CHARS = 200;
+
+// The same normalising the seed's show gets, so a host is matched the way
+// it was typed. Any blank, over-long or extra name refuses the command.
+function hostsFrom(values: readonly string[]): string[] | undefined {
+  const hosts = values.map((value) => value.normalize("NFC").trim());
+  if (hosts.length > MAX_HOSTS || hosts.some((host) => host === "" || [...host].length > MAX_HOST_CHARS)) return undefined;
+  return hosts;
+}
 
 const grouped = new Intl.NumberFormat("en-US");
 const utc = (date: Date) => `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -157,6 +209,8 @@ export function readArgs(argv: string[]): Args | undefined {
       apply?: boolean | undefined;
       tunnel?: string | undefined;
       pick?: string | undefined;
+      host?: string[] | undefined;
+      archive?: string | undefined;
     };
     positionals: string[];
   };
@@ -169,6 +223,8 @@ export function readArgs(argv: string[]): Args | undefined {
         apply: { type: "boolean", default: false },
         tunnel: { type: "string" },
         pick: { type: "string" },
+        host: { type: "string", multiple: true },
+        archive: { type: "string" },
       },
       allowPositionals: true,
       strict: true,
@@ -188,14 +244,24 @@ export function readArgs(argv: string[]): Args | undefined {
   if (dev && tunnelPort !== undefined) return undefined;
   const pick = parsed.values.pick === undefined ? undefined : positionFrom(parsed.values.pick);
   if (pick !== undefined && !(pick >= 1 && pick <= MAX_PICK)) return undefined;
-  const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true, pick);
+  const hosts = hostsFrom(parsed.values.host ?? []);
+  const archive = parsed.values.archive;
+  if (hosts === undefined || archive?.trim() === "") return undefined;
+  const command = readCommand(parsed.positionals, parsed.values.yes === true, parsed.values.apply === true, pick, { hosts, archive });
   if (command === undefined) return undefined;
   if (pick !== undefined && command.name !== "seed" && command.name !== "guesses") return undefined;
+  if ((hosts.length > 0 || archive !== undefined) && command.name !== "seed" && command.name !== "recheck") return undefined;
   if (tunnelPort !== undefined && ((command.name === "roles" && !command.apply) || command.name === "selftest")) return undefined;
   return { dev, tunnelPort, command };
 }
 
-function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: number | undefined): Command | undefined {
+function readCommand(
+  positionals: string[],
+  yes: boolean,
+  apply: boolean,
+  pick: number | undefined,
+  operator: { hosts: string[]; archive: string | undefined },
+): Command | undefined {
   const [name, ...rest] = positionals;
   if (name === "roles") return rest.length === 0 && !yes ? { name, apply } : undefined;
   if (name === "seed") {
@@ -205,7 +271,7 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     // doors hand the agent the same text for the same typed name.
     const text = show.normalize("NFC").trim();
     if (text === "" || [...text].length > MAX_SEED_SHOW_CHARS) return undefined;
-    return { name, show: text, pick };
+    return { name, show: text, pick, ...operator };
   }
   if (apply) return undefined;
   if (name === "promote") {
@@ -224,6 +290,11 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     return { name, runId, yes, pick };
   }
   if (yes) return undefined;
+  if (name === "recheck") {
+    const [runId] = rest;
+    if (rest.length !== 1 || runId === undefined) return undefined;
+    return { name, runId, ...operator };
+  }
   if (name === "unpromote") {
     const [runId] = rest;
     if (rest.length !== 1 || runId === undefined) return undefined;
@@ -247,6 +318,7 @@ function readCommand(positionals: string[], yes: boolean, apply: boolean, pick: 
     name === "budgets" ||
     name === "prune" ||
     name === "nightly" ||
+    name === "reconcile" ||
     name === "health" ||
     name === "showcase" ||
     name === "selftest"
@@ -315,12 +387,27 @@ async function passed(step: () => Promise<boolean>): Promise<boolean> {
   }
 }
 
+const placesWord = (n: number) => `${grouped.format(n)} ${n === 1 ? "place" : "places"}`;
+
+// A lowered counter is the fix working, not a problem, so it passes. The
+// counts printed are the counters as the reconcile found and left them.
+async function runReconcile(db: Db): Promise<boolean> {
+  const { runs, mcp } = await reconcileInflight(db);
+  console.log("In-progress run counters, lowered to the runs that hold them:");
+  console.log(`  site  ${grouped.format(runs.before)} before, ${grouped.format(runs.after)} after`);
+  console.log(`  MCP   ${grouped.format(mcp.before)} before, ${grouped.format(mcp.after)} after`);
+  const freed = Math.max(0, runs.before - runs.after) + Math.max(0, mcp.before - mcp.after);
+  console.log(freed === 0 ? "No place was lost." : `Freed ${placesWord(freed)} that no run held.`);
+  return true;
+}
+
 /**
- * The scheduled job: budgets, then prune, each run whatever the other did, so
- * a night no profile covers (budgets fails) still prunes. A step that throws
- * prints the same fixed line main would print for it. Prints both reports
- * and one closing line, and resolves true only when both steps passed; main
- * turns that into exit 0 or 1.
+ * The scheduled job: budgets, then prune, then reconcile, each run whatever
+ * the others did, so a night no profile covers (budgets fails) still prunes
+ * and still frees lost run places. A step that throws prints the same fixed
+ * line main would print for it. Prints the three reports, the reconcile's
+ * before and after counts among them, and one closing line, and resolves
+ * true only when every step passed; main turns that into exit 0 or 1.
  */
 export async function runNightly(db: Db): Promise<boolean> {
   console.log("$ ops budgets");
@@ -329,9 +416,12 @@ export async function runNightly(db: Db): Promise<boolean> {
   console.log("$ ops prune");
   const prune = await passed(() => runPrune(db));
   console.log("");
+  console.log("$ ops reconcile");
+  const reconcile = await passed(() => runReconcile(db));
+  console.log("");
   const word = (ok: boolean) => (ok ? "passed" : "failed");
-  console.log(`Nightly: budgets ${word(budgets)}, prune ${word(prune)}.`);
-  return budgets && prune;
+  console.log(`Nightly: budgets ${word(budgets)}, prune ${word(prune)}, reconcile ${word(reconcile)}.`);
+  return budgets && prune && reconcile;
 }
 
 async function runFlag(db: Db, which: Switch, on: boolean): Promise<boolean> {
@@ -471,7 +561,11 @@ const printableName = (text: string): string =>
 // seed, briefs and guesses build the same agent, so a brief or a flip from
 // any of them is made by the same runner parts and charges the same offline
 // share.
-function seedAgentFromEnv(db: Db, command: "seed" | "briefs" | "guesses"): { agent: SeedAgent; settings: AgentSettings } | null {
+function seedAgentFromEnv(
+  db: Db,
+  command: "seed" | "briefs" | "guesses",
+  operator?: OperatorInput,
+): { agent: SeedAgent; settings: AgentSettings } | null {
   let qloo: QlooConfig;
   try {
     qloo = loadQlooConfig();
@@ -492,6 +586,7 @@ function seedAgentFromEnv(db: Db, command: "seed" | "briefs" | "guesses"): { age
     model: settings.model,
     effort: settings.effort,
     trends: settings.trends,
+    ...(operator === undefined ? {} : { operator }),
   });
   return { agent, settings };
 }
@@ -547,7 +642,7 @@ async function runGuesses(db: Db, runId: string, yes: boolean, pick: number | un
     console.log(`Run ${id} ${GUESSES_REFUSED[plan.code]}. Nothing was done.`);
     return false;
   }
-  const spend = "1 model call, up to 8 Qloo searches and 1 insights call. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.";
+  const spend = "1 model call, up to 8 Qloo searches and 1 insights call. Qloo calls charge qloo:day:offline, qloo:month:offline and qloo:month; model tokens charge anthropic:day:offline.";
   if (!yes) {
     console.log(`Run ${id} (${printableName(plan.showName)}, ${plan.guests} guests) has no Without Qloo flip yet.`);
     console.log(`Run again with --yes to add it: ${spend}`);
@@ -578,12 +673,31 @@ async function runGuesses(db: Db, runId: string, yes: boolean, pick: number | un
   return true;
 }
 
-async function runSeed(db: Db, show: string, pick: number | undefined): Promise<boolean> {
-  const built = seedAgentFromEnv(db, "seed");
+// The archive is read before any agent is built, so a file it refuses
+// spends nothing.
+async function operatorFrom(hosts: string[], archive: string | undefined): Promise<OperatorInput | null> {
+  if (archive === undefined) return { hosts };
+  try {
+    return { hosts, archive: await readArchive(archive) };
+  } catch (error) {
+    if (!(error instanceof ArchiveError)) throw error;
+    console.log(error.message);
+    return null;
+  }
+}
+
+async function runSeed(db: Db, show: string, pick: number | undefined, hosts: string[], archive: string | undefined): Promise<boolean> {
+  const operator = await operatorFrom(hosts, archive);
+  if (operator === null) return false;
+  const built = seedAgentFromEnv(db, "seed", operator);
   if (built === null) return false;
+  const archived = operator.archive?.titles.length ?? 0;
+  if (hosts.length + archived > 0) {
+    console.log(`Leaving out ${hosts.length} --host names and the people in ${archived} archive titles, for this run only. Neither is stored.`);
+  }
   const { agent, settings } = built;
   console.log(
-    `Seeding with ${settings.model}, effort ${settings.effort}, trends ${settings.trends ? "on" : "off"}. Qloo calls charge qloo:day:offline and qloo:month; model tokens charge anthropic:day:offline.`,
+    `Seeding with ${settings.model}, effort ${settings.effort}, trends ${settings.trends ? "on" : "off"}. Qloo calls charge qloo:day:offline, qloo:month:offline and qloo:month; model tokens charge anthropic:day:offline.`,
   );
   const outcome = await seedShow(db, agent, show, pick);
 
@@ -626,6 +740,57 @@ async function runSeed(db: Db, show: string, pick: number | undefined): Promise<
   console.log("");
   console.log(`Put it on the home page: npx tsx scripts/ops.ts promote ${outcome.runId} <position> --yes`);
   return true;
+}
+
+const flagsText = (flags: { pastGuest: boolean; host: boolean }) =>
+  flags.host ? "a host" : flags.pastGuest ? "a past guest" : "not a past guest, not a host";
+
+function findingText(finding: RecheckFinding): string {
+  switch (finding.kind) {
+    case "feed_unread":
+      return "The show's feed could not be read, so only the show's names and any --host and --archive were checked.";
+    case "board_row_unreadable":
+      return `Board row ${finding.rank} does not read back.`;
+    case "board_guest":
+      return `${printableName(finding.name)} is on the board but is ${finding.as === "host" ? "a host" : "a past guest"}.`;
+    case "flip_guess":
+      return `The flip calls ${printableName(finding.name)} ${flagsText(finding.stored)}; today it is ${flagsText(finding.today)}.`;
+    case "brief_unreadable":
+      return `The brief for ${printableName(finding.guest)} does not read back.`;
+    case "prose":
+      return `The ${finding.field} for ${printableName(finding.guest)} fails today's prose check (${printableName(finding.reason)}).`;
+  }
+}
+
+const RECHECK_REFUSED: Record<RecheckRefusal, string> = {
+  RECHECK_NOT_DONE: "is not a done run, so there is nothing to recheck",
+  RECHECK_NO_BOARD: "has no board row that reads back",
+  RECHECK_NO_SHOW: "does not say which stored candidate it used, and no single one matches its show, so its feed is unknown",
+};
+
+// Reads only, so it may run on the hosted database at any time. Names reach
+// the terminal only through printableName (C3.6). `feeds` lets the
+// self-test serve a synthetic feed; otherwise the real fetcher reads the
+// run's feed once.
+async function runRecheck(db: Db, runId: string, operator: OperatorInput, feeds: Pick<AgentFeeds, "safeFetch" | "parseFeed"> = { safeFetch, parseFeed }): Promise<boolean> {
+  const report = await recheckRun(db, { feeds, operator }, runId);
+  const id = printableName(runId);
+  if (report.kind === "refused") {
+    console.log(`Run ${id} ${RECHECK_REFUSED[report.code]}. Nothing was checked.`);
+    return false;
+  }
+  const { feed, counts } = report;
+  const reach = feed.read ? `${feed.episodes} feed titles${feed.since === null ? "" : ` back to ${feed.since}`}` : "no feed titles";
+  console.log(
+    `Rechecked run ${id} (${printableName(report.showName)}) against ${reach}, ${report.archiveTitles} archive titles and ${report.hosts} --host names: ${counts.guests} board guests, ${counts.guesses} flip guesses, ${counts.briefs} briefs. Nothing was written.`,
+  );
+  if (report.findings.length === 0) {
+    console.log("Nothing found.");
+    return true;
+  }
+  console.log(`Found ${report.findings.length}:`);
+  for (const finding of report.findings) console.log(`  - ${findingText(finding)}`);
+  return false;
 }
 
 // A promoted run the home page does not show is a problem worth exit 1.
@@ -715,6 +880,66 @@ async function selftestShowcase(db: Db): Promise<string[]> {
   return failures;
 }
 
+// A synthetic feed for the recheck self-test, served without any network
+// request, so the past-guest check has titles to read (C7.3).
+const syntheticFeeds = (titles: readonly string[]): Pick<AgentFeeds, "safeFetch" | "parseFeed"> => ({
+  safeFetch: async () => ({
+    body: `<?xml version="1.0"?><rss><channel><title>Synthetic Show</title>${titles.map((title) => `<item><title>${title}</title></item>`).join("")}</channel></rss>`,
+  }),
+  parseFeed,
+});
+
+// A done run in the shape the agent runner stores, with its confirmed
+// candidate named on its board event and a flip that calls nobody a past guest.
+async function recheckableRun(db: Db): Promise<string> {
+  const runId = await createRun(db, { show: "Synthetic Show", exclude: [] });
+  await setRunStatus(db, runId, "running");
+  const [candidateId] = await putCandidates(db, runId, [
+    {
+      appleId: null,
+      name: "Synthetic Show",
+      publisher: "Synthetic Publisher",
+      feedHandleSource: "directory",
+      feedUrl: "https://feeds.invalid/selftest.xml",
+      qlooId: "00000000-0000-4000-8000-000000000650",
+      qlooName: "Synthetic Show",
+    },
+  ]);
+  await putBoard(db, runId, SELFTEST_GUESTS);
+  const pastGuests = { checked: true, skipped: 0, titles: 1, since: null, source: "directory", candidateId, archiveTitles: 0 };
+  await appendEvent(db, runId, "board", { guests: [], pastGuests });
+  const guesses = SELFTEST_GUESTS.map((guest) => ({ name: guest.name, fit: 0.5, fitKnown: true, reach: "bookable", pastGuest: false, host: false, onBoard: true }));
+  await appendEvent(db, runId, "without_qloo", { status: "done", guesses, unresolved: 0 });
+  await finishRun(db, runId, "done", { name: "done", data: { guests: SELFTEST_GUESTS.length } });
+  return runId;
+}
+
+async function eventCount(db: Db, runId: string): Promise<number> {
+  return (await listEventsAfter(db, runId, 0, 500)).length;
+}
+
+async function selftestRecheck(db: Db): Promise<string[]> {
+  const failures: string[] = [];
+  const runId = await recheckableRun(db);
+  const before = await eventCount(db, runId);
+  console.log(`$ ops --dev recheck ${runId}   (on this throwaway database, with a synthetic feed that names no guest)`);
+  const clean = await printed(() => runRecheck(db, runId, {}, syntheticFeeds(["Episode one"])));
+  if (!clean.result || !clean.text.includes("Nothing found")) failures.push("recheck reported a problem on a clean synthetic run");
+  console.log("");
+  console.log(`$ ops --dev recheck ${runId} --host "Synthetic Guest 3"   (with a synthetic feed whose oldest title names Synthetic Guest 2)`);
+  const found = await printed(() => runRecheck(db, runId, { hosts: ["Synthetic Guest 3"] }, syntheticFeeds(["Episode one", "Synthetic Guest 2 looks back"])));
+  if (
+    found.result ||
+    !found.text.includes("Synthetic Guest 2 is on the board but is a past guest") ||
+    !found.text.includes("Synthetic Guest 3 is on the board but is a host") ||
+    !found.text.includes("The flip calls Synthetic Guest 2 not a past guest, not a host; today it is a past guest")
+  ) {
+    failures.push("recheck did not report the synthetic past guest, host and flip");
+  }
+  if ((await eventCount(db, runId)) !== before) failures.push("recheck wrote to the run");
+  return failures;
+}
+
 // Prints as usual and also hands back what was printed, so the self-test can
 // check the operator's view itself, not only the data behind it.
 async function printed<T>(work: () => Promise<T>): Promise<{ result: T; text: string }> {
@@ -729,6 +954,39 @@ async function printed<T>(work: () => Promise<T>): Promise<{ result: T; text: st
   } finally {
     console.log = original;
   }
+}
+
+// Takes the MCP pair and never gives it back, which is exactly what a lost
+// release leaves, so health and reconcile have a real lost place to find.
+async function selftestReconcile(db: Db): Promise<string[]> {
+  if (!(await acquireMcpRunSlots(db, 1, 3))) return ["the synthetic lost place could not be taken"];
+  const failures: string[] = [];
+  console.log("$ ops --dev health   (one site place and one MCP place taken and never given back)");
+  const lost = await printed(() => runHealth(db));
+  if (
+    !lost.text.includes("The in-progress run counter is at 1, but no run is queued or running") ||
+    !lost.text.includes("The MCP in-progress run counter is at 1, but no MCP run is queued or running")
+  ) {
+    failures.push("health did not report the lost site and MCP places");
+  }
+  console.log("");
+  console.log("$ ops --dev reconcile");
+  const reconciled = await printed(() => runReconcile(db));
+  if (
+    !reconciled.result ||
+    !reconciled.text.includes("site  1 before, 0 after") ||
+    !reconciled.text.includes("MCP   1 before, 0 after") ||
+    !reconciled.text.includes("Freed 2 places that no run held.")
+  ) {
+    failures.push("reconcile did not lower both counters from 1 to 0");
+  }
+  console.log("");
+  console.log("$ ops --dev health");
+  const healed = await runHealth(db);
+  if (JSON.stringify(healed.problems) !== JSON.stringify(["Live runs are off, so the site shows saved runs only."])) {
+    failures.push("health still reported a lost place after reconcile");
+  }
+  return failures;
 }
 
 // Two synthetic keys issued inside this process. Neither key is ever printed;
@@ -787,13 +1045,17 @@ async function runSelftest(db: Db): Promise<boolean> {
   const expected = ["Live runs are off, so the site shows saved runs only."];
   if (JSON.stringify(second.problems) !== JSON.stringify(expected)) failures.push("the second health check did not report live runs off, alone");
   console.log("");
+  failures.push(...(await selftestReconcile(db)));
+  console.log("");
   failures.push(...(await selftestShowcase(db)));
+  console.log("");
+  failures.push(...(await selftestRecheck(db)));
   console.log("");
   failures.push(...(await selftestMcp(db)));
   console.log("");
   if (failures.length === 0) {
     console.log(
-      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, a synthetic finished run got its 3 briefs written and printed, went on the home page and came off again, and MCP switched on, listed two synthetic keys with no hash, revoked one, then all, and switched off.",
+      "Self-test passed: budgets set cleanly, health was clean, health flagged live runs once they were off, health found a synthetic lost run place and reconcile freed it, a synthetic finished run got its 3 briefs written and printed, went on the home page and came off again, recheck found nothing on a clean synthetic run and found its synthetic past guest, host and flip without writing, and MCP switched on, listed two synthetic keys with no hash, revoked one, then all, and switched off.",
     );
     return true;
   }
@@ -819,7 +1081,8 @@ function messageOf(error: unknown): string {
     error instanceof RoleSetupError ||
     error instanceof StoreError ||
     error instanceof ServerError ||
-    error instanceof PromoteError
+    error instanceof PromoteError ||
+    error instanceof ArchiveError
   ) {
     return error.message;
   }
@@ -876,6 +1139,8 @@ async function main(): Promise<number> {
         return (await runPrune(db)) ? 0 : 1;
       case "nightly":
         return (await runNightly(db)) ? 0 : 1;
+      case "reconcile":
+        return (await runReconcile(db)) ? 0 : 1;
       case "flag":
         return (await runFlag(db, command.flag, command.on)) ? 0 : 1;
       case "mcp":
@@ -895,7 +1160,11 @@ async function main(): Promise<number> {
       case "showcase":
         return (await runShowcase(db)) ? 0 : 1;
       case "seed":
-        return (await runSeed(db, command.show, command.pick)) ? 0 : 1;
+        return (await runSeed(db, command.show, command.pick, command.hosts, command.archive)) ? 0 : 1;
+      case "recheck": {
+        const operator = await operatorFrom(command.hosts, command.archive);
+        return operator !== null && (await runRecheck(db, command.runId, operator)) ? 0 : 1;
+      }
       case "selftest":
         return (await runSelftest(db)) ? 0 : 1;
     }

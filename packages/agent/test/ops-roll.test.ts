@@ -80,6 +80,7 @@ describe("rollBuckets", () => {
       "qloo:day:offline",
       "qloo:month",
       "qloo:month:mcp",
+      "qloo:month:offline",
       "youtube:day",
     ]);
     for (const bucket of Object.values(byKey)) expect(bucket.changed).toEqual(["created"]);
@@ -94,6 +95,7 @@ describe("rollBuckets", () => {
     expect(await usage(db, "youtube:day")).toEqual({ cap: 9_000, used: 0, windowEnd: day });
     expect(await usage(db, "qloo:day:mcp")).toEqual({ cap: 300, used: 0, windowEnd: day });
     expect(await usage(db, "qloo:month:mcp")).toEqual({ cap: 2_000, used: 0, windowEnd: month });
+    expect(await usage(db, "qloo:month:offline")).toEqual({ cap: 4_000, used: 0, windowEnd: month });
     expect(await usage(db, "anthropic:day:mcp")).toEqual({ cap: 500_000, used: 0, windowEnd: day });
     expect(await usage(db, "mcp:keys:day")).toEqual({ cap: 50, used: 0, windowEnd: day });
   });
@@ -134,7 +136,7 @@ describe("rollBuckets", () => {
     const outcome = await rollAt("2026-11-01T00:00:00.000Z");
     const next = rolled(outcome);
 
-    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-11-01", to: "2026-11-06" });
+    expect(outcome.covered && outcome.profile).toEqual({ from: "2026-11-01", to: "2026-11-07" });
     expect(next["qloo:month"]?.changed).toEqual(["cap", "window"]);
     expect(await usage(db, "qloo:month")).toEqual({ cap: 32_000, used: 0, windowEnd: at("2026-12-01T02:00:00.000Z") });
     expect(await usage(db, "qloo:day")).toEqual({ cap: 3_000, used: 0, windowEnd: at("2026-11-02T02:00:00.000Z") });

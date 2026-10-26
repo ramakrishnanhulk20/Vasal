@@ -1,10 +1,12 @@
-// Not covered here: Apple's live API (the feed demo script calls it), and
-// what safeFetch itself enforces (safe-fetch.test.ts). Every response below
-// is synthetic and the fetch is a stand-in, so no test reaches Apple.
+// Not covered here: Apple's live API (the feed demo script calls it), what
+// safeFetch itself enforces (safe-fetch.test.ts), and two processes sharing
+// the directory cache at once (PGlite has one connection). Every response
+// below is synthetic and the fetch is a stand-in, so no test reaches Apple.
 import { describe, expect, it, vi } from "vitest";
 import { FeedError } from "../src/feeds/errors.js";
-import { createDirectoryLimiter, lookupShow, searchShows } from "../src/feeds/lookup.js";
+import { createDirectoryCache, createDirectoryLimiter, lookupShow, searchShows, type DirectoryCache } from "../src/feeds/lookup.js";
 import type { SafeFetchOptions, SafeFetchResult } from "../src/net/safe-fetch.js";
+import { migratedPglite } from "./helpers/pglite.js";
 
 type Call = { url: URL; opts: SafeFetchOptions | undefined };
 
@@ -202,6 +204,27 @@ describe("the Apple directory limiter (D3.7)", () => {
     expect(calls).toHaveLength(20);
   });
 
+  it("refuses the 11th MCP lookup in a minute while a website lookup still passes, and the refused one holds no shared place", async () => {
+    vi.resetModules();
+    const fresh = await import("../src/feeds/lookup.js");
+    const { calls, fetchImpl } = fakeFetch(EMPTY);
+
+    for (let i = 0; i < 10; i += 1) await (i % 2 === 0 ? fresh.searchShows("show", { fetchImpl, surface: "mcp" }) : fresh.lookupShow("123456", { fetchImpl, surface: "mcp" }));
+    const refused = await fresh.searchShows("show", { fetchImpl, surface: "mcp" }).catch((error: unknown) => error);
+    expect((refused as { code?: unknown }).code).toBe("LOOKUP_FAILED");
+    expect(calls).toHaveLength(10);
+
+    for (let i = 0; i < 10; i += 1) await fresh.searchShows("show", { fetchImpl, surface: "web" });
+    expect(calls).toHaveLength(20);
+    const full = await fresh.searchShows("show", { fetchImpl }).catch((error: unknown) => error);
+    expect((full as { code?: unknown }).code).toBe("LOOKUP_FAILED");
+    expect(calls).toHaveLength(20);
+  });
+
+  it("refuses a per-minute count outside 1 to 20 when it is made", () => {
+    for (const perMinute of [0, 21, 1.5, Number.NaN]) expect(() => createDirectoryLimiter({ perMinute }), String(perMinute)).toThrow(RangeError);
+  });
+
   it("is one limiter for the whole process by default, shared by searchShows and lookupShow", async () => {
     vi.resetModules();
     const fresh = await import("../src/feeds/lookup.js");
@@ -213,5 +236,71 @@ describe("the Apple directory limiter (D3.7)", () => {
     // A fresh module brings its own FeedError class, so the code is read directly.
     expect((refused as { code?: unknown }).code).toBe("LOOKUP_FAILED");
     expect(calls).toHaveLength(20);
+  });
+});
+
+describe("the directory cache", () => {
+  const open = () => ({
+    takes: 0,
+    async take() {
+      this.takes += 1;
+      return true;
+    },
+  });
+
+  it("answers a repeat search or lookup inside the hour with no request and no limiter place, and asks again after it", async () => {
+    const db = await migratedPglite();
+    try {
+      let now = Date.parse("2026-10-24T12:00:00.000Z");
+      const limiter = open();
+      const { calls, fetchImpl } = fakeFetch(JSON.stringify({ resultCount: 2, results: [podcast(111111, "Good Show"), podcast(222222, "Song", { kind: "song" })] }));
+      const opts = { fetchImpl, limiter, cache: createDirectoryCache(db, () => new Date(now)) };
+
+      const first = await searchShows("Good Show", opts);
+      const again = await searchShows("  Good Show ", opts);
+      expect(again).toEqual(first);
+      expect(again.map((show) => [show.appleId, show.feedUrl?.href])).toEqual([["111111", "https://feeds.example.com/111111.xml"]]);
+      expect([calls.length, limiter.takes]).toEqual([1, 1]);
+
+      expect((await lookupShow("111111", opts))?.name).toBe("Good Show");
+      expect((await lookupShow("111111", opts))?.name).toBe("Good Show");
+      expect([calls.length, limiter.takes]).toEqual([2, 2]);
+
+      now += 60 * 60 * 1_000;
+      await searchShows("Good Show", opts);
+      expect([calls.length, limiter.takes]).toEqual([3, 3]);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("treats a cached answer that fails the candidate schema as a miss, stores only checked results, and never stores a failure", async () => {
+    const stored: unknown[] = [];
+    const cache: DirectoryCache = {
+      get: async () => [{ kind: "podcast", collectionId: "111111", collectionName: "Id is a string" }],
+      put: async (_key, value) => {
+        stored.push(value);
+      },
+    };
+    const { calls, fetchImpl } = fakeFetch(JSON.stringify({ results: [podcast(111111, "Good Show"), { kind: "song" }] }));
+
+    expect((await searchShows("show", { fetchImpl, limiter: open(), cache })).map((show) => show.appleId)).toEqual(["111111"]);
+    expect(calls).toHaveLength(1);
+    expect(stored).toEqual([
+      [
+        {
+          kind: "podcast",
+          collectionId: 111111,
+          collectionName: "Good Show",
+          artistName: "Good Show Media",
+          feedUrl: "https://feeds.example.com/111111.xml",
+          primaryGenreName: "Comedy",
+        },
+      ],
+    ]);
+
+    const broken = fakeFetch("<html>not json</html>");
+    expect(await failureCode(searchShows("show", { fetchImpl: broken.fetchImpl, limiter: open(), cache }))).toBe("LOOKUP_FAILED");
+    expect(stored).toHaveLength(1);
   });
 });

@@ -12,7 +12,7 @@ import type { Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { liveRunsEnabled } from "../store/flags.js";
 import type { AgentPort } from "./agent-port.js";
-import { acquireInflightSlot, countVisitorRun, releaseInflightSlot } from "./caps.js";
+import { acquireInflightSlot, countVisitorRun, releaseInflightSlot, visitorRunsAtCap } from "./caps.js";
 import type { ServerConfig } from "./config.js";
 import { ServerError } from "./errors.js";
 import { clientAddressFrom, isAllowedPost } from "./guards.js";
@@ -27,6 +27,7 @@ import {
   getBrief,
   getBriefClaim,
   getCandidate,
+  getPastGuests,
   getRun,
   getWithoutQloo,
   listBoard,
@@ -34,7 +35,9 @@ import {
   listEventsAfter,
   listShowcase,
   publicBoardGuest,
+  publicBrief,
   setRunStatus,
+  streamedEventData,
   type PublicBoardGuest,
   type RunInput,
   type RunRecord,
@@ -60,6 +63,7 @@ const MAX_EXCLUSIONS = 25;
 const MAX_EXCLUSION_LENGTH = 100;
 const MAX_TOKEN_LENGTH = 2_048;
 const MAX_BRIEFS_PER_RUN = 5;
+const BRIEF_UNREADABLE = "BRIEF_UNREADABLE";
 // Long past the time a visitor needs to pick a show; a run older than this
 // is closed at its next confirm instead of continuing on a stale pick.
 const CONFIRM_TTL_MS = 30 * 60 * 1_000;
@@ -82,6 +86,7 @@ const MAX_STREAM_POLL_MS = 60_000;
 const DEFAULT_STREAM_LIFETIME_MS = 600_000;
 const EVENT_PAGE = 100;
 const EVENTS_ROUTE = "/runs/:id/events";
+const HEALTH_QUERY_TIMEOUT_MS = 2_000;
 const SSE_HEADERS = { "Content-Type": "text/event-stream; charset=utf-8" };
 
 // zod counts code points here and in createRun alike, so the two agree. The
@@ -131,6 +136,24 @@ function wholeNumber(value: number | undefined, fallback: number, max: number): 
   const chosen = value ?? fallback;
   if (!Number.isSafeInteger(chosen) || chosen < 1 || chosen > max) throw new ServerError("SRV_BAD_INPUT");
   return chosen;
+}
+
+// A query still running when the limit passes is left to the pool's own
+// statement timeout; its late answer is ignored.
+async function databaseAnswers(db: Db): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), HEALTH_QUERY_TIMEOUT_MS);
+  });
+  const answered = db.query("SELECT 1 AS ok").then(
+    ({ rows }) => rows.length === 1 && rows[0]?.["ok"] === 1,
+    () => false,
+  );
+  try {
+    return await Promise.race([answered, late]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function isRunPath(path: string): boolean {
@@ -187,7 +210,9 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * /runs/:id/brief, GET /runs/:id/briefs/:guestId, POST /agent-keys
  * (keys-route.ts) and POST /mcp (mcp/server.ts); every other path and
  * method gives 404 NOT_FOUND, and there is no way to list visitor runs
- * (C6.1). GET /showcase lists only the runs the operator promoted (C6.3),
+ * (C6.1). GET /health answers 200 { ok: true, liveRuns } only when the
+ * database answers SELECT 1 within 2 seconds, and 503 { ok: false }
+ * otherwise. GET /showcase lists only the runs the operator promoted (C6.3),
  * from storage alone, cacheable for 60 seconds and open to indexing.
  * GET /runs/:id shows a done run's board as publicBoardGuest rows only, so
  * no Qloo entity id or internal number reaches the page and a row that fails
@@ -195,14 +220,21 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * carry a kolam drawn from those rows' numbers and guest ids only
  * (kolam/kolam.ts, C3.9), or null. A done run's page also carries
  * withoutQloo, its latest "without_qloo" event as getWithoutQloo reads it
- * (Qloo names, numbers and flags only), or null.
+ * (Qloo names, numbers and flags only), or null, and pastGuests, how far its
+ * past-guest check reached as getPastGuests reads it (counts, a month and
+ * the kind of feed, never its URL), or null.
  * Confirm and brief act only on website runs, and give an MCP run the same
  * 404 NOT_FOUND as an unknown one before any claim, cap or agent call
  * (D4.1). They act only on ids the server issued for that run (C6.2). A
  * confirm on a run that has waited more than 30 minutes since it was created
- * closes it as failed with CONFIRM_EXPIRED and gives 410 CONFIRM_EXPIRED.
+ * closes it as failed with CONFIRM_EXPIRED and gives 410 CONFIRM_EXPIRED. A
+ * confirm on a run in any other state than awaiting_confirm gives 409
+ * NOT_AWAITING before the kill switch and before any slot is taken.
  * Each guest's brief is claimed once, at most 5 claims per run, and a brief
- * that failed may be asked for once more; after a second failure the POST
+ * that failed may be asked for once more. A brief a budget refused is
+ * deferred instead: it spends no attempt and holds none of the 5, the GET
+ * reports it as { status: "none" }, and the POST claims it again after the
+ * kill switch, within the 5. After a second failure the POST
  * gives 409 { error: "BRIEF_FAILED", code } (C5.8), even with live runs
  * off, which refuse only a brief that would call the model. An agent that
  * is not ready gets that same brief 503 AGENT_NOT_READY, before any claim,
@@ -211,8 +243,18 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * BRIEF_NOT_READY, whether live runs are on or off (C6.3). GET
  * /runs/:id/briefs/:guestId reports { status: "done", brief },
  * { status: "pending" }, { status: "failed", code } or { status: "none" }
- * from storage alone. The event stream writes only formatSseFrame
- * frames and pings (C3.3), allows 3 open streams per run, 6 per visitor and
+ * from storage alone. Both brief routes show a stored brief only as
+ * publicBrief's five named fields, and one that fails storedBriefSchema
+ * reads as missing (C6.5). When the brief is missing and its claim is done,
+ * so it will never be written again, the brief is read once more; only when
+ * that read, made after the done claim was read, is still missing does GET
+ * answer { status: "failed", code: "BRIEF_UNREADABLE" } and POST 409
+ * BRIEF_FAILED with that code, never pending. A readable brief is always
+ * answered as done, whatever the claim says. The event
+ * stream writes only formatSseFrame frames and pings (C3.3), each frame
+ * holding its stored event as
+ * streamedEventData gives it, so a guest's reach reads as GET /runs/:id
+ * shows it. It allows 3 open streams per run, 6 per visitor and
  * maxOpenStreams (100 by default) in all, in this process, and ends at a
  * done or failed event, a finished and drained run, a run awaiting its
  * confirm once its candidates frame is out, or streamLifetimeMs; pings
@@ -224,15 +266,21 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
  * 8 KiB body cap and a strict body schema before anything else runs (C5.5,
  * C8.1), and a GET or HEAD never spends (C5.4). POST /runs also needs a
  * human check solved on this site for the run-start action (C5.9), checked
- * before the visitor is counted. Refusals are JSON
+ * before the visitor is counted, and a visitor already at the day's cap gets
+ * 429 VISITOR_LIMIT before any run place is taken (C5.8). Refusals are JSON
  * { error: CODE }, change nothing, and each writes one warn line holding only
  * the route pattern and the code (C3.6). An unexpected failure gives 500
  * { error: "INTERNAL" } and one log line holding only the route pattern and
  * a fixed code (C3.6). Throws ServerError("SRV_BAD_INPUT") while building if
  * streamPollMs is outside 1 to 60,000, streamLifetimeMs outside 1 to
  * 600,000, or maxOpenStreams outside 1 to 1,000.
+ * The app also carries drain(timeoutMs), which resolves once every run this
+ * process started or continued in the background has settled, including
+ * its failure write and the release of its slot, and every brief POST
+ * /runs/:id/brief set writing has settled, or once timeoutMs has passed,
+ * with how many are still going. It never rejects. MCP runs are not counted.
  */
-export function createApp(deps: AppDeps): Hono {
+export function createApp(deps: AppDeps): Hono & { drain(timeoutMs: number): Promise<number> } {
   const { db, config, agent } = deps;
   const now = deps.now ?? (() => new Date());
   const pollMs = wholeNumber(deps.streamPollMs, DEFAULT_STREAM_POLL_MS, MAX_STREAM_POLL_MS);
@@ -258,6 +306,10 @@ export function createApp(deps: AppDeps): Hono {
     logRefusal(patternOf(c, "unmatched"), "BRIEF_FAILED");
     return c.json({ error: "BRIEF_FAILED", code }, 409);
   };
+  // The runner stores a brief before it marks its claim done, so a brief read
+  // made after a done claim was read finds it unless it is truly unreadable.
+  // The route's first brief read may have run just before the brief landed.
+  const briefAfterDoneClaim = async (runId: string, guestId: string) => publicBrief(await getBrief(db, runId, guestId));
 
   const socketOf = (c: Context): string | null => {
     try {
@@ -314,17 +366,38 @@ export function createApp(deps: AppDeps): Hono {
 
   // The request has already been answered when this runs. A run that stops
   // without finishing is saved as failed, never left looking alive (C6.4).
+  // Kept so a stopping process can give runs and briefs in flight time to finish.
+  const background = new Set<Promise<void>>();
+  const track = (job: Promise<void>): void => {
+    background.add(job);
+    void job.finally(() => background.delete(job));
+  };
   const inBackground = (route: string, runId: string, work: () => Promise<void>, onSettled?: () => Promise<void>): void => {
-    void (async () => {
-      try {
-        await work();
-      } catch (error) {
-        logFailure(route, error);
-        await failRun(runId, "AGENT_ERROR").catch((failure: unknown) => logFailure(route, failure));
-      } finally {
-        if (onSettled) await onSettled().catch((failure: unknown) => logFailure(route, failure));
-      }
-    })();
+    track(
+      (async () => {
+        try {
+          await work();
+        } catch (error) {
+          logFailure(route, error);
+          await failRun(runId, "AGENT_ERROR").catch((failure: unknown) => logFailure(route, failure));
+        } finally {
+          if (onSettled) await onSettled().catch((failure: unknown) => logFailure(route, failure));
+        }
+      })(),
+    );
+  };
+
+  const drain = async (timeoutMs: number): Promise<number> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeUp = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    try {
+      await Promise.race([Promise.allSettled(background), timeUp]);
+    } finally {
+      clearTimeout(timer);
+    }
+    return background.size;
   };
 
   const sameSiteJson: MiddlewareHandler = async (c, next) => {
@@ -407,7 +480,7 @@ export function createApp(deps: AppDeps): Hono {
         const events = await listEventsAfter(db, runId, last, EVENT_PAGE);
         if (closed) return;
         for (const event of events) {
-          emit(formatSseFrame(event.event, event.seq, event.data));
+          emit(formatSseFrame(event.event, event.seq, streamedEventData(event.event, event.data)));
           last = event.seq;
           if (event.event === "done" || event.event === "failed") return;
         }
@@ -471,7 +544,12 @@ export function createApp(deps: AppDeps): Hono {
     }),
   );
 
-  app.get("/health", async (c) => c.json({ ok: true, liveRuns: await liveRunsEnabled(db) }));
+  // liveRunsEnabled reads any failure as "off", so on its own it would call a
+  // dead database healthy (audit A3-N3).
+  app.get("/health", async (c) => {
+    if (!(await databaseAnswers(db))) return c.json({ ok: false }, 503);
+    return c.json({ ok: true, liveRuns: await liveRunsEnabled(db) });
+  });
 
   // Read by the home page, so it only reads storage: no agent, human check,
   // kill switch or meter is touched (C5.4), and only the operator's promote
@@ -501,6 +579,10 @@ export function createApp(deps: AppDeps): Hono {
     const visitor = visitorKey(address, config.visitorHashSecret);
     if (visitor === null) return refuse(c, 400, "NO_CLIENT_ADDRESS");
 
+    // A visitor already at the cap is refused before any place is taken, so
+    // their retries cannot hold places other visitors need (C5.8). It is only
+    // a read: the count after the slot below is still the gate.
+    if (await visitorRunsAtCap(db, visitor, config.runsPerVisitorPerDay, now())) return refuse(c, 429, "VISITOR_LIMIT");
     // The slot is taken before the visitor's count, so a busy site does not
     // use up anyone's daily runs. From here every exit gives the slot back
     // unless a run now holds it.
@@ -530,10 +612,11 @@ export function createApp(deps: AppDeps): Hono {
     const run = await getRun(db, c.req.param("id"));
     if (run === null) return refuse(c, 404, "NOT_FOUND");
     const done = run.status === "done";
-    const [candidates, stored, withoutQloo] = await Promise.all([
+    const [candidates, stored, withoutQloo, pastGuests] = await Promise.all([
       listCandidates(db, run.id),
       listBoard(db, run.id),
       done ? getWithoutQloo(db, run.id) : null,
+      done ? getPastGuests(db, run.id) : null,
     ]);
     // Only a finished run shows its board and its flip, so a run that stopped
     // early is never shown with partial results (C6.4).
@@ -548,6 +631,7 @@ export function createApp(deps: AppDeps): Hono {
       board,
       kolam: done ? boardKolam(run.id, board) : null,
       withoutQloo,
+      pastGuests,
     });
   });
 
@@ -597,6 +681,10 @@ export function createApp(deps: AppDeps): Hono {
     if (run.status === "awaiting_confirm" && now().getTime() - run.createdAt.getTime() > CONFIRM_TTL_MS) {
       return expireRun(c, run.id);
     }
+    // A showcase run's id and candidate ids are public, so anything a confirm
+    // did before this check could be looped by anyone. A run that is not
+    // waiting takes no slot and never reaches the kill switch (audit A3-1).
+    if (run.status !== "awaiting_confirm") return refuse(c, 409, "NOT_AWAITING");
     // Continuing is where a run spends most of its Qloo calls and model
     // tokens, so it obeys the kill switch and takes an in-flight slot just as
     // a start does (C5.7, C5.8). A run refused here stays awaiting_confirm.
@@ -630,7 +718,8 @@ export function createApp(deps: AppDeps): Hono {
     const { guestId } = body;
     if ((await getBoardGuest(db, run.id, guestId)) === null) return refuse(c, 404, "UNKNOWN_GUEST");
 
-    const brief = await getBrief(db, run.id, guestId);
+    // A stored brief that fails its schema reads as missing and goes on to the claim (C6.5).
+    const brief = publicBrief(await getBrief(db, run.id, guestId));
     if (brief !== null) return c.json({ brief }, 200);
     // The operator writes and reads a showcase run's briefs before promoting
     // it (ops briefs), so no visitor ever writes the one every later visitor
@@ -638,11 +727,18 @@ export function createApp(deps: AppDeps): Hono {
     if (await isPromoted(db, run.id)) return refuse(c, 409, "BRIEF_NOT_READY");
     // Only new model spend stops when live runs are off (C5.7), so a stored
     // brief, a brief that failed for good and one already being written are
-    // all answered from storage first. claimBrief below stays the only gate
-    // that lets a model call through.
+    // all answered from storage first. A deferred claim goes on like a new
+    // one. claimBrief below stays the only gate that lets a model call
+    // through.
     const held = await getBriefClaim(db, run.id, guestId);
     if (held?.status === "failed" && held.attempts === 2) return briefFailed(c, held.errorCode);
-    if (held?.status === "pending" || held?.status === "done") return c.json({ status: "pending" }, 202);
+    // A done claim is never claimed again, so a brief it cannot read would
+    // otherwise sit at pending for good. It answers as the GET does.
+    if (held?.status === "done") {
+      const landed = await briefAfterDoneClaim(run.id, guestId);
+      return landed === null ? briefFailed(c, BRIEF_UNREADABLE) : c.json({ brief: landed }, 200);
+    }
+    if (held?.status === "pending") return c.json({ status: "pending" }, 202);
     if (!(await liveRunsEnabled(db))) return refuse(c, 503, "LIVE_RUNS_OFF");
     if (agent.ready === false) return refuse(c, 503, "AGENT_NOT_READY");
 
@@ -655,9 +751,7 @@ export function createApp(deps: AppDeps): Hono {
     }
     if (claim === "claimed") {
       // A failed brief leaves the finished run and its board alone.
-      void (async () => agent.writeBrief(run.id, guestId))().catch((error: unknown) =>
-        logFailure("agent.writeBrief", error),
-      );
+      track((async () => agent.writeBrief(run.id, guestId))().catch((error: unknown) => logFailure("agent.writeBrief", error)));
     }
     return c.json({ status: "pending" }, 202);
   });
@@ -670,12 +764,19 @@ export function createApp(deps: AppDeps): Hono {
     const guestId = c.req.param("guestId");
     if ((await getBoardGuest(db, run.id, guestId)) === null) return refuse(c, 404, "UNKNOWN_GUEST");
 
-    const brief = await getBrief(db, run.id, guestId);
+    const brief = publicBrief(await getBrief(db, run.id, guestId));
     if (brief !== null) return c.json({ status: "done", brief });
-    // A done claim whose brief cannot be read counts as missing (C6.5).
+    // A brief that fails its schema counts as missing (C6.5), so the claim
+    // decides the answer, and a done claim with nothing readable has failed.
     const claim = await getBriefClaim(db, run.id, guestId);
+    if (claim?.status === "done") {
+      const landed = await briefAfterDoneClaim(run.id, guestId);
+      return c.json(landed === null ? { status: "failed", code: BRIEF_UNREADABLE } : { status: "done", brief: landed });
+    }
     if (claim?.status === "pending") return c.json({ status: "pending" });
     if (claim?.status === "failed") return c.json({ status: "failed", code: claim.errorCode });
+    // A deferred claim spent no attempt and may be asked for again, so the
+    // page offers it as if it had never been asked for.
     return c.json({ status: "none" });
   });
 
@@ -693,5 +794,5 @@ export function createApp(deps: AppDeps): Hono {
     return c.json({ error: "INTERNAL" }, 500);
   });
 
-  return app;
+  return Object.assign(app, { drain });
 }

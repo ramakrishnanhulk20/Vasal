@@ -2,8 +2,8 @@
 // every refusal that must happen before any Qloo call, the request each tool
 // builds, size caps on what goes back to the model, step summaries that
 // carry no ids or upstream text, the trends switch, past guests left out
-// of people lists, and shared tags dropped for their words or length before
-// they are stored. It does not cover
+// of people lists, and shared tags dropped for their family, words or length
+// before they are stored. It does not cover
 // the model loop or the Anthropic client (next work order), the real cache
 // and meter (see
 // qloo-metered.test.ts), or real Qloo response shapes. All data is synthetic.
@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { buildBoard } from "../src/agent/board.js";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { stepFor } from "../src/agent/loop.js";
-import { ACCUSATIONS_RULE, isShowableTag, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { ACCUSATIONS_RULE, FAMILY_RULE, isShowableTag, RELEASE_CLAIM_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 import { attachHarness, PICK_HINTS, researchTools, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
@@ -68,9 +68,9 @@ function synthResponse(op: QlooOperation): unknown {
       }));
     case "compare":
       return {
-        tags: [0.9, 0.2, 0.7].map((score, n) => ({ tag_id: `urn:tag:synthetic:${n}`, name: `taste ${n} ${MARKER}`, query: { score } })),
-        a: [{ tag_id: "urn:tag:synthetic_show:side", name: `side taste ${MARKER}` }],
-        b: [{ tag_id: "urn:tag:synthetic_person:side", name: `Side Taste ${MARKER}` }],
+        tags: [0.9, 0.2, 0.7].map((score, n) => ({ tag_id: `urn:tag:genre:media:taste_${n}`, name: `taste ${n} ${MARKER}`, query: { score } })),
+        a: [{ tag_id: "urn:tag:style:qloo:side_taste", name: `side taste ${MARKER}` }],
+        b: [{ tag_id: "urn:tag:content:qloo:side_taste", name: `Side Taste ${MARKER}` }],
       };
     case "search":
       return [{ entity_id: personId(50), name: `Synthetic Found ${MARKER}`, popularity: 0.3, query: { affinity: 0.99 } }];
@@ -164,6 +164,18 @@ describe("researchTools", () => {
 
     expect(titles?.description).toBe("Titles of the show's recent episodes, so you can see what the show covers. Call it once.");
     expect(JSON.stringify(researchTools(ON))).not.toContain("Past guests");
+  });
+
+  it("describes what audience_of feeds as a lean, and no tool text, hint or audience_of result says a guest would add listeners the show lacks", async () => {
+    const audience = researchTools(ON).find((tool) => tool.name === "audience_of");
+    expect(audience?.description).toContain("an audience group this guest's fans lean toward more than the show's listeners do");
+
+    const { ctx, qloo } = await withPeople();
+    const result = await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON);
+    expect(result.isError).toBe(false);
+    for (const text of [JSON.stringify(researchTools(ON)), JSON.stringify(PICK_HINTS), result.content]) {
+      expect(text).not.toMatch(/does not reach|would add|would bring|new listeners/i);
+    }
   });
 });
 
@@ -315,7 +327,7 @@ describe("tool requests and results", () => {
       personId: personId(1),
       name: `Synthetic Person 1 ${MARKER}`,
       affinity: 0.99,
-      reach: "bookable",
+      reach: "none",
     });
     expect(ctx.people.get(personId(2))).toEqual({ name: `Synthetic Person 2 ${MARKER}`, affinity: 0.977, popularity: 0.51 });
   });
@@ -580,12 +592,12 @@ describe("tool requests and results", () => {
 });
 
 describe("shared_taste matching", () => {
-  const idTag = (name: string, score: number, family = "synthetic_family") => ({
+  const idTag = (name: string, score: number, family = "genre:media") => ({
     tag_id: `urn:tag:${family}:${name.toLowerCase().replace(/\W+/gu, "_")}`,
     name,
     query: { score },
   });
-  const side = (...names: string[]) => names.map((name, n) => ({ tag_id: `urn:tag:synthetic_side:${n}`, name }));
+  const side = (...names: string[]) => names.map((name, n) => ({ tag_id: `urn:tag:content:qloo:side_${n}`, name }));
 
   async function tastesFor(compare: { tags: unknown[]; a: unknown[]; b: unknown[] }) {
     const ctx = newContext();
@@ -615,7 +627,7 @@ describe("shared_taste matching", () => {
 
   it("gives one entry for a name found in two tag families", async () => {
     const { stored } = await tastesFor({
-      tags: [idTag("Comedy", 0.7, "synthetic_genre"), idTag("Comedy", 0.69, "synthetic_style")],
+      tags: [idTag("Comedy", 0.7, "genre:media"), idTag("Comedy", 0.69, "style:qloo")],
       a: side("Comedy", "Comedy"),
       b: side("Comedy"),
     });
@@ -650,6 +662,68 @@ describe("shared_taste matching", () => {
     ]);
     expect(shown).toEqual(["Comedy", "Engaging", "Blackjack"]);
     expect(summary).toBe("found 3 shared tastes");
+  });
+
+  it("keeps only tags from a showable family, so a theme, keyword, ethnicity or unknown family never becomes a chip (A2-7)", async () => {
+    const { stored, shown, summary } = await tastesFor({
+      tags: [
+        idTag("Comedy", 0.9, "genre:media"),
+        idTag("Engaging", 0.8, "content:qloo"),
+        idTag("Mental Health", 0.7, "theme:qloo"),
+        idTag("Sexuality", 0.6, "keyword:qloo"),
+        idTag("Asian", 0.5, "ethnicity:qloo"),
+        idTag("Fraud", 0.4, "keyword:qloo"),
+        idTag("Synthetic Novel Taste", 0.3, "synthetic_family:qloo"),
+      ],
+      a: [],
+      b: [],
+    });
+
+    expect(stored).toEqual([
+      { name: "Comedy", score: 0.9 },
+      { name: "Engaging", score: 0.8 },
+    ]);
+    expect(shown).toEqual(["Comedy", "Engaging"]);
+    expect(summary).toBe("found 2 shared tastes");
+  });
+
+  it("drops a topic chip Qloo files under a showable family, such as Mental Health in genre:media", async () => {
+    const { stored, shown } = await tastesFor({
+      tags: [
+        idTag("Mental Health", 0.9, "genre:media"),
+        idTag("Faith oriented", 0.8, "audience:qloo"),
+        idTag("Political comedy", 0.7, "subgenre:qloo"),
+        idTag("Comedy", 0.6, "genre:media"),
+      ],
+      a: side("Sexually candid", "Experimental"),
+      b: side("Sexually candid", "Experimental"),
+    });
+
+    expect(stored).toEqual([
+      { name: "Comedy", score: 0.6 },
+      { name: "Experimental", score: null },
+    ]);
+    expect(shown).toEqual(["Comedy", "Experimental"]);
+  });
+
+  it("matches a name across the sides only when both sides' tags are in a showable family and carry an id", async () => {
+    const { stored } = await tastesFor({
+      tags: [],
+      a: [
+        { tag_id: "urn:tag:style:qloo:faith", name: "Faith" },
+        { tag_id: "urn:tag:theme:qloo:recovery", name: "Recovery" },
+        { name: "Synthetic Idless" },
+        { tag_id: "urn:tag:host:qloo:candid", name: "Candid" },
+      ],
+      b: [
+        { tag_id: "urn:tag:religion:qloo:faith", name: "Faith" },
+        { tag_id: "urn:tag:style:qloo:recovery", name: "Recovery" },
+        { tag_id: "urn:tag:style:qloo:synthetic_idless", name: "Synthetic Idless" },
+        { tag_id: "urn:tag:content:qloo:candid", name: "Candid" },
+      ],
+    });
+
+    expect(stored).toEqual([{ name: "Candid", score: null }]);
   });
 
   it("drops a tag longer than the board's 40-character chip instead of letting the board cut it", async () => {
@@ -813,6 +887,111 @@ describe("finish_board", () => {
     }
   });
 
+  it("sends back an angle saying a guest has a release coming, with the release hint, trends on or off (A2-5)", async () => {
+    const angle = "Her new film and the long road to making it.";
+    const input = { picks: VALID_PICKS.map((pick, n) => (n === 2 ? { ...pick, angle } : pick)) };
+
+    for (const opts of [ON, OFF]) {
+      const { ctx, qloo } = await withPeople();
+      const outcome = await runTool(ctx, qloo, "finish_board", input, TODAY, opts);
+
+      expect(outcome.finished).toBeUndefined();
+      expect(JSON.parse(outcome.content)).toEqual({
+        error: "PICKS_REJECTED",
+        rejected: [{ index: 2, reason: "release_claim", hint: RELEASE_CLAIM_RULE }],
+      });
+    }
+    expect(PICK_HINTS.release_claim).toBe(RELEASE_CLAIM_RULE);
+    expect(RELEASE_CLAIM_RULE).toBe(
+      "Qloo does not say who is in a release, so never write that someone has a film, show, book or album coming out. Pick them for it if you like, but write the angle about their work so far.",
+    );
+  });
+
+  // Runs upcoming_releases with these film titles, then finish_board with this angle as the second pick.
+  async function afterReleases(titles: string[], angle: string) {
+    const release = (name: string, n: number) => ({ entity_id: `00000000-0000-4000-8000-00000000032${n}`, name, properties: { release_date: IN_30_DAYS } });
+    const { qloo } = fakeQloo((op) => (op.op === "insights" && op.filterType === "urn:entity:movie" ? titles.map(release) : synthResponse(op)));
+    const ctx = newContext();
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    await runTool(ctx, qloo, "upcoming_releases", { kind: "movie" }, TODAY, ON);
+    return runTool(ctx, qloo, "finish_board", { picks: VALID_PICKS.map((pick, n) => (n === 1 ? { ...pick, angle } : pick)) }, TODAY, ON);
+  }
+  const titleHint = (title: string) => `Do not name the upcoming title "${title}": Qloo does not say who is in it.`;
+
+  it("sends back an angle holding an upcoming title's words in a row, whatever its dashes, colons, case or articles, and the hint names the title (C2.10)", async () => {
+    const reckoning = "Mission: Impossible – The Final Reckoning";
+    const cases: Array<[string, string]> = [
+      [reckoning, "His stunts in Mission Impossible - The Final Reckoning."],
+      [reckoning, "His stunts in mission impossible final reckoning."],
+      ["Dune: Part Three", "Her work on DUNE:  part three and the craft behind it."],
+    ];
+
+    for (const [title, angle] of cases) {
+      const outcome = await afterReleases([title], angle);
+      expect(outcome.finished, angle).toBeUndefined();
+      expect(JSON.parse(outcome.content), angle).toEqual({ error: "PICKS_REJECTED", rejected: [{ index: 1, reason: "release_claim", hint: titleHint(title) }] });
+    }
+  });
+
+  it("never matches a title left with one word once articles go, or words that are not all there in a row", async () => {
+    const titles = ["The Show", "Up", "Wicked", "The Studio", "Big Shot"];
+    const angles = [
+      "Why the show's fans would love her.",
+      "Up close with a sharp storyteller.",
+      "Wicked smart takes on sketch comedy.",
+      "Stories from the studio and the road.",
+      "Stories of the big shots in comedy.",
+    ];
+
+    for (const angle of angles) {
+      const outcome = await afterReleases(titles, angle);
+      expect(outcome.finished?.[1]?.angle, angle).toBe(angle);
+    }
+  });
+
+  it("finds the title in the text the board would store, so a link or email wedged inside it cannot hide it (C2.10)", async () => {
+    for (const angle of ["Her role in Wicked x.co For Good and the craft behind it.", "His stunts in Mission Impossible a@b.co The Final Reckoning."]) {
+      const outcome = await afterReleases(["Wicked: For Good", "Mission: Impossible – The Final Reckoning"], angle);
+      expect(outcome.finished, angle).toBeUndefined();
+      expect(JSON.parse(outcome.content).rejected?.[0]?.reason, angle).toBe("release_claim");
+    }
+  });
+
+  it("names the title in the hint as upcoming_releases cleaned it, cut to 120 characters", async () => {
+    const title = `Synthetic Saga ${"x".repeat(150)}`;
+
+    const outcome = await afterReleases([`${title}${HIDDEN}`], `Her part in ${title} and why it worked.`);
+
+    const { rejected } = JSON.parse(outcome.content) as { rejected: Array<{ hint: string }> };
+    expect(rejected).toEqual([{ index: 1, reason: "release_claim", hint: titleHint(title.slice(0, 120)) }]);
+    expect(UNSAFE.test(outcome.content)).toBe(false);
+  });
+
+  it("sends back an angle about a guest's family with the family hint, trends on or off, and keeps a business partner", async () => {
+    const input = {
+      picks: [
+        { personId: personId(1), angle: "Building a company with a business partner." },
+        { personId: personId(2), angle: "Life on tour with her husband and kids." },
+        { personId: personId(3), angle: "Their fans already love this show." },
+      ],
+    };
+
+    for (const opts of [ON, OFF]) {
+      const { ctx, qloo } = await withPeople();
+      const outcome = await runTool(ctx, qloo, "finish_board", input, TODAY, opts);
+
+      expect(outcome.finished).toBeUndefined();
+      expect(JSON.parse(outcome.content)).toEqual({
+        error: "PICKS_REJECTED",
+        rejected: [{ index: 1, reason: "family_claim", hint: FAMILY_RULE }],
+      });
+    }
+    expect(PICK_HINTS.family_claim).toBe(FAMILY_RULE);
+    expect(FAMILY_RULE).toBe(
+      "Do not mention the guest's partner, marriage, children or other family: what a model remembers about a real person's family is often wrong.",
+    );
+  });
+
   it("every refused pick carries the fixed hint for its reason", async () => {
     const { ctx, qloo } = await withPeople();
     const input = {
@@ -926,13 +1105,16 @@ describe("past guests (C2.1, C2.2)", () => {
     expect(ctx.people.has(personId(50))).toBe(true);
   });
 
-  it("reports reach as unknown for a person with no popularity", async () => {
+  it("reports reach as household name only at Qloo popularity 0.97 or above, and as none otherwise, missing popularity included", async () => {
     const ctx = newContext();
-    const { qloo } = fakeQloo(() => synthPeople(1).map(({ popularity: _popularity, ...person }) => person));
+    const popularities = [0.97, 0.969, undefined];
+    const { qloo } = fakeQloo(() =>
+      synthPeople(3).map(({ popularity: _popularity, ...person }, n) => (popularities[n] === undefined ? person : { ...person, popularity: popularities[n] })),
+    );
 
     const outcome = await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
 
-    expect((JSON.parse(outcome.content) as { people: Array<{ reach: string }> }).people[0]?.reach).toBe("unknown");
+    expect((JSON.parse(outcome.content) as { people: Array<{ reach: string }> }).people.map((person) => person.reach)).toEqual(["household name", "none", "none"]);
   });
 
   it("people_for_show leaves out a past guest and says how many", async () => {

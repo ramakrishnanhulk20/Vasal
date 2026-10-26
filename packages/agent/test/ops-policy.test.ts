@@ -30,6 +30,7 @@ const OCTOBER = {
   "qloo:month": ["month", 12_000],
   "qloo:day": ["day", 1_000],
   "qloo:day:offline": ["day", 6_000],
+  "qloo:month:offline": ["month", 4_000],
   "anthropic:day": ["day", 2_000_000],
   "anthropic:day:offline": ["day", 4_000_000],
   "youtube:day": ["day", 9_000],
@@ -42,6 +43,7 @@ const NOVEMBER = {
   "qloo:month": ["month", 32_000],
   "qloo:day": ["day", 1_400],
   "qloo:day:offline": ["day", 300],
+  "qloo:month:offline": ["month", 3_000],
   "anthropic:day": ["day", 3_000_000],
   "anthropic:day:offline": ["day", 500_000],
   "youtube:day": ["day", 9_000],
@@ -50,18 +52,19 @@ const NOVEMBER = {
   "anthropic:day:mcp": ["day", 1_000_000],
   "mcp:keys:day": ["day", 100],
 };
-// The judging window, 30 Oct to 5 Nov, raises only these day caps; every
-// month cap stays its month's.
+// The judging window, 30 Oct to 6 Nov, raises only these day caps; every
+// month cap stays its month's. Its October part also cuts the offline share.
 const JUDGING_DAYS = {
   "qloo:day": ["day", 3_000],
   "qloo:day:mcp": ["day", 600],
-  "anthropic:day": ["day", 4_000_000],
+  "anthropic:day": ["day", 20_000_000],
   "anthropic:day:mcp": ["day", 1_000_000],
   "mcp:keys:day": ["day", 100],
 };
 const AFTER_JUDGING = {
   ...NOVEMBER,
   "qloo:month": ["month", 20_000],
+  "qloo:month:offline": ["month", 2_000],
   "anthropic:day": ["day", 1_000_000],
   "anthropic:day:mcp": ["day", 500_000],
 };
@@ -77,15 +80,16 @@ describe("the shipped policy", () => {
 
     expect(caps).toEqual([
       { range: "2026-10-01..2026-10-30", caps: OCTOBER },
-      { range: "2026-10-30..2026-11-01", caps: { ...OCTOBER, ...JUDGING_DAYS } },
-      { range: "2026-11-01..2026-11-06", caps: { ...NOVEMBER, ...JUDGING_DAYS } },
-      { range: "2026-11-06..2026-12-01", caps: NOVEMBER },
+      { range: "2026-10-30..2026-11-01", caps: { ...OCTOBER, ...JUDGING_DAYS, "qloo:day:offline": ["day", 1_500] } },
+      { range: "2026-11-01..2026-11-07", caps: { ...NOVEMBER, ...JUDGING_DAYS } },
+      { range: "2026-11-07..2026-12-01", caps: NOVEMBER },
       { range: "2026-12-01..2027-01-01", caps: AFTER_JUDGING },
       { range: "2027-01-01..2027-02-01", caps: AFTER_JUDGING },
     ]);
     expect(policy.notes?.join(" ")).toContain("judging");
     expect(policy.notes?.join(" ")).toContain("Judging now ends 5 Nov");
     expect(policy.notes?.join(" ")).toContain("qloo:month:mcp");
+    expect(policy.notes?.join(" ")).toContain("qloo:month:offline");
   });
 
   it("fits October and November inside the one Qloo month that runs from key day to 20 Nov, and November's judging days inside November", async () => {
@@ -104,7 +108,7 @@ describe("the shipped policy", () => {
 
     const judging = policy.profiles.find((p) => p.from === "2026-11-01")!;
     const judgingDays = (Date.parse(judging.to) - Date.parse(judging.from)) / DAY_MS;
-    expect(judgingDays).toBe(5);
+    expect(judgingDays).toBe(6);
     const perDay = capOf(judging, "qloo:day") + capOf(judging, "qloo:day:mcp") + capOf(judging, "qloo:day:offline");
     expect(perDay * judgingDays).toBeLessThanOrEqual(november!);
   });
@@ -206,8 +210,8 @@ describe("profileFor", () => {
     expect(profileFor(policy, at("2026-10-30T00:00:00.000Z"))).toBe(octoberJudging);
     expect(profileFor(policy, at("2026-10-31T23:59:59.999Z"))).toBe(octoberJudging);
     expect(profileFor(policy, at("2026-11-01T00:00:00.000Z"))).toBe(novemberJudging);
-    expect(profileFor(policy, at("2026-11-05T23:59:59.999Z"))).toBe(novemberJudging);
-    expect(profileFor(policy, at("2026-11-06T00:00:00.000Z"))).toBe(november);
+    expect(profileFor(policy, at("2026-11-06T23:59:59.999Z"))).toBe(novemberJudging);
+    expect(profileFor(policy, at("2026-11-07T00:00:00.000Z"))).toBe(november);
     expect(profileFor(policy, at("2026-11-30T23:59:59.999Z"))).toBe(november);
     expect(profileFor(policy, at("2026-12-01T00:00:00.000Z"))).toBe(december);
     expect(profileFor(policy, at("2027-01-01T00:00:00.000Z"))).toBe(january);

@@ -3,9 +3,10 @@ import { ServerError } from "./errors.js";
 /**
  * The fixed set of stream event names (C3.3). runs.ts re-exports it, and both
  * the stored events and the stream frames are checked against this one list.
- * A stored event streams exactly as stored, so each one holds only what the
- * page may show; "without_qloo" holds Qloo names, numbers and flags, never an
- * id or model text (D5.5).
+ * A stored event streams as stored except for reach, which goes out as
+ * publicReach gives it, so each one holds only what the page may show;
+ * "without_qloo" holds Qloo names, numbers and flags, never an id or model
+ * text (D5.5).
  */
 export const RUN_EVENTS = ["step", "candidates", "board", "brief", "without_qloo", "done", "failed"] as const;
 export type RunEventName = (typeof RUN_EVENTS)[number];

@@ -124,6 +124,7 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
       RUN_ID,
       items([1, 2, 3].map((n) => boardRow(n, { name: `Ada${HIDDEN} Lovelace`, sharedTags: [`sci${HIDDEN}ence`], angle: `Ask${HIDDEN} about engines.` }))),
       APP_ORIGIN,
+      null,
     );
 
     const unsafe = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Bidi_Control}]/u;
@@ -137,6 +138,7 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
       RUN_ID,
       items([1, 2, 3].map((n) => boardRow(n, { name: "Ada ![x](https://evil.example/p?d=) Lovelace", sharedTags: ["see evil.example/login"] }))),
       APP_ORIGIN,
+      null,
     );
     const found = candidatesReply(items([candidateRow({ name: "Show ![x](https://evil.example/p?d=)", publisher: "evil.example/login" })]));
 
@@ -155,6 +157,7 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
       RUN_ID,
       items([1, 2, 3].map((n) => boardRow(n, { name: "N".repeat(200), sharedTags: ["t".repeat(200)], angle: "a ".repeat(200) }))),
       APP_ORIGIN,
+      null,
     );
     const [first] = structured(board)["guests"] as Array<{ name: string; sharedTags: string[]; angle: string }>;
     expect(first?.name).toHaveLength(120);
@@ -181,6 +184,7 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
       RUN_ID,
       items([1, 2, 3].map((n) => boardRow(n, { name: emoji.repeat(120), sharedTags: tags, angle: emoji.repeat(400), showName: emoji.repeat(120) }))),
       APP_ORIGIN,
+      null,
     );
     expect(structured(board)["showName"]).toBe(emoji.repeat(120));
     const guests = structured(board)["guests"] as Array<{ name: string; sharedTags: string[]; angle: string }>;
@@ -208,7 +212,7 @@ describe("cleaning third-party text (D5.1, D5.2, D5.3)", () => {
 
 describe("what a result may carry (D5.4, D5.5)", () => {
   it("never copies a Qloo person id, a Qloo show id, a feed URL or the rising points out of the stored rows", () => {
-    const board = boardReply(RUN_ID, items([1, 2, 3].map((n) => boardRow(n))), APP_ORIGIN);
+    const board = boardReply(RUN_ID, items([1, 2, 3].map((n) => boardRow(n))), APP_ORIGIN, null);
     const found = candidatesReply(items([candidateRow(), candidateRow({ appleId: null })]));
 
     for (const result of [board, found]) {
@@ -225,9 +229,40 @@ describe("what a result may carry (D5.4, D5.5)", () => {
     );
   });
 
+  it("shows only the chips today's rules allow from a row stored before them (C3.10)", () => {
+    const board = boardReply(RUN_ID, items([boardRow(1, { sharedTags: ["Mental Health", "Comedy"] })]), APP_ORIGIN, null);
+
+    expect((structured(board)["guests"] as Array<{ sharedTags: string[] }>)[0]?.sharedTags).toEqual(["Comedy"]);
+  });
+
+  it("carries the past-guest coverage it is given by name, with the feed's name and publisher cleaned, null when there is none, and never a feed URL or candidate id (A2-6)", () => {
+    for (const source of ["directory", "linked", "pasted"] as const) {
+      const coverage = { checked: true, episodes: 312, since: "2019-09", source, feedName: "SmartLess", feedPublisher: "Jason Bateman", archiveTitles: 4 };
+      const smuggled = { ...coverage, feedUrl: FEED_MARKER, candidateId: RUN_ID } as typeof coverage;
+
+      const shown = boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN, smuggled);
+
+      expect(structured(shown)["pastGuests"], source).toEqual(coverage);
+      expect(textOf(shown), source).not.toContain(FEED_MARKER);
+      expect(textOf(shown), source).not.toContain("candidateId");
+    }
+    const hostile = { checked: true, episodes: 1, since: null, source: "pasted" as const, feedName: `Smart${HIDDEN}Less ![x](https://evil.example/p)`, feedPublisher: "evil.example", archiveTitles: 0 };
+    const cleaned = boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN, hostile);
+    expect(structured(cleaned)["pastGuests"]).toMatchObject({ feedName: "SmartLess ![x]()", feedPublisher: "" });
+    expect(linksOutsideOwnUrls(cleaned)).toEqual([]);
+    const unnamed = boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN, { ...hostile, feedName: null, feedPublisher: null });
+    expect(structured(unnamed)["pastGuests"]).toMatchObject({ feedName: null, feedPublisher: null });
+
+    expect(structured(boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN, null))["pastGuests"]).toBeNull();
+    const shown = structured(cleaned);
+    expect(runOutput.safeParse({ ...shown, pastGuests: { ...hostile, feedName: "SmartLess", feedPublisher: null, source: "visitor" } }).success).toBe(false);
+    expect(runOutput.safeParse({ ...shown, pastGuests: { checked: true, episodes: 1, since: null, source: "pasted", archiveTitles: 0 } }).success).toBe(false);
+    expect(runOutput.safeParse({ ...shown, pastGuests: undefined }).success).toBe(false);
+  });
+
   it("labels every success result with the fixed source line, and every error is exactly { error } with isError", () => {
     const successes = [
-      boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN),
+      boardReply(RUN_ID, items([boardRow(1)]), APP_ORIGIN, null),
       candidatesReply(items([candidateRow()])),
       runningReply(RUN_ID),
       awaitingReply(RUN_ID),
@@ -289,7 +324,7 @@ describe("output schemas and the size cap (D5.1, D5.2)", () => {
       boardRow(index + 1, { name: `Guest ${index + 1} ${"n".repeat(150)}`, sharedTags: Array.from({ length: 5 }, () => "t".repeat(60)), angle: "a".repeat(400) }),
     );
 
-    const result = boardReply(RUN_ID, items(rows), APP_ORIGIN);
+    const result = boardReply(RUN_ID, items(rows), APP_ORIGIN, null);
 
     expect(result.isError).toBeUndefined();
     expect(Buffer.byteLength(JSON.stringify(structured(result)), "utf8")).toBeLessThanOrEqual(16 * 1024);
@@ -304,17 +339,33 @@ describe("output schemas and the size cap (D5.1, D5.2)", () => {
     });
   });
 
-  it("passes an unknown reach through to the caller as unknown", () => {
-    const result = boardReply(RUN_ID, items([boardRow(1, { reach: "unknown" })]), APP_ORIGIN);
+  it("reads rows stored with an old bookable, well known or unknown reach, and gives each no reach label", () => {
+    const rows = ["bookable", "well known", "unknown", "none"].map((reach, index) => boardRow(index + 1, { reach }));
 
-    expect((structured(result)["guests"] as Array<{ reach: string }>)[0]?.reach).toBe("unknown");
+    const result = boardReply(RUN_ID, items(rows), APP_ORIGIN, null);
+
+    expect((structured(result)["guests"] as Array<{ reach: unknown }>).map((guest) => guest.reach)).toEqual([null, null, null, null]);
+  });
+
+  it("shows household name for a household name and null for none, and its schema refuses any other reach", () => {
+    const result = boardReply(RUN_ID, items([boardRow(1, { reach: "household name" }), boardRow(2, { reach: "none" })]), APP_ORIGIN, null);
+    const guests = structured(result)["guests"] as Array<Record<string, unknown>>;
+
+    expect(guests.map((guest) => guest.reach)).toEqual(["household name", null]);
+    for (const reach of ["none", "bookable", "well known", "unknown"]) {
+      expect(runOutput.safeParse({ ...structured(result), guests: [{ ...guests[0], reach }] }).success, reach).toBe(false);
+    }
   });
 
   it("answers upstream_failed for rows that fail their schema, never a partial row", () => {
-    expect(structured(boardReply(RUN_ID, items([{ name: "no person id" }]), APP_ORIGIN))).toEqual({ error: "upstream_failed" });
+    expect(structured(boardReply(RUN_ID, items([{ name: "no person id" }]), APP_ORIGIN, null))).toEqual({ error: "upstream_failed" });
     expect(structured(candidatesReply(items([{ name: 5 }])))).toEqual({ error: "upstream_failed" });
     expect(structured(briefReply(RUN_ID, randomUUID(), { why: "only one field" }))).toEqual({ error: "upstream_failed" });
-    const mixed = boardReply(RUN_ID, items([boardRow(1), { personId: "short" }, boardRow(3)]), APP_ORIGIN);
+    expect(structured(briefReply(RUN_ID, randomUUID(), storedBrief({ why: 5 })))).toEqual({ error: "upstream_failed" });
+    const extra = briefReply(RUN_ID, randomUUID(), storedBrief({ internal: FEED_MARKER }));
+    expect(Object.keys((structured(extra)["brief"] ?? {}) as object).sort()).toEqual(["angle", "pitchBody", "pitchSubject", "questions", "why"]);
+    expect(textOf(extra)).not.toContain(FEED_MARKER);
+    const mixed = boardReply(RUN_ID, items([boardRow(1), { personId: "short" }, boardRow(3)]), APP_ORIGIN, null);
     expect((structured(mixed)["guests"] as unknown[]).length).toBe(2);
   });
 });

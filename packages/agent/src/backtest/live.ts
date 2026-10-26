@@ -33,10 +33,12 @@ function entitiesOf(data: unknown): QlooEntity[] {
  * - findPodcasts: search with types [urn:entity:podcast], take 5, as
  *   { id, name }.
  * - resolvePerson: search with types [urn:entity:person], take 1. The top
- *   result as { id, name, popularity }, or null when there is none or the
- *   request builder refuses the name (no call is made then, and the
- *   pipeline counts the guest as unresolved). Its popularity is not used by
- *   the pipeline; a missing one is NaN, never a made-up number.
+ *   result as { id, name, popularity }, or null when there is none, when
+ *   the request builder refuses the name (no call is made then) or when
+ *   Qloo refuses the search with a 400, which the client gives as
+ *   QLOO_BAD_INPUT; the pipeline counts the guest as unresolved. Its
+ *   popularity is not used by the pipeline; a missing one is NaN, never a
+ *   made-up number.
  * - fitScores: insights with filterType urn:entity:person, the podcast as
  *   the only signal, the batch as resultEntities and take set to the batch
  *   size, so Qloo is asked to return every id. Affinity is read from

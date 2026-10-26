@@ -8,11 +8,15 @@ import { StoreError } from "../src/store/errors.js";
 import {
   pruneSecondBuckets,
   QLOO_PER_SECOND_CAP,
+  refund,
   reserve,
   reserveQlooCall,
+  reserveWithReceipt,
   setBucket,
+  settleToUsage,
   usage,
   waitForQlooSlot,
+  type Receipt,
   type Reservation,
 } from "../src/store/meter.js";
 import { migratedPglite } from "./helpers/pglite.js";
@@ -140,6 +144,165 @@ describe("reserve", () => {
       expect(await codeOf(reserve(db, items, NOW))).toBe("STORE_BAD_INPUT");
     }
     expect(await usedOf("runs:day")).toBe(0);
+  });
+});
+
+describe("reserveWithReceipt and refund", () => {
+  async function receiptFor(items: Reservation[], now = NOW): Promise<Receipt> {
+    const receipt = await reserveWithReceipt(db, items, now);
+    if (receipt === null) throw new Error("expected a receipt");
+    return receipt;
+  }
+
+  it("reserves as reserve does, says what it took, and a refund lowers used", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+
+    const receipt = await receiptFor([{ key: "tokens:day", amount: 6_000 }, { key: "tokens:day", amount: 2_000 }]);
+    expect(receipt).toEqual({ items: [{ key: "tokens:day", amount: 8_000 }], windowEnds: { "tokens:day": FAR_FUTURE.toISOString() } });
+    expect(await usedOf("tokens:day")).toBe(8_000);
+    expect(await reserveWithReceipt(db, [{ key: "tokens:day", amount: 2_001 }], NOW)).toBeNull();
+    expect(await usedOf("tokens:day")).toBe(8_000);
+
+    await refund(db, receipt, { "tokens:day": 7_300 });
+
+    expect(await usedOf("tokens:day")).toBe(700);
+  });
+
+  it("never takes used below 0 or gives back more than the receipt reserved, even when settled twice", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    expect(await reserve(db, [{ key: "tokens:day", amount: 500 }], NOW)).toBe(true);
+    const receipt = await receiptFor([{ key: "tokens:day", amount: 100 }]);
+
+    await refund(db, receipt, { "tokens:day": 1_000 });
+    expect(await usedOf("tokens:day")).toBe(500);
+    await refund(db, receipt, { "tokens:day": 100 });
+    expect(await usedOf("tokens:day")).toBe(500);
+
+    const second = await receiptFor([{ key: "tokens:day", amount: 100 }]);
+    await db.query("UPDATE usage_buckets SET used = 30 WHERE key = 'tokens:day'");
+    await refund(db, second, { "tokens:day": 100 });
+    expect(await usedOf("tokens:day")).toBe(0);
+  });
+
+  it("changes nothing once the bucket's window has rolled since the reservation", async () => {
+    const ended = new Date("2020-01-01T00:00:00.000Z");
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: ended });
+    const old = await receiptFor([{ key: "tokens:day", amount: 100 }], new Date("2019-12-31T00:00:00.000Z"));
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    expect(await reserve(db, [{ key: "tokens:day", amount: 50 }], NOW)).toBe(true);
+
+    await refund(db, old, { "tokens:day": 100 });
+
+    expect(await usage(db, "tokens:day")).toEqual({ used: 50, cap: 10_000, windowEnd: FAR_FUTURE });
+  });
+
+  it("refunds both keys of a two-key receipt", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    await setBucket(db, { key: "tokens:day:mcp", cap: 10_000, windowEnd: FAR_FUTURE });
+    const receipt = await receiptFor([{ key: "tokens:day", amount: 100 }, { key: "tokens:day:mcp", amount: 200 }]);
+
+    await refund(db, receipt, { "tokens:day": 60, "tokens:day:mcp": 150 });
+
+    expect(await usedOf("tokens:day")).toBe(40);
+    expect(await usedOf("tokens:day:mcp")).toBe(50);
+  });
+
+  it("refuses a key the receipt does not hold, a bad amount and a receipt reserve could not give, before changing anything", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    await setBucket(db, { key: "youtube:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    expect(await reserve(db, [{ key: "youtube:day", amount: 10 }], NOW)).toBe(true);
+    const receipt = await receiptFor([{ key: "tokens:day", amount: 100 }]);
+    const doubled = { items: [{ key: "tokens:day", amount: 100 }, { key: "tokens:day", amount: 100 }], windowEnds: receipt.windowEnds };
+
+    for (const [given, amounts] of [
+      [receipt, { "youtube:day": 10 }],
+      [receipt, { "tokens:day": -1 }],
+      [receipt, { "tokens:day": 1.5 }],
+      [receipt, { "tokens:day": Number.NaN }],
+      [doubled, { "tokens:day": 200 }],
+      [{ ...receipt, windowEnds: {} }, { "tokens:day": 100 }],
+      [{ ...receipt, windowEnds: { "tokens:day": "not a date" } }, { "tokens:day": 100 }],
+    ] as Array<[Receipt, Record<string, number>]>) {
+      expect(await codeOf(refund(db, given, amounts)), JSON.stringify(amounts)).toBe("STORE_BAD_INPUT");
+    }
+    expect(await usedOf("tokens:day")).toBe(100);
+    expect(await usedOf("youtube:day")).toBe(10);
+
+    await refund(db, receipt, { "tokens:day": 100 });
+    expect(await usedOf("tokens:day")).toBe(0);
+  });
+});
+
+describe("settleToUsage", () => {
+  async function settleFor(amount: number, now = NOW): Promise<(used: number) => Promise<void>> {
+    const receipt = await reserveWithReceipt(db, [{ key: "tokens:day", amount }], now);
+    if (receipt === null) throw new Error("expected a receipt");
+    return settleToUsage(db, receipt);
+  }
+
+  it("gives back what a call did not use, changes nothing when it used exactly the reservation, and settles once", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+
+    const below = await settleFor(1_000);
+    await below(240);
+    expect(await usedOf("tokens:day")).toBe(240);
+    await below(0);
+    expect(await usedOf("tokens:day")).toBe(240);
+
+    const equal = await settleFor(500);
+    await equal(500);
+    expect(await usedOf("tokens:day")).toBe(740);
+  });
+
+  it("charges what a call used above its reservation as one more add, in every bucket of the receipt", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    await setBucket(db, { key: "tokens:day:mcp", cap: 10_000, windowEnd: FAR_FUTURE });
+    const receipt = await reserveWithReceipt(db, [{ key: "tokens:day", amount: 100 }, { key: "tokens:day:mcp", amount: 300 }], NOW);
+    if (receipt === null) throw new Error("expected a receipt");
+    const settle = settleToUsage(db, receipt);
+
+    await settle(250);
+    await settle(9_000);
+
+    expect(await usedOf("tokens:day")).toBe(250);
+    expect(await usedOf("tokens:day:mcp")).toBe(250);
+  });
+
+  it("charges an over-run even when it takes used past the cap, and that bucket then refuses every reservation", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 1_000, windowEnd: FAR_FUTURE });
+    const settle = await settleFor(900);
+
+    await settle(1_600);
+
+    expect(await usage(db, "tokens:day")).toEqual({ used: 1_600, cap: 1_000, windowEnd: FAR_FUTURE });
+    expect(await reserve(db, [{ key: "tokens:day", amount: 1 }], NOW)).toBe(false);
+  });
+
+  it("changes nothing, below or above, once the bucket's window has rolled since the reservation", async () => {
+    const ended = new Date("2020-01-01T00:00:00.000Z");
+    const before = new Date("2019-12-31T00:00:00.000Z");
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: ended });
+    const under = await settleFor(100, before);
+    const over = await settleFor(100, before);
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    expect(await reserve(db, [{ key: "tokens:day", amount: 50 }], NOW)).toBe(true);
+
+    await under(0);
+    await over(5_000);
+
+    expect(await usage(db, "tokens:day")).toEqual({ used: 50, cap: 10_000, windowEnd: FAR_FUTURE });
+  });
+
+  it("refuses a used that is not a whole number from 0, before changing anything", async () => {
+    await setBucket(db, { key: "tokens:day", cap: 10_000, windowEnd: FAR_FUTURE });
+    const settle = await settleFor(100);
+
+    for (const used of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "5" as unknown as number]) {
+      expect(await codeOf(settle(used)), String(used)).toBe("STORE_BAD_INPUT");
+    }
+    expect(await usedOf("tokens:day")).toBe(100);
+    await settle(40);
+    expect(await usedOf("tokens:day")).toBe(40);
   });
 });
 

@@ -97,13 +97,12 @@ describe("healthReport", () => {
     expect(missing.problems).toEqual(["The MCP in-progress run counter could not be read, so no MCP run can start."]);
   });
 
-  it("flags an in-progress counter above 0 while no run is queued or running, for the site and for MCP (G23)", async () => {
+  it("flags an in-progress counter above the runs queued or running, for the site and for MCP (G23)", async () => {
     await healthySite();
     await db.query("UPDATE inflight SET n = 1");
-    const lostSite =
-      "The in-progress run counter is at 1, but no run is queued or running, so 1 of the site's run places is lost. If the next health check shows it too, restart the agent server, which resets the counter.";
-    const lostMcp =
-      "The MCP in-progress run counter is at 1, but no MCP run is queued or running, so 1 of MCP's run places is lost. If the next health check shows it too, restart the agent server, which resets the counter.";
+    const hint = "If the next health check shows it too, run ops reconcile, which lowers the counter to the runs that hold it, or restart the agent server.";
+    const lostSite = `The in-progress run counter is at 1, but no run is queued or running, so 1 of the site's run places is lost. ${hint}`;
+    const lostMcp = `The MCP in-progress run counter is at 1, but no MCP run is queued or running, so 1 of MCP's run places is lost. ${hint}`;
 
     expect((await healthReport(db, NOW, COVERED)).problems).toEqual([lostSite, lostMcp]);
 
@@ -114,6 +113,12 @@ describe("healthReport", () => {
     const { id: tokenId } = await issueToken(db);
     await createRun(db, { show: "Synthetic Show", exclude: [] }, NOW, { surface: "mcp", tokenId });
     expect((await healthReport(db, NOW, COVERED)).problems).toEqual([]);
+
+    await db.query("UPDATE inflight SET n = CASE slot WHEN 'runs' THEN 5 ELSE 3 END");
+    expect((await healthReport(db, NOW, COVERED)).problems).toEqual([
+      `The in-progress run counter is at 5, but only 2 runs are queued or running, so 3 of the site's run places are lost. ${hint}`,
+      `The MCP in-progress run counter is at 3, but only 1 MCP run is queued or running, so 2 of MCP's run places are lost. ${hint}`,
+    ]);
   });
 
   it("flags the first day in the next 14 that no budget profile covers, and a policy that could not be read", async () => {

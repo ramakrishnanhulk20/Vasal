@@ -41,6 +41,11 @@ GRANT SELECT, INSERT ON qloo_cache, visitor_counters TO vasal_app;
 GRANT UPDATE (body, fetched_at, expires_at) ON qloo_cache TO vasal_app;
 GRANT UPDATE (runs) ON visitor_counters TO vasal_app;
 
+-- Every Qloo reply's monthly count is stored by the process that got it, so
+-- the app adds the one row and moves it. It cannot delete the row, and the
+-- id check keeps it to one row.
+GRANT SELECT, INSERT, UPDATE ON qloo_quota TO vasal_app;
+
 GRANT SELECT ON app_flags TO vasal_app;
 
 -- Runs are append only for the app: it can read and add rows, and on runs it

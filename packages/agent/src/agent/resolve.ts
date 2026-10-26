@@ -7,7 +7,7 @@ import type { ParsedFeed } from "../feeds/rss.js";
 import { QlooError } from "../qloo/errors.js";
 import type { MeteredQloo } from "../qloo/metered.js";
 import type { QlooEntity } from "../qloo/schemas.js";
-import type { RunInput } from "../server/runs.js";
+import type { FeedSource, RunInput } from "../server/runs.js";
 import { cleanText } from "../text/normalize.js";
 import { AgentError } from "./errors.js";
 
@@ -16,6 +16,7 @@ export type ResolvedShow = {
   name: string;
   publisher: string;
   feedHandleSource: "directory" | "visitor";
+  provenance: FeedSource;
   feedUrl: string | null;
   qlooId: string;
   qlooName: string;
@@ -40,12 +41,16 @@ function clean(text: string): string {
   return cleanText(whole, { maxChars: MAX_NAME_CHARS }).trim();
 }
 
-function fromDirectory(show: ShowCandidate): Listed {
+// A directory entry is fetched as a directory feed either way, but only one
+// a name search ranked is vouched for. Anyone can list a lookalike and hand
+// out its Apple link, so a linked entry's feed never reaches a model (C2.7).
+function fromDirectory(show: ShowCandidate, provenance: "directory" | "linked"): Listed {
   return {
     appleId: show.appleId,
     name: clean(show.name),
     publisher: clean(show.publisher),
     feedHandleSource: "directory",
+    provenance,
     feedUrl: show.feedUrl?.href ?? null,
   };
 }
@@ -55,8 +60,9 @@ async function qlooPodcastFor(qloo: MeteredQloo, name: string): Promise<{ id: st
   try {
     ({ data } = await qloo.call<QlooEntity[]>({ op: "search", query: name, types: ["urn:entity:podcast"], take: QLOO_SEARCH_TAKE }));
   } catch (error) {
-    // A name the request builder refuses (a lone surrogate, for one) is a
-    // candidate Qloo cannot be asked about, not a failed run.
+    // A name the request builder refuses (a lone surrogate, for one), or one
+    // Qloo answers with a 400, is a candidate Qloo cannot be asked about, not
+    // a failed run.
     if (error instanceof QlooError && error.code === "QLOO_BAD_INPUT") return null;
     throw error;
   }
@@ -90,15 +96,19 @@ async function feedTitle(
 /**
  * Turns what the visitor typed into at most 5 show candidates, each tied to
  * exactly one Qloo podcast. classifyInput decides the kind (C8.2): a name is
- * searched in the podcast directory, and an Apple Podcasts link is looked up
- * by its id. Any other http or https URL is fetched once through a
+ * searched in the podcast directory (provenance "directory"), and an Apple
+ * Podcasts link is looked up by its id (provenance "linked", because no
+ * search vouched for that entry). Any other http or https URL (provenance
+ * "pasted") is fetched once through a
  * FeedHandles handle issued for it (C1.5) and parsed with parseFeed; it
  * becomes one candidate named after the feed's title, with the URL's
  * hostname as its publisher and the URL kept so continueRun can fetch it
  * again through a fresh handle. Episode titles are not kept at this step.
  * Each candidate then gets one metered Qloo search (podcasts only, take 5)
  * and pickPodcastMatch; a candidate with no single match is dropped, never
- * guessed (C8.4). Names, publishers and Qloo names go through cleanText
+ * guessed (C8.4). Candidates that match the same Qloo podcast collapse to
+ * the first of them in the directory's order, so each candidate returned has
+ * its own Qloo id. Names, publishers and Qloo names go through cleanText
  * (controls, invisible and direction characters removed, NFC) and are capped
  * at 200 code points (C3.7).
  *
@@ -123,11 +133,11 @@ export async function resolveShow(
   let listed: Listed[];
   switch (classified.kind) {
     case "name":
-      listed = (await deps.searchShows(classified.text)).map(fromDirectory);
+      listed = (await deps.searchShows(classified.text)).map((show) => fromDirectory(show, "directory"));
       break;
     case "apple": {
       const show = await deps.lookupShow(classified.appleId);
-      listed = show === null ? [] : [fromDirectory(show)];
+      listed = show === null ? [] : [fromDirectory(show, "linked")];
       break;
     }
     case "feed": {
@@ -140,6 +150,7 @@ export async function resolveShow(
           name,
           publisher: clean(classified.url.hostname),
           feedHandleSource: "visitor",
+          provenance: "pasted",
           feedUrl: classified.url.href,
         },
       ];
@@ -153,7 +164,12 @@ export async function resolveShow(
   const matched: ResolvedShow[] = [];
   for (const show of shows) {
     const podcast = await qlooPodcastFor(deps.qloo, show.name);
-    if (podcast !== null) matched.push({ ...show, qlooId: podcast.id, qlooName: podcast.name });
+    // Every candidate for one Qloo podcast would get the same board, but each
+    // brings its own feed. Apple ranks the real show first, so a lookalike
+    // listed after it can never lend its feed to that show's run (A2-8).
+    if (podcast !== null && !matched.some((earlier) => earlier.qlooId === podcast.id)) {
+      matched.push({ ...show, qlooId: podcast.id, qlooName: podcast.name });
+    }
   }
   if (matched.length === 0) throw new AgentError("SHOW_NO_QLOO_MATCH");
   return matched;

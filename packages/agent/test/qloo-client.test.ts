@@ -1,7 +1,9 @@
-// Covers the HTTPS client against a fake fetch, the response schemas against
-// hand-written synthetic bodies, and config loading from a plain object. It
-// does not cover the real Qloo host, real response shapes (only the live probe
-// can), the repo-root .env file, or rate limiting across processes.
+// Covers the HTTPS client against a fake fetch, its reading of Qloo's monthly
+// quota headers, the response schemas against hand-written synthetic bodies,
+// and config loading from a plain object. It does not cover the real Qloo
+// host, real response shapes or real quota headers (only the live probe can),
+// storing the quota (store-quota.test.ts), the repo-root .env file, or rate
+// limiting across processes.
 import { describe, expect, it, vi } from "vitest";
 import { loadQlooConfig } from "../src/config.js";
 import { createQlooClient } from "../src/qloo/client.js";
@@ -97,12 +99,15 @@ describe("createQlooClient", () => {
     expect(cappedSleep.mock.calls.map(([ms]) => ms)).toEqual([10_000]);
   });
 
-  it("maps 401, 403, 404, other 4xx and exhausted 5xx to fixed codes, retrying only the 5xx", async () => {
+  it("maps 401, 403, 404, other 4xx, 408 and exhausted 5xx to fixed codes, retrying only 408 and the 5xx", async () => {
     const cases: Array<[number, string, number]> = [
       [401, "QLOO_AUTH", 1],
       [403, "QLOO_FORBIDDEN_TYPE", 1],
       [404, "QLOO_NOT_FOUND", 1],
-      [400, "QLOO_UPSTREAM", 1],
+      [400, "QLOO_BAD_INPUT", 1],
+      [409, "QLOO_BAD_INPUT", 1],
+      [422, "QLOO_BAD_INPUT", 1],
+      [408, "QLOO_UPSTREAM", 3],
       [500, "QLOO_UPSTREAM", 3],
     ];
     for (const [status, code, attempts] of cases) {
@@ -262,6 +267,88 @@ describe("createQlooClient", () => {
     const error = await failureOf(createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl }).call(SEARCH));
     expect(error.code).toBe("QLOO_UPSTREAM");
     expect(calls).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createQlooClient onQuota", () => {
+  const quotaHeaders = (remaining: string, limit: string) => ({ "X-Month-RateLimit-Remaining": remaining, "X-Month-RateLimit-Limit": limit });
+
+  it("reports both counts once, with the time the reply arrived, after a 200 and after a 429", async () => {
+    for (const status of [200, 429]) {
+      const { fetchImpl } = scriptedFetch([() => json(status, { results: [] }, quotaHeaders("48210", "50000"))]);
+      const onQuota = vi.fn();
+      const before = Date.now();
+      const client = createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl, maxRetries: 0, onQuota });
+
+      const outcome = await client.call(SEARCH).then(
+        (result) => result.status,
+        (error: QlooError) => error.code,
+      );
+
+      expect(outcome).toBe(status === 200 ? 200 : "QLOO_RATE_LIMIT");
+      expect(onQuota).toHaveBeenCalledTimes(1);
+      expect(onQuota).toHaveBeenCalledWith({ remaining: 48210, limit: 50000, seenAt: expect.any(Date) });
+      expect((onQuota.mock.calls[0]?.[0] as { seenAt: Date }).seenAt.getTime()).toBeGreaterThanOrEqual(before);
+    }
+  });
+
+  it("reads the header names in any case", async () => {
+    const { fetchImpl } = scriptedFetch([
+      () => json(200, { results: [] }, { "x-MONTH-ratelimit-remaining": "0", "X-month-RATELIMIT-limit": "50000" }),
+    ]);
+    const onQuota = vi.fn();
+    await createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl, onQuota }).call(SEARCH);
+
+    expect(onQuota).toHaveBeenCalledWith({ remaining: 0, limit: 50000, seenAt: expect.any(Date) });
+  });
+
+  it("calls nothing when either header is missing, negative, fractional or not a number", async () => {
+    const cases: Array<Record<string, string>> = [
+      {},
+      { "X-Month-RateLimit-Remaining": "1499" },
+      { "X-Month-RateLimit-Limit": "50000" },
+      quotaHeaders("-5", "50000"),
+      quotaHeaders("1499", "-50000"),
+      quotaHeaders("1499.5", "50000"),
+      quotaHeaders("1499", "50000.0"),
+      quotaHeaders("lots", "50000"),
+      quotaHeaders("1e3", "50000"),
+      quotaHeaders("1,499", "50000"),
+      quotaHeaders("", "50000"),
+    ];
+    for (const headers of cases) {
+      const { fetchImpl } = scriptedFetch([() => json(200, { results: [] }, headers)]);
+      const onQuota = vi.fn();
+      await createQlooClient({ apiKey: FAKE_KEY, baseUrl: BASE, fetchImpl, onQuota }).call(SEARCH);
+      expect(onQuota, JSON.stringify(headers)).not.toHaveBeenCalled();
+    }
+  });
+
+  it("waits for onQuota before answering, and an onQuota that fails does not fail the call", async () => {
+    const order: string[] = [];
+    const slow = scriptedFetch([() => json(200, { results: [] }, quotaHeaders("1500", "50000"))]);
+    const recording = createQlooClient({
+      apiKey: FAKE_KEY,
+      baseUrl: BASE,
+      fetchImpl: slow.fetchImpl,
+      onQuota: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        order.push("recorded");
+      },
+    });
+    await recording.call(SEARCH).then(() => order.push("answered"));
+    expect(order).toEqual(["recorded", "answered"]);
+
+    const broken = scriptedFetch([() => json(200, { results: [synthEntity(1)] }, quotaHeaders("1500", "50000"))]);
+    const failing = createQlooClient({
+      apiKey: FAKE_KEY,
+      baseUrl: BASE,
+      fetchImpl: broken.fetchImpl,
+      onQuota: async () => {
+        throw new Error("database down");
+      },
+    });
+    expect((await failing.call(SEARCH)).data).toEqual([synthEntity(1)]);
   });
 });
 

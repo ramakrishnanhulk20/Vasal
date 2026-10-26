@@ -1,8 +1,9 @@
 // Checks a running agent server from the outside, the way a visitor, another
 // website or an agent would reach it: every public door must answer as
 // designed. It holds no secret and sends none, and it makes no Qloo or model
-// call: the one request that could start a run carries a dummy human-check
-// token, which a real Turnstile secret refuses before anything is spent.
+// call: the requests that could start a run or issue an agent key carry a
+// dummy human-check token, which a real Turnstile secret refuses before
+// anything is spent.
 //
 // Usage: npm run prove -- --remote <url> [--origin https://vasal.site] [--allow-empty-showcase]
 import { randomUUID } from "node:crypto";
@@ -27,6 +28,7 @@ const FOREIGN_ORIGIN = "https://evil.example";
 // start below stops at the human check.
 const DUMMY_TOKEN = "XXXX.DUMMY.TOKEN.XXXX";
 const COMMA_ADDRESS = "192.0.2.1, 198.51.100.2";
+const BAD_ADDRESS = "not-an-address";
 const MAX_BODY_CHARS = 1_000_000;
 const EVENT_NAMES: readonly string[] = RUN_EVENTS;
 // A refusal code is shown only when it has the server's own shape, so text
@@ -195,7 +197,30 @@ export async function prove(opts: ProveOptions): Promise<CheckLine[]> {
     } else add("FAIL", name, `${probe.status} ${code}, expected 403 HUMAN_CHECK_FAILED`);
   }
 
+  // The key route reads the address before the human check and does not
+  // depend on live runs, so this tests the edge on every run while MCP is on.
+  const keyProbe = await postJson("/agent-keys", { turnstileToken: DUMMY_TOKEN }, { origin: opts.origin, "x-real-ip": BAD_ADDRESS });
+  const keyName = "X-Real-IP agent-key probe";
+  if (keyProbe === null) noAnswer(keyName);
+  else {
+    const code = codeOf(keyProbe.body);
+    if (keyProbe.status === 403 && code === "HUMAN_CHECK_FAILED") {
+      add("PASS", keyName, "403 HUMAN_CHECK_FAILED: the edge replaced a client-written X-Real-IP, and the dummy token was refused before any key was issued");
+    } else if (keyProbe.status === 400 && code === "NO_CLIENT_ADDRESS") {
+      add("FAIL", keyName, "400 NO_CLIENT_ADDRESS: a client-written X-Real-IP reached the server, so a caller can choose the address it is counted under. Check the edge and CLIENT_IP_HEADER");
+    } else if (keyProbe.status === 503 && code === "MCP_OFF") {
+      add("SKIP", keyName, "503 MCP_OFF, so the header was not tested");
+    } else if (keyProbe.status === 201) {
+      add("FAIL", keyName, "201: the dummy token passed the human check, so an agent key was issued with no human");
+    } else add("FAIL", keyName, `${keyProbe.status} ${code}, expected 403 HUMAN_CHECK_FAILED`);
+  }
+
   return lines;
+}
+
+/** The process exit code for a set of check lines: 1 when any check failed, otherwise 0. */
+export function exitCodeFor(lines: readonly CheckLine[]): number {
+  return lines.some((line) => line.outcome === "FAIL") ? 1 : 0;
 }
 
 // A frame is the id, event and data lines a formatSseFrame call writes. A
@@ -295,7 +320,7 @@ async function main(): Promise<number> {
   for (const line of lines) console.log(`${line.outcome.padEnd(4)}  ${line.name}: ${line.reason}`);
   const count = (outcome: Outcome) => lines.filter((line) => line.outcome === outcome).length;
   console.log(`${count("PASS")} passed, ${count("FAIL")} failed, ${count("SKIP")} skipped, ${count("WARN")} warned.`);
-  return count("FAIL") > 0 ? 1 : 0;
+  return exitCodeFor(lines);
 }
 
 if (import.meta.main) process.exitCode = await main();

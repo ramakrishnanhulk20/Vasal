@@ -2,7 +2,7 @@ import { serve } from "@hono/node-server";
 import { getConnInfo } from "@hono/node-server/conninfo";
 import { fileURLToPath } from "node:url";
 import { createAnthropicModel, type ModelClient } from "../agent/model.js";
-import { createAgentRunner, reserveSurfaceTokens, waitForSurfaceQlooSlot } from "../agent/runner.js";
+import { createAgentRunner, reserveSurfaceTokens, SURFACE_BUDGETS, waitForSurfaceQlooSlot } from "../agent/runner.js";
 import { loadQlooConfig, type QlooConfig } from "../config.js";
 import { lookupShow, searchShows } from "../feeds/lookup.js";
 import { parseFeed } from "../feeds/rss.js";
@@ -15,8 +15,9 @@ import { createMeteredQloo } from "../qloo/metered.js";
 import { createPgDb, createPgliteDb, type Db } from "../store/db.js";
 import { StoreError } from "../store/errors.js";
 import { setFlag } from "../store/flags.js";
-import { setBucket } from "../store/meter.js";
+import { setBucket, waitForQlooSlot } from "../store/meter.js";
 import { migrate } from "../store/migrate.js";
+import { recordQuota } from "../store/quota.js";
 import { createUnavailableAgent, type AgentPort } from "./agent-port.js";
 import { createApp } from "./app.js";
 import { resetInflight } from "./caps.js";
@@ -39,6 +40,10 @@ const DEV_BUCKETS: ReadonlyArray<[key: string, cap: number]> = [
   ["youtube:day", 5_000],
 ];
 const ANTHROPIC_DAY = "anthropic:day";
+// The hosted server takes 8 of Qloo's 10 calls a second. An in-memory
+// database meters only this process, so a local server on the shared key
+// holds itself to the 2 the hosted meter leaves free (C9.2).
+const DEV_DB_PER_SECOND_CAP = 2;
 
 function codeOf(error: unknown): string {
   return error instanceof ServerError || error instanceof StoreError ? error.code : "UNEXPECTED";
@@ -113,9 +118,22 @@ function createAgent(db: Db, config: ServerConfig, qloo: QlooConfig): AgentPort 
     });
   // No retries inside the client, so every Qloo attempt takes its own slot
   // from the shared meter (C5.1, C5.2).
-  const client = createQlooClient({ apiKey: qloo.apiKey, baseUrl: qloo.baseUrl, maxRetries: 0 });
-  const meteredFor = (surface: RunSurface) =>
-    createMeteredQloo({ client, db, baseUrl: qloo.baseUrl, waitForSlot: (target, signal) => waitForSurfaceQlooSlot(target, surface, signal) });
+  const client = createQlooClient({ apiKey: qloo.apiKey, baseUrl: qloo.baseUrl, maxRetries: 0, onQuota: (quota) => recordQuota(db, quota) });
+  // openDb gives the in-memory database exactly when DATABASE_URL is unset.
+  const inMemory = config.databaseUrl === null;
+  const slotFor =
+    (surface: RunSurface) =>
+    (target: Db, signal?: AbortSignal): Promise<boolean> => {
+      if (!inMemory) return waitForSurfaceQlooSlot(target, surface, signal);
+      const budget = SURFACE_BUDGETS[surface];
+      return waitForQlooSlot(target, {
+        dayKey: budget.qlooDayKey,
+        extraKeys: [...budget.qlooExtraKeys],
+        perSecondCap: DEV_DB_PER_SECOND_CAP,
+        ...(signal === undefined ? {} : { signal }),
+      });
+    };
+  const meteredFor = (surface: RunSurface) => createMeteredQloo({ client, db, baseUrl: qloo.baseUrl, waitForSlot: slotFor(surface) });
   const models: Record<RunSurface, ModelClient> = { web: modelFor("web"), mcp: modelFor("mcp") };
   const qloos = { web: meteredFor("web"), mcp: meteredFor("mcp") };
   console.log(`The agent is on and uses ${config.model}.`);
@@ -179,6 +197,11 @@ async function main(): Promise<void> {
     void (async () => {
       let exitCode = 0;
       try {
+        // Railway kills the process 15 seconds after SIGTERM. Runs and briefs
+        // in flight get 12 of them and closing the database the rest; one
+        // still going after that is failed by the next start's sweeps.
+        const stillRunning = await app.drain(12_000);
+        console.log(JSON.stringify({ level: "info", route: "shutdown", stillRunning }));
         // A stream that was mid-query when its connection dropped finishes
         // that query before it stops. This query runs after it, so close()
         // never meets a query in flight, which can hang PGlite.

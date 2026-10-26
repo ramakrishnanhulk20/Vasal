@@ -69,7 +69,7 @@ export function synthResponse(op: QlooOperation): unknown {
         population_percentile: week < 4 ? 70 : 60,
       }));
     case "compare":
-      return { tags: [{ tag_id: "urn:tag:synthetic:1", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
+      return { tags: [{ tag_id: "urn:tag:genre:media:synthetic", name: "synthetic taste", query: { score: 0.5 } }], a: [], b: [] };
     default:
       return [];
   }

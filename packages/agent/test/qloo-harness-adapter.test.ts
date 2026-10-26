@@ -2,9 +2,9 @@
 // through our metered path: the harness's real describe workflow and name
 // resolver, createMeteredHarnessClient, the real cache and meter on PGlite,
 // and the real HTTPS client over a fake fetch. It shows each harness request
-// takes exactly one meter slot, a refused budget sends nothing, a 429 is one
-// request and never retried, a redirect is refused, a query key or value
-// outside the rule never leaves the process, a repeat lookup sends nothing
+// takes exactly one meter slot, a refused budget sends nothing, a 429 is
+// tried at most three times with a slot each, a redirect is refused, a query
+// key or value outside the rule never leaves the process, a repeat lookup sends nothing
 // new, and the harness gets an observer that writes no file. It does not
 // cover the real Qloo host or its real answers (only a live run can), the
 // harness's other eight workflows, or the stdio `qloo mcp` route
@@ -164,7 +164,7 @@ describe("find_person through Qloo's harness and our meter", () => {
     expect(ctx.steps).toEqual([{ tool: "find_person", ok: false, summary: "failed: QLOO_BUDGET" }]);
   });
 
-  it("sends one request on a 429 and never retries, even over a client that would, and shows only the code (C5.2, C3.6)", async () => {
+  it("tries a 429 three times in all, each on its own slot, never through the client's own retries, and shows only the code (C5.2, C3.6)", async () => {
     for (const maxRetries of [0, 2]) {
       const host = qlooHost(() => json(429, { message: `slow down ${MARKER}` }, { "retry-after": "0" }));
       const { qloo, reservations } = metered(host.fetchImpl, maxRetries);
@@ -173,8 +173,8 @@ describe("find_person through Qloo's harness and our meter", () => {
       const outcome = await findPerson(ctx, qloo);
 
       expect(outcome, String(maxRetries)).toEqual({ content: JSON.stringify({ error: "QLOO_RATE_LIMIT" }), isError: true });
-      expect(host.sent, String(maxRetries)).toHaveLength(1);
-      expect(reservations.count, String(maxRetries)).toBe(1);
+      expect(host.sent, String(maxRetries)).toHaveLength(3);
+      expect(reservations.count, String(maxRetries)).toBe(3);
       expect(ctx.steps).toEqual([{ tool: "find_person", ok: false, summary: "failed: QLOO_RATE_LIMIT" }]);
       expect(JSON.stringify([outcome, ctx.steps])).not.toContain(MARKER);
     }
@@ -197,10 +197,12 @@ describe("find_person through Qloo's harness and our meter", () => {
     const outcome = await findPerson(ctx, qloo);
 
     expect(outcome).toEqual({ content: JSON.stringify({ error: "QLOO_UPSTREAM" }), isError: true });
-    expect(sent.map(({ url }) => url.host)).toEqual([BASE.host]);
-    expect(sent[0]?.init.redirect).toBe("error");
+    // The refused redirect fails as QLOO_UPSTREAM, which the meter retries, so
+    // three attempts go out, each one only to Qloo.
+    expect(sent.map(({ url }) => url.host)).toEqual([BASE.host, BASE.host, BASE.host]);
+    expect(sent.every(({ init }) => init.redirect === "error")).toBe(true);
     expect(sent[0]?.init.headers).toEqual({ Accept: "application/json", "X-Api-Key": FAKE_KEY });
-    expect(reservations.count).toBe(1);
+    expect(reservations.count).toBe(3);
     expect(ctx.people.size).toBe(0);
   });
 

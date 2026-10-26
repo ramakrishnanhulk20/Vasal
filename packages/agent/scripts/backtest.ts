@@ -5,9 +5,9 @@
 // pre-registered results from a stored dataset. The post-hoc checks are
 // recomputed by scripts/backtest-robustness.ts.
 //
-// The live pull spends the offline Qloo share (qloo:day:offline, still inside
-// the shared month and per-second limits) through the same metered client as
-// the server (C5.1, C9.2). Its output holds Qloo-derived values, so it goes
+// The live pull spends the offline Qloo share (qloo:day:offline and
+// qloo:month:offline, still inside the shared month and per-second limits)
+// through the same metered client as the server (C5.1, C9.2). Its output holds Qloo-derived values, so it goes
 // only to the git-ignored data/backtest folder (C7.3).
 //
 // Usage: npx tsx scripts/backtest.ts [--limit-shows N] [--dev-db]
@@ -35,7 +35,8 @@ import { QlooError } from "../src/qloo/errors.js";
 import { createMeteredQloo } from "../src/qloo/metered.js";
 import type { Db } from "../src/store/db.js";
 import { StoreError } from "../src/store/errors.js";
-import { reserve, waitForQlooSlot } from "../src/store/meter.js";
+import { reserve, reserveWithReceipt, settleToUsage, waitForQlooSlot } from "../src/store/meter.js";
+import { recordQuota } from "../src/store/quota.js";
 import { createYouTubeClient } from "../src/youtube/client.js";
 import { YouTubeError } from "../src/youtube/errors.js";
 
@@ -50,6 +51,7 @@ const USAGE = [
 const LIVE_KEYS = ["QLOO_API_KEY", "YOUTUBE_API_KEY", "ANTHROPIC_API_KEY"] as const;
 const OWNER_DB = "OWNER_DATABASE_URL";
 const OFFLINE_QLOO_DAY = "qloo:day:offline";
+const OFFLINE_QLOO_MONTH = "qloo:month:offline";
 // The live server takes 8 of Qloo's 10 calls a second, and an offline script
 // outside the hosted meter takes the other 2. A --dev-db pull meters itself
 // in a throwaway database the server never sees, so it holds itself to 2.
@@ -310,8 +312,9 @@ async function runLive(limitShows: number | null, devDb: boolean): Promise<numbe
 
     // No retries inside the client, so every Qloo attempt takes its own slot
     // from the offline share of the shared meter (C5.1, C5.2).
-    const client = createQlooClient({ apiKey: qlooKey, baseUrl: qlooConfig.baseUrl, maxRetries: 0 });
-    const slot = devDb ? { dayKey: OFFLINE_QLOO_DAY, perSecondCap: DEV_DB_PER_SECOND_CAP } : { dayKey: OFFLINE_QLOO_DAY };
+    const client = createQlooClient({ apiKey: qlooKey, baseUrl: qlooConfig.baseUrl, maxRetries: 0, onQuota: (quota) => recordQuota(store, quota) });
+    const offline = { dayKey: OFFLINE_QLOO_DAY, extraKeys: [OFFLINE_QLOO_MONTH] };
+    const slot = devDb ? { ...offline, perSecondCap: DEV_DB_PER_SECOND_CAP } : offline;
     const qloo = createMeteredQloo({
       client,
       db: store,
@@ -326,7 +329,10 @@ async function runLive(limitShows: number | null, devDb: boolean): Promise<numbe
       apiKey: anthropicKey,
       model: settings.model,
       effort: settings.effort,
-      reserveTokens: (tokens) => reserve(store, [{ key: ANTHROPIC_DAY, amount: tokens }]),
+      reserveTokens: async (tokens) => {
+        const receipt = await reserveWithReceipt(store, [{ key: ANTHROPIC_DAY, amount: tokens }]);
+        return receipt === null ? false : settleToUsage(store, receipt);
+      },
     });
     const pulledAt = new Date();
     const deps = createLivePipelineDeps({ db: store, qloo, youtube, extractGuest: createGuestExtractor(model), now: () => pulledAt });

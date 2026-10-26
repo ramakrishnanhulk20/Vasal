@@ -1,19 +1,21 @@
 // Covers writing a brief with a scripted fake model: the facts the model is
 // given, each draft's fixed time limit, the one rewrite after failed prose,
 // removal of links and emails, placeholders filled with code values, the
-// reach phrase, the trend-claim refusal for a guest with no trend data, and
-// the sensitive-trait refusal for every guest. It
+// reach sentence only a household name gets, the brings meaning and the
+// refusal of {{brings}} for a guest with no audience lean, the fit as a bare percentage and the refusal of {{fit}} for a
+// guest with no fit score, the trend-claim refusal for a guest with no trend
+// data, and the sensitive-trait refusal for every guest. It
 // does not cover checkProse's own rules (agent-prose), how the client
 // enforces the limit (agent-model), the real model's writing, or storing the
 // brief (agent-runner). All data is synthetic.
 import { describe, expect, it } from "vitest";
 import type { ZodType } from "zod";
 import type { BoardEntry } from "../src/agent/board.js";
-import { writeBrief } from "../src/agent/brief.js";
+import { briefFillValues, writeBrief } from "../src/agent/brief.js";
 import { AgentError } from "../src/agent/errors.js";
 import type { ModelCallOptions, ModelClient } from "../src/agent/model.js";
 import { BRIEF_SYSTEM } from "../src/agent/prompts.js";
-import { ACCUSATIONS_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
+import { ACCUSATIONS_RULE, FAMILY_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
 
 const SHOW_NAME = "Synthetic Show";
 const GUEST: BoardEntry = {
@@ -22,7 +24,7 @@ const GUEST: BoardEntry = {
   fit: 0.86,
   fitKnown: true,
   fitRank: 1,
-  reach: "well known",
+  reach: "household name",
   rising: { state: "rising", points: 3.2 },
   bringsNew: { segment: "age:25_to_29", label: "listeners 25 to 29", gap: 0.4 },
   sharedTags: ["pop punk", "skate culture", "90s nostalgia"],
@@ -30,7 +32,7 @@ const GUEST: BoardEntry = {
 };
 
 const GOOD = {
-  why: "{{guest}} has {{fit}} with {{show}} listeners, and interest is {{rising}}.",
+  why: "{{guest}} has a fit of {{fit}} with {{show}} listeners, and interest is {{rising}}.",
   angle: "Growing up loud with {{tag1}}.",
   questions: ["What drew you to {{tag2}}?", "What changed?", "What stayed?", "Who inspired you?", "Why do {{brings}} love you?"],
   pitch_subject: "{{show}} would love to have {{guest}}",
@@ -38,6 +40,7 @@ const GOOD = {
 };
 
 const UNKNOWN_RISING: BoardEntry = { ...GUEST, rising: { state: "unknown", points: null } };
+const NO_REACH: BoardEntry = { ...GUEST, reach: "none" };
 
 type StructuredParams = Parameters<ModelClient["structured"]>[0];
 type Fact = { placeholder: string; meaning: string; value?: string };
@@ -84,7 +87,7 @@ describe("writeBrief", () => {
     const { brief, removed } = await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });
 
     expect(brief).toEqual({
-      why: "Blink-182 has 86% fit with Synthetic Show listeners, and interest is on the rise.",
+      why: "Blink-182 has a fit of 86% with Synthetic Show listeners, and interest is on the rise.",
       angle: "Growing up loud with pop punk.",
       questions: ["What drew you to skate culture?", "What changed?", "What stayed?", "Who inspired you?", "Why do listeners 25 to 29 love you?"],
       pitch_subject: "Synthetic Show would love to have Blink-182",
@@ -164,14 +167,42 @@ describe("writeBrief", () => {
     }
   });
 
-  it("says plainly when the fit is unscored and passes other model errors straight through", async () => {
-    const unscored = fakeModel([{ ...GOOD, angle: "Growing up loud.", questions: ["One?", "Two?", "Three?", "Four?", "Five?"] }]);
-    const { brief } = await writeBrief(unscored.model, {
-      guest: { ...GUEST, fit: 0, fitKnown: false, bringsNew: null, sharedTags: [] },
-      showName: SHOW_NAME,
-    });
-    expect(brief.why).toBe("Blink-182 has an unscored fit with Synthetic Show listeners, and interest is on the rise.");
+  it("tells the model an unscored guest has no fit, refuses a draft that uses {{fit}} anyway, and keeps one that does not", async () => {
+    const unscoredGuest: BoardEntry = { ...GUEST, fit: 0, fitKnown: false, bringsNew: null, sharedTags: [] };
+    const plain = { ...GOOD, angle: "Growing up loud.", questions: ["Why?", "What changed?", "What stayed?", "Who inspired you?", "What next?"] };
 
+    const refused = fakeModel([plain, plain]);
+    expect(await codeOf(writeBrief(refused.model, { guest: unscoredGuest, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
+    expect(refused.calls).toHaveLength(2);
+    expect(factsOf(refused.calls[0]!.user)["fit"]).toEqual({ placeholder: "{{fit}}", meaning: "no fit score exists for this guest, so do not use it" });
+
+    const kept = fakeModel([{ ...plain, why: "{{guest}} suits {{show}} listeners, and interest is {{rising}}." }]);
+    const { brief } = await writeBrief(kept.model, { guest: unscoredGuest, showName: SHOW_NAME });
+    expect(brief.why).toBe("Blink-182 suits Synthetic Show listeners, and interest is on the rise.");
+    expect(JSON.stringify(brief)).not.toContain("fit");
+  });
+
+  it("fills {{fit}} with the bare percentage, so no wording the facts suggest reads fit fit", async () => {
+    const { model, calls } = fakeModel([GOOD]);
+    await writeBrief(model, { guest: { ...GUEST, fit: 0.98 }, showName: SHOW_NAME });
+    expect(factsOf(calls[0]!.user)["fit"]).toEqual({
+      placeholder: "{{fit}}",
+      meaning: "the audience fit as a percentage, for example 86%: write it as a fit of {{fit}}",
+    });
+
+    for (const [why, filled] of [
+      ["{{guest}} has a fit of {{fit}} with {{show}}.", "Blink-182 has a fit of 98% with Synthetic Show."],
+      ["{{guest}} is a {{fit}} fit for {{show}}.", "Blink-182 is a 98% fit for Synthetic Show."],
+      ["{{guest}} matches {{show}} at {{fit}}.", "Blink-182 matches Synthetic Show at 98%."],
+    ]) {
+      const drafted = fakeModel([{ ...GOOD, why }]);
+      const { brief } = await writeBrief(drafted.model, { guest: { ...GUEST, fit: 0.98 }, showName: SHOW_NAME });
+      expect(brief.why).toBe(filled);
+      expect(JSON.stringify(brief)).not.toMatch(/fit fit/i);
+    }
+  });
+
+  it("passes other model errors straight through", async () => {
     const budget = fakeModel([new AgentError("MODEL_BUDGET")]);
     expect(await codeOf(writeBrief(budget.model, { guest: GUEST, showName: SHOW_NAME }))).toBe("MODEL_BUDGET");
     expect(budget.calls).toHaveLength(1);
@@ -179,33 +210,73 @@ describe("writeBrief", () => {
 });
 
 describe("writeBrief wording", () => {
-  it("fills {{reach}} with a whole sentence naming the guest, and shows the model the same sentence", async () => {
-    const sentences: Array<[BoardEntry["reach"], string]> = [
-      ["bookable", "is within reach, so booking is realistic"],
-      ["well known", "is well known, so booking will take some work"],
-      ["household name", "is a household name, so booking will be a long shot"],
-    ];
-    for (const [reach, rest] of sentences) {
-      const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." }]);
+  it("fills a household name's {{reach}} with its whole sentence naming the guest, and shows the model the same sentence", async () => {
+    const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." }]);
 
-      const { brief } = await writeBrief(model, { guest: { ...GUEST, reach }, showName: SHOW_NAME });
+    const { brief } = await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });
 
-      expect(brief.why).toBe(`Blink-182 suits Synthetic Show. Blink-182 ${rest}.`);
-      expect(factsOf(calls[0]!.user)["reach"]).toMatchObject({ placeholder: "{{reach}}", value: `{{guest}} ${rest}` });
+    expect(brief.why).toBe("Blink-182 suits Synthetic Show. Blink-182 is a household name, so booking will be a long shot.");
+    expect(factsOf(calls[0]!.user)["reach"]).toEqual({
+      placeholder: "{{reach}}",
+      meaning:
+        "a finished sentence, already naming the guest, on how hard this guest is to book. Use it as a sentence of its own: start a sentence with {{reach}} and put a full stop straight after it",
+      value: "{{guest}} is a household name, so booking will be a long shot",
+    });
+  });
+
+  it("gives a none guest's {{reach}} no value, refuses a draft that uses it anyway, and keeps one that does not (G15)", async () => {
+    const withReach = { ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." };
+
+    const refused = fakeModel([withReach, withReach]);
+    expect(await codeOf(writeBrief(refused.model, { guest: NO_REACH, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
+    expect(refused.calls).toHaveLength(2);
+    expect(factsOf(refused.calls[0]!.user)["reach"]).toEqual({ placeholder: "{{reach}}", meaning: "no reach note exists for this guest, so do not use it" });
+
+    const kept = fakeModel([withReach, GOOD]);
+    const { brief } = await writeBrief(kept.model, { guest: NO_REACH, showName: SHOW_NAME });
+    expect(kept.calls).toHaveLength(2);
+    expect(brief.why).toBe("Blink-182 has a fit of 86% with Synthetic Show listeners, and interest is on the rise.");
+    expect(briefFillValues(NO_REACH, SHOW_NAME, [])).not.toHaveProperty("reach");
+  });
+
+  it("offers no template, for either reach, that can say booking is realistic or within reach (G15)", async () => {
+    for (const guest of [GUEST, NO_REACH]) {
+      const { model, calls } = fakeModel([GOOD]);
+      await writeBrief(model, { guest, showName: SHOW_NAME });
+      for (const text of [BRIEF_SYSTEM, calls[0]!.user, ...Object.values(briefFillValues(guest, SHOW_NAME, guest.sharedTags))]) {
+        expect(text, guest.reach).not.toMatch(/realistic|within reach/i);
+      }
     }
   });
 
-  it("says Qloo has no reach data for a guest whose reach is unknown, and never that booking is realistic (G15)", async () => {
-    const { model, calls } = fakeModel([{ ...GOOD, why: "{{guest}} suits {{show}}. {{reach}}." }]);
+  it("describes {{brings}} to the model as a lean, never as listeners the show lacks", async () => {
+    const { model, calls } = fakeModel([GOOD]);
+    await writeBrief(model, { guest: GUEST, showName: SHOW_NAME });
 
-    const { brief } = await writeBrief(model, { guest: { ...GUEST, reach: "unknown" }, showName: SHOW_NAME });
+    expect(factsOf(calls[0]!.user)["brings"]).toEqual({
+      placeholder: "{{brings}}",
+      meaning: "an audience group this guest's fans lean toward more than the show's listeners do",
+      value: "listeners 25 to 29",
+    });
+    expect(calls[0]!.user).not.toContain("does not reach yet");
+  });
 
-    expect(brief.why).toBe("Blink-182 suits Synthetic Show. Qloo has no reach data for this guest.");
-    expect(factsOf(calls[0]!.user)["reach"]).toMatchObject({ placeholder: "{{reach}}", value: "Qloo has no reach data for this guest" });
-    for (const text of [JSON.stringify(brief), calls[0]!.user]) {
-      expect(text).not.toContain("booking is realistic");
-      expect(text).not.toContain("within reach");
-    }
+  it("gives a guest with no audience lean no {{brings}} value, refuses a draft that uses it anyway, and keeps one that does not", async () => {
+    const noLean: BoardEntry = { ...GUEST, bringsNew: null };
+
+    const refused = fakeModel([GOOD, GOOD]);
+    expect(await codeOf(writeBrief(refused.model, { guest: noLean, showName: SHOW_NAME }))).toBe("AGENT_BAD_PROSE");
+    expect(refused.calls).toHaveLength(2);
+    expect(factsOf(refused.calls[0]!.user)["brings"]).toEqual({
+      placeholder: "{{brings}}",
+      meaning: "no audience lean was found for this guest, so do not use it",
+    });
+    expect(refused.calls[0]!.user).not.toMatch(/does not reach|would add|would bring|new listeners/i);
+
+    const kept = fakeModel([{ ...GOOD, questions: [...GOOD.questions.slice(0, 4), "What comes next?"] }]);
+    const { brief } = await writeBrief(kept.model, { guest: noLean, showName: SHOW_NAME });
+    expect(brief.questions.at(-1)).toBe("What comes next?");
+    expect(briefFillValues(noLean, SHOW_NAME, [])).not.toHaveProperty("brings");
   });
 
   it("keeps the host's notes out of the pitch: {{reach}} or {{brings}} in the subject or email fails, while why may use both", async () => {
@@ -218,7 +289,7 @@ describe("writeBrief wording", () => {
       }
     }
     const { model } = fakeModel([{ ...GOOD, why: "{{reach}}. It would also bring {{brings}}." }]);
-    expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toContain("so booking will take some work.");
+    expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toContain("so booking will be a long shot.");
   });
 
   it("gives the model the board's angle as the episode idea, cleaned and capped, and leaves it out when empty", async () => {
@@ -257,7 +328,7 @@ describe("writeBrief wording", () => {
     }
     const { model } = fakeModel([{ ...GOOD, why: "{{reach}}.\nIt is a good match." }]);
     expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toBe(
-      "Blink-182 is well known, so booking will take some work.\nIt is a good match.",
+      "Blink-182 is a household name, so booking will be a long shot.\nIt is a good match.",
     );
   });
 
@@ -280,7 +351,7 @@ describe("writeBrief wording", () => {
     const rewritten = fakeModel([{ ...GOOD, pitch_body: "We think {{guest}} is on the rise. Could we find a date?" }, GOOD]);
     const { brief } = await writeBrief(rewritten.model, { guest: UNKNOWN_RISING, showName: SHOW_NAME });
     expect(rewritten.calls).toHaveLength(2);
-    expect(brief.why).toBe("Blink-182 has 86% fit with Synthetic Show listeners, and interest is not yet tracked.");
+    expect(brief.why).toBe("Blink-182 has a fit of 86% with Synthetic Show listeners, and interest is not yet tracked.");
   });
 
   it("tells the model not to describe the guest's sensitive traits", () => {
@@ -305,6 +376,26 @@ describe("writeBrief wording", () => {
     const { brief } = await writeBrief(rewritten.model, { guest: GUEST, showName: SHOW_NAME });
     expect(rewritten.calls).toHaveLength(2);
     expect(brief.pitch_body).toBe("Hi team, we would love Blink-182 on Synthetic Show. Could we find a date that works?");
+  });
+
+  it("refuses every listed family word in a brief field, and keeps a business partner and family comedy", async () => {
+    const words = [
+      ..."wife wives husband husbands spouse spouses marriage marriages married divorce divorced fiance fiancee".split(" "),
+      ..."girlfriend boyfriend motherhood fatherhood parenthood parenting kids children son sons daughter daughters".split(" "),
+      ..."baby babies newborn widow widowed widower".split(" "),
+    ];
+    for (const word of words) {
+      const draft = { ...GOOD, questions: [...GOOD.questions.slice(0, 4), `What did your ${word} think of the tour?`] };
+      const { model, calls } = fakeModel([draft, draft]);
+      expect(await codeOf(writeBrief(model, { guest: GUEST, showName: SHOW_NAME })), word).toBe("AGENT_BAD_PROSE");
+      expect(calls).toHaveLength(2);
+    }
+
+    const { model } = fakeModel([{ ...GOOD, why: "{{guest}} built a label with a business partner, and {{show}} listeners love family comedy." }]);
+    expect((await writeBrief(model, { guest: GUEST, showName: SHOW_NAME })).brief.why).toBe(
+      "Blink-182 built a label with a business partner, and Synthetic Show listeners love family comedy.",
+    );
+    expect(BRIEF_SYSTEM).toContain(FAMILY_RULE);
   });
 
   it("checks before filling, so a shared tag named like a trend never trips the refusal", async () => {
