@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+:root {
+  --night: #0a0c11;
+  --night-2: #11141c;
+  --rice: #f2eee6;
+  --rice-dim: rgba(242, 238, 230, 0.62);
+  --rule: rgba(242, 238, 230, 0.12);
+  --accent: #f2a93b;
+  --status: #8fa3b8;
+  --dawn: 0;
+}
+
+@theme inline {
+  --color-night: var(--night);
+  --color-night-2: var(--night-2);
+  --color-rice: var(--rice);
+  --color-rice-dim: var(--rice-dim);
+  --color-rule: var(--rule);
+  --color-accent: var(--accent);
+  --color-status: var(--status);
+}
+
+@utility font-display {
+  font-family: var(--font-display), serif;
+}
+
+@utility font-body {
+  font-family: var(--font-body), system-ui, sans-serif;
+}
+
+html {
+  background: var(--night);
+  color-scheme: dark;
+  scrollbar-color: rgba(242, 238, 230, 0.22) transparent;
+  scrollbar-width: thin;
+}
+
+body {
+  background: var(--night);
+  color: var(--rice);
+  font-family: var(--font-body), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.dawn-base {
+  background: linear-gradient(180deg, #0a0c11 0%, #0e1120 70%, #121428 100%);
+}
+
+.dawn-glow {
+  height: 65vh;
+  background: radial-gradient(
+    ellipse 85% 60% at 50% 100%,
+    rgba(201, 135, 74, calc(0.1 + 0.28 * var(--dawn))) 0%,
+    rgba(110, 74, 90, calc(0.08 + 0.17 * var(--dawn))) 38%,
+    transparent 72%
+  );
+}
+
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  width: 100%;
+  height: 100%;
+  opacity: 0.06;
+  mix-blend-mode: overlay;
+  pointer-events: none;
+}
+
+/* Underline that draws from the left on hover or keyboard focus. */
+.link-draw {
+  position: relative;
+  display: inline-block;
+  transition: color 250ms ease-out;
+}
+
+.link-draw::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 1px;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 250ms ease-out;
+}
+
+.link-draw:hover::after,
+.link-draw:focus-visible::after,
+a:hover > .link-draw::after,
+a:focus-visible > .link-draw::after {
+  transform: scaleX(1);
+}
+
+/* Reduced motion: the final picture appears at once. The inline styles that
+   motion writes for the start of each animation are overridden here, so there
+   is no flash of the hidden state before the script runs. */
+@media (prefers-reduced-motion: reduce) {
+  [data-rise] {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  [data-kolam-draw] {
+    opacity: 1 !important;
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+
+  [data-kolam-dot] {
+    opacity: 0.7 !important;
+  }
+}
