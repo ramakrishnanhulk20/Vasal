@@ -1,0 +1,44 @@
+---
+title: Why Qloo
+description: What only Qloo's taste graph gives Vasal, which of its capabilities the code uses, and what breaks without it.
+---
+
+A podcast host does not need a list of famous people. They need people whose fans already listen to shows like theirs. That answer lives in audience data, not in a model's memory, and Qloo is the source Vasal uses for it.
+
+## What only Qloo gives this product
+
+Qloo's taste graph connects entities of different kinds through the audiences they share: podcasts, people, films, TV shows, books and more. Vasal uses four things that no podcast directory and no language model holds.
+
+- Cross-domain taste: given a podcast, Qloo can say which people its listeners love. The link runs from a show to people, so a guest can come from music, film, sport or anywhere else the audience's taste reaches. A directory of podcasts cannot answer that.
+- How strong the match is: Qloo returns an affinity score for a person given a show. Vasal asks for all of a board's guests in one call, so their scores sit on one scale and rank against each other.
+- What the guest brings: Qloo reports who a person's fans are, by age band and gender. Vasal compares that with the show's own audience to find a group the guest's fans lean toward more than the show's listeners do.
+- What the two audiences share: Qloo compares two audiences and returns the tags they have in common. Vasal turns the best few into the "shared tastes" on a board, and into material for a brief.
+
+Qloo also supplies the checks that keep a board realistic. A person with a death date is removed, and a person whose popularity is at the very top of Qloo's scale is labelled a household name.
+
+## The capabilities the code uses
+
+| What Vasal asks | Qloo capability | Where it is used |
+| --- | --- | --- |
+| Which Qloo podcast is this show | Entity search, podcasts | Finding the show |
+| Which people this show's listeners love | Insights, people, with the show as the signal | Research |
+| Who a person's fans are | Insights, demographics | Research and the "leans toward" group |
+| How well a person fits a show | Insights, people, with the show as the signal and the person as the result filter | The fit on every board |
+| What two audiences share | Analysis, compare | Shared tastes |
+| Which films, shows and books are coming | Insights, films, TV shows and books, with a release year filter | Research |
+| Who a name is | Entity search, people, and entity lookup, through Qloo's own harness | Research and Without Qloo |
+| Whether interest in a person is rising | Trending, people | Switched off by default |
+
+[Every Qloo call](/docs/qloo-calls) shows the request for each one, with every parameter name.
+
+## What breaks without it
+
+Take Qloo out and the same model still suggests guests, but from memory alone. It tends to name the people it has read about most, which are the well-known ones. A model has no listener data, so it cannot tell a guest whose fans match your audience from a guest who is only famous. It also cannot check a name against the show's whole episode history, so it can suggest someone your show had on years ago.
+
+Vasal does not leave that as a claim. Every board has a [Without Qloo](/docs/without-qloo) tab. It asks the same model for guests with no Qloo data, then lets Qloo name and score each guess and checks each one against the show's episode history. The [home page](/#without-qloo) totals how many of those guesses had already been on the show or hosted it.
+
+The [backtest](/docs/the-backtest) tests the other side, which is whether Qloo's fit score means anything for audience size. Across 755 episodes of 8 large podcasts, guests with a higher fit drew more views, after allowing for how long each episode had been online and for the guest's general fame. The link is small and positive.
+
+## What the code does with it
+
+Qloo supplies the data and the code does the arithmetic. The AI model chooses which questions to ask and writes the prose, and it never writes a number. That split is why Vasal can be checked: every figure on a board traces to a Qloo call, and [How it works](/docs/how-it-works) shows where each one is computed.

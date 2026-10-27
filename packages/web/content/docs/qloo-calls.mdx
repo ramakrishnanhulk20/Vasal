@@ -1,0 +1,262 @@
+---
+title: Every Qloo call
+description: Each Qloo request Vasal makes, with its parameters, the response fields it reads, how often a run sends it and how the meter counts it.
+---
+
+This page lists every kind of Qloo request in the code, in the order a run makes them. Qloo's terms keep its response data out of public repositories, so every response value below is a placeholder in angle brackets, and every id is written as a placeholder too. Parameter names and field names are the ones the code uses. The example inputs, such as a show name, are our own.
+
+## How every call is sent
+
+- Method and host: `GET` only, to `https://hackathon.api.qloo.com`. Hackathon keys work only on that host.
+- Key: in the `X-Api-Key` header and nowhere else. It is shown as `<your hackathon key>` below.
+- Parameters: the path is fixed for each kind of call. Every value enters the query as one encoded parameter, so text such as `x&take=500#y` stays one value. Parameters are sorted by name, as in the examples.
+- Limits per attempt: a 20 second timeout, no redirects (a redirect would carry the key to another host), and a response body of at most 5 MiB (1,000,000 bytes for the requests the harness makes, see section 6).
+- Responses: each response is checked against a schema that lists only the fields the code reads. Other fields are ignored. A response that does not match is an error and is never cached.
+
+## How the meter counts a call
+
+Every Qloo call goes through one metered client, in this order.
+
+1. The cache: the key is the exact request. A hit is free and uses no budget. A stored answer lasts 7 days, and only a successful answer that passed its schema is stored.
+2. Qloo's own count: every reply carries `X-Month-RateLimit-Remaining` and `X-Month-RateLimit-Limit`, and the code records them. With fewer than 1,500 calls remaining, no call goes out. A reading older than 24 hours counts as no reading, so the first reply after Qloo's monthly reset brings a fresh one.
+3. One slot, all or nothing: in one database statement the call takes a slot from the month bucket (`qloo:month`), its day share and the current second's bucket, which allows 8 calls a second against Qloo's 10. A website run uses the `qloo:day` share. An agent run (MCP) uses `qloo:day:mcp` and also `qloo:month:mcp`. Operator seeding uses `qloo:day:offline` and `qloo:month:offline`. If any bucket is full, the call is not made and the run fails with `QLOO_BUDGET`.
+4. Retries: a 408, a 429, a server error or a dropped connection is tried up to 2 more times, after 250 ms and then 750 ms. Each attempt takes its own slot and counts as its own call. Any other 4xx is never retried. A call the run's deadline cuts off keeps the slot it took.
+
+Adding up the per-run caps below gives at most 54 first attempts for one run, before retries and before the cache saves any. That is 5 podcast searches, 3 people lists, 11 audience reads, 10 taste comparisons, 3 release lists, 12 for name lookups, 1 fit call, and the 9 of the Without Qloo flip. With trends switched on, up to 10 more.
+
+## 1. Find the podcast
+
+What Vasal asks: which podcast in Qloo is this show. Vasal sends one search for each candidate show Apple's directory returned, up to 5 a run, and keeps a candidate only if exactly one Qloo podcast matches its name.
+
+```text
+GET https://hackathon.api.qloo.com/search
+X-Api-Key: <your hackathon key>
+
+query=SmartLess
+take=5
+types=urn:entity:podcast
+```
+
+The code reads these fields from each entity in the answer. The answer is either a flat `results` list or `results.entities`, and both are accepted.
+
+```json
+{
+  "results": [
+    {
+      "entity_id": "<entity id>",
+      "name": "<podcast name>"
+    }
+  ]
+}
+```
+
+Frequency: up to 5 a run, at run start. A repeat of the same name is answered from the cache.
+
+## 2. Who this show's listeners love
+
+What Vasal asks: which people have the most fans in common with this show's audience. This is the `people_for_show` tool. The model may ask for everyone, or only the less famous (`bookable` and `emerging` add a popularity ceiling of 0.9 and 0.7).
+
+```text
+GET https://hackathon.api.qloo.com/v2/insights
+X-Api-Key: <your hackathon key>
+
+feature.explainability=true
+filter.popularity.max=0.9
+filter.type=urn:entity:person
+signal.interests.entities=<the show's entity id>
+take=20
+```
+
+`filter.popularity.max` is sent only when the model asks for `bookable` or `emerging`.
+
+```json
+{
+  "results": {
+    "entities": [
+      {
+        "entity_id": "<entity id>",
+        "name": "<person name>",
+        "popularity": <a number from 0 to 1>,
+        "query": { "affinity": <a number from 0 to 1> },
+        "properties": { "date_of_death": "<a date, present only for a person who has died>" }
+      }
+    ]
+  }
+}
+```
+
+The code reads the affinity from `query.affinity`, or from `properties.affinity` when that is the one present. A person with a `date_of_death` is dropped. Frequency: up to 3 a run.
+
+## 3. Who a person's fans are
+
+What Vasal asks: how a person's audience breaks down by age band and gender. This is the `audience_of` tool and the source of the "leans toward" group. The show's own audience is read once per run, the first time the tool is used, and the guest's after it.
+
+```text
+GET https://hackathon.api.qloo.com/v2/insights
+X-Api-Key: <your hackathon key>
+
+filter.type=urn:demographics
+signal.interests.entities=<the show's or the person's entity id>
+```
+
+```json
+{
+  "results": {
+    "demographics": [
+      {
+        "entity_id": "<entity id>",
+        "query": {
+          "age": { "<an age band>": <a number above or below 0> },
+          "gender": { "<a gender>": <a number above or below 0> }
+        }
+      }
+    ]
+  }
+}
+```
+
+A number above 0 means that group is stronger than average in that audience. The code has a plain label for these age bands: `24_and_younger`, `25_to_29`, `30_to_34`, `35_to_44`, `45_to_54`, `55_and_older`, `35_and_younger` and `36_to_55`. It has a label for `female` and `male`. A band it has no label for is ignored. Frequency: up to 10 people a run, plus one read for the show.
+
+## 4. What two audiences share
+
+What Vasal asks: which tastes the show's audience and a person's audience have in common. This is the `shared_taste` tool and the source of the shared tastes on a board.
+
+```text
+GET https://hackathon.api.qloo.com/v2/analysis/compare
+X-Api-Key: <your hackathon key>
+
+a.signal.interests.entities=<the show's entity id>
+b.signal.interests.entities=<the person's entity id>
+take=10
+```
+
+```json
+{
+  "results": {
+    "tags": [
+      { "tag_id": "<tag id>", "name": "<tag name>", "query": { "score": <a number> } }
+    ],
+    "a": [ { "name": "<tag name>", "tag_id": "<tag id>" } ],
+    "b": [ { "name": "<tag name>", "tag_id": "<tag id>" } ]
+  }
+}
+```
+
+`tags` are the shared tags. `a` and `b` list every tag each side carries. The code also counts a tag name that both sides carry under different ids, but only for tag families it allows to be shown. Frequency: up to 10 a run.
+
+## 5. Upcoming releases
+
+What Vasal asks: which films, TV shows or books this show's audience is likely to care about. The titles steer which people the model researches. Vasal never writes that a person has one coming, because Qloo does not say who is in a release.
+
+```text
+GET https://hackathon.api.qloo.com/v2/insights
+X-Api-Key: <your hackathon key>
+
+filter.release_year.min=<the current year>
+filter.type=urn:entity:movie
+signal.interests.entities=<the show's entity id>
+take=20
+```
+
+`filter.type` is `urn:entity:movie`, `urn:entity:tv_show` or `urn:entity:book`. For books the year parameter is `filter.publication_year.min` instead.
+
+```json
+{
+  "results": {
+    "entities": [
+      {
+        "entity_id": "<entity id>",
+        "name": "<title>",
+        "properties": { "release_date": "<a date or a year>" }
+      }
+    ]
+  }
+}
+```
+
+Books use `properties.publication_date`. Qloo ignores the date filter on films and TV, so the code checks each row's own date and keeps only titles dated in the next two years. A row with no usable date is dropped. Frequency: up to 3 a run.
+
+## 6. Who a name is
+
+What Vasal asks: the person a name belongs to. This is the `find_person` tool. It runs on Qloo's own harness package (`@qloo/qloo-harness`), inside Vasal's process, using the harness's describe workflow and its name resolver. The harness never makes a request of its own. Every request it wants to make goes through Vasal's metered client, so each one takes its own slot and counts as its own call.
+
+```text
+GET https://hackathon.api.qloo.com/search
+X-Api-Key: <your hackathon key>
+
+query=<a person's name>
+take=5
+types=urn:entity:person
+```
+
+Then, for the match it picks:
+
+```text
+GET https://hackathon.api.qloo.com/entities
+X-Api-Key: <your hackathon key>
+
+entity_ids=<the matched person's entity id>
+```
+
+The harness reads these answers itself. Vasal then checks that each person has an `entity_id` and a `name`, keeps only one whose name matches the name that was asked for, and discards the rest. Qloo answers a name it cannot match with its nearest hits, so this check matters. A name shaped like an id is refused with no call. Frequency: up to 6 names a run, 2 calls each.
+
+## 7. How well each pick fits
+
+What Vasal asks: how strongly each picked person's audience matches the show's, in one call, so every fit on the board is on one scale.
+
+```text
+GET https://hackathon.api.qloo.com/v2/insights
+X-Api-Key: <your hackathon key>
+
+filter.results.entities=<up to 25 person entity ids, sorted and joined by commas>
+filter.type=urn:entity:person
+signal.interests.entities=<the show's entity id>
+take=<the number of ids>
+```
+
+The answer has the same shape as the answer in section 2. The code reads `entity_id`, `query.affinity` and `popularity` for each id it asked about, and drops a person with a `date_of_death`. A person left out of the answer has no fit, shown as "not scored". Frequency: once a run, and once more for the Without Qloo flip.
+
+## 8. The Without Qloo flip
+
+The flip searches for each guess the model made, then scores the people it found with the call in section 7.
+
+```text
+GET https://hackathon.api.qloo.com/search
+X-Api-Key: <your hackathon key>
+
+query=<a name the model guessed>
+take=3
+types=urn:entity:person
+```
+
+The code accepts the first hit whose name matches the guess. Frequency: up to 8 searches and 1 fit call a run.
+
+## 9. Trending, switched off
+
+What Vasal would ask: whether interest in a person has risen over the last 12 full weeks. This is the `trend_of` tool. It is off unless `VASAL_TRENDS` is on, because Qloo's hackathon host returned no trend rows on 21 Oct 2026. With the default setting no run sends it, and every guest's rising state is "unknown".
+
+```text
+GET https://hackathon.api.qloo.com/v2/trending
+X-Api-Key: <your hackathon key>
+
+filter.end_date=<the Sunday before today, YYYY-MM-DD>
+filter.start_date=<the Monday 12 weeks earlier, YYYY-MM-DD>
+filter.type=urn:entity:person
+signal.interests.entities=<the person's entity id>
+```
+
+```json
+{
+  "results": {
+    "trending": [
+      { "date": "<YYYY-MM-DD>", "population_percentile": <a number> }
+    ]
+  }
+}
+```
+
+Code compares the mean percentile of the newest 4 weeks with the 8 before them. A rise of 2 points or more is "rising" and a fall of 2 or more is "falling". With fewer than 12 usable weeks it says "unknown". Frequency if on: up to 10 a run.
+
+## Calls outside a run
+
+The backtest uses the same metered client for podcast and person searches and for the fit call in section 7, in batches of at most 25 ids. It draws on its own offline share of the budget. The key-day probe script sends the same kinds of request without the meter, paced at 2 a second, and is run only while live runs are off. The request builder can also form a `/v2/tags` request, but no run sends one.

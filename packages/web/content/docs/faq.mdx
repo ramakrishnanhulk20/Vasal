@@ -1,0 +1,44 @@
+---
+title: FAQ
+description: Short answers to the questions hosts and judges ask most about missing guests, famous guests, past guests, failed runs, the AI's writing, cost and data.
+---
+
+## Why is a guest I expected missing?
+
+Vasal lists only the people the research step picked from Qloo's results for your show, so a guest you know well may simply not rank. A person is also dropped if your episode titles, episode descriptions or the names of the people who make the show mention them, or if Qloo marks them as having died. A person the model found by name stays only if Qloo scores their fit at 0.5 or higher.
+
+## Why isn't a famous guest suggested?
+
+Fame is not what Vasal ranks. It ranks how strongly a person's fans match your listeners, so a very famous person appears only if their audience fits. The research step can ask Qloo to leave out the most famous names, and a guest at the top of Qloo's popularity scale carries a "household name" label.
+
+## What does "household name" mean?
+
+It marks a guest whose Qloo popularity is 0.97 or higher, which is the very top of the scale. A brief calls such a guest a long shot to book. In a check on 30 people on 25 Oct 2026, Qloo's popularity could not tell famous from unknown below that line, so no other label is given. A missing label says nothing about how easy a booking will be.
+
+## What does the fit percentage mean?
+
+It is Qloo's affinity score for the guest given your show, shown as a percentage. It measures how strongly the guest's audience matches your listeners. It is not the chance the guest says yes, and it is not a forecast of downloads. [The backtest](/docs/the-backtest) found that a higher fit goes with more YouTube views, but only a little, with a correlation of 0.14.
+
+## Has this guest been on my show?
+
+Vasal checks every person against the show's feed: the episode titles, the episode descriptions and the names of the people who make the show. The run page says how far back that check reached, and says so if the feed could not be read. The check reads at most the newest 2,000 episodes and misses nicknames and misspellings, so a guest from before the feed's reach can slip through.
+
+## What happens when a run fails?
+
+The run is saved as failed with a short code and no board, the page shows a plain reason, and partial results are never shown. The run still counts against your daily runs. If the day's budget is spent, it resets on the next UTC day, and the saved showcase boards keep working in the meantime. If Qloo does not know your show, try the name exactly as your podcast app shows it, or paste the Apple Podcasts link.
+
+## What does the AI write, and what doesn't it?
+
+The model chooses which Qloo questions to ask, writes one sentence for each guest, and later writes the brief and the pitch. It never writes a number, link, email address or phone number, and it may not say a guest has something coming out or write about their family, health or identity. Code computes every figure, fills in the names, and refuses any draft that breaks these rules. The pitch is a draft, and Vasal never sends it.
+
+## Why can't Vasal find my show?
+
+Vasal needs your show in Apple's podcast directory or at an RSS feed link, and it needs exactly one matching podcast in Qloo. If Qloo has no match, or two podcasts tie at the same level, the run stops with a reason instead of guessing. Try the show's name as it appears in your podcast app, an Apple Podcasts link or the feed link.
+
+## What does it cost?
+
+Nothing for a visitor: there are no accounts and no payment step. You can start a few runs a day, 5 by default, and agent keys are free with their own daily limits. Each run spends Qloo calls and model tokens from the operator's daily budgets, which is why the limits exist. [Security and limits](/docs/security-and-limits) lists the numbers.
+
+## What data does Vasal keep?
+
+Vasal keeps the runs you start, with the show text you typed, the board and any briefs. Anyone with a run's link can read it, so do not type anything private. Your network address is stored only as a keyed hash for the daily count, and the count is deleted once its day is more than 2 days old. Agent keys are stored only as hashes.

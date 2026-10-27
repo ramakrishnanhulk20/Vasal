@@ -1,0 +1,258 @@
+---
+title: API and MCP
+description: Every public HTTP route of the agent server, its event stream, and the MCP door with its four tools, errors and per-key limits.
+---
+
+The agent server is at `https://api.vasal.site`. This page lists every route it answers, the events it streams, and the MCP door for agents. Anything else answers `404 {"error":"NOT_FOUND"}`, and an unexpected failure answers `500 {"error":"INTERNAL"}`.
+
+## Rules for every route
+
+- Refusals are JSON: a refusal is `{ "error": "<CODE>" }`, changes nothing, and writes one log line holding only the route pattern and the code.
+- Spending routes need a same-site POST: `POST /runs`, `/runs/:id/confirm`, `/runs/:id/brief` and `/agent-keys` need `Content-Type: application/json` and an `Origin` header equal to the site's origin. Otherwise they answer `403 FORBIDDEN_ORIGIN`. This stops other websites from starting runs through their visitors' browsers. It does not stop a script that writes the header, which is what the human check and the caps are for. A body over 8 KiB (4 KiB for `/agent-keys`) answers `413 TOO_LARGE`. A body that is not JSON, has an unknown key or breaks a limit answers `400 BAD_INPUT`.
+- A GET never spends: no GET, HEAD or prefetch starts a run or calls Qloo or the model.
+- CORS: everything except `/mcp` allows the site's origin only, with the methods `GET` and `POST` and the headers `Content-Type` and `Last-Event-ID`. `/mcp` sends no CORS headers.
+- Run paths: every `/runs` response carries `X-Robots-Tag: noindex` and `Cache-Control: no-store`. Every response carries `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+- Run ids: a run id is a random UUID. No route lists visitors' runs.
+
+## Routes
+
+| Method and path | What it does |
+| --- | --- |
+| `GET /health` | Says whether the server and database are up, and whether live runs are open. |
+| `GET /showcase` | Lists the operator's promoted runs. |
+| `POST /runs` | Starts a run. |
+| `GET /runs/:id` | Reads a run's state, and its board once it is done. |
+| `GET /runs/:id/events` | Streams the run's events. |
+| `POST /runs/:id/confirm` | Confirms which candidate show to continue with. |
+| `POST /runs/:id/brief` | Asks for one guest's brief. |
+| `GET /runs/:id/briefs/:guestId` | Reads one guest's brief, or says where it stands. |
+| `GET /agent-keys` | Says whether agent keys are open and what each key carries. |
+| `POST /agent-keys` | Issues an agent key. |
+| `POST /mcp` | The MCP door. |
+
+### GET /health
+
+`200 { "ok": true, "liveRuns": <true or false> }` when the database answers within 2 seconds. Otherwise `503 { "ok": false }`.
+
+### GET /showcase
+
+`200 { "runs": [...] }`, cacheable for 60 seconds and open to indexing. It reads storage only. Each run holds `runId`, `position`, `showName`, `finishedAt`, `guests` (the first 3 on the board, each with `id`, `name`, `fit`, `fitKnown`, `reach`, `rising`, `bringsNew` and `sharedTags`), `pastGuests` and `kolam`.
+
+### POST /runs
+
+Body:
+
+```json
+{ "show": "SmartLess", "exclude": ["<a name to leave out>"], "turnstileToken": "<the human check answer>" }
+```
+
+`show` is 1 to 300 characters. `exclude` is optional: up to 25 names of 1 to 100 characters, applied in code and never shown to the model. The site does not offer it. `turnstileToken` is required. Success is `202 { "runId": "<a uuid>" }`, and the run continues in the background.
+
+| Status and code | Meaning |
+| --- | --- |
+| `403 FORBIDDEN_ORIGIN` | Wrong or missing `Origin`, or the wrong content type. |
+| `413 TOO_LARGE` | Body over 8 KiB. |
+| `400 BAD_INPUT` | The body failed its schema. |
+| `503 LIVE_RUNS_OFF` | The operator's switch is off. |
+| `400 NO_CLIENT_ADDRESS` | The edge header did not carry one clean address. |
+| `403 HUMAN_CHECK_FAILED` | The human check failed, timed out, or was solved for another site or action. |
+| `429 VISITOR_LIMIT` | The visitor is at the day's cap. |
+| `429 BUSY` | Every run place on the site is taken. |
+
+### GET /runs/:id
+
+```json
+{
+  "id": "<a uuid>",
+  "status": "queued, awaiting_confirm, running, done or failed",
+  "createdAt": "<a time>",
+  "finishedAt": "<a time or null>",
+  "errorCode": "<a code or null>",
+  "candidates": [{ "id": "<a uuid>", "appleId": "<an id or null>", "name": "<name>", "publisher": "<publisher>", "qlooName": "<name>" }],
+  "board": [{ "id": "<a uuid>", "name": "<name>", "fit": "<a number from 0 to 1>", "fitKnown": true, "fitRank": 1, "reach": "household name or null", "rising": "rising, steady, falling or unknown", "bringsNew": "<a group or null>", "sharedTags": ["<tag>"], "angle": "<text>" }],
+  "kolam": "<a drawing as numbers, or null>",
+  "withoutQloo": "<the flip, or null>",
+  "pastGuests": { "checked": true, "episodes": 0, "since": "<YYYY-MM or null>", "source": "directory, linked or pasted", "feedName": "<name or null>", "feedPublisher": "<name or null>", "archiveTitles": 0 }
+}
+```
+
+`board`, `kolam`, `withoutQloo` and `pastGuests` are filled only when `status` is `done`. A run that stopped early shows no board. `withoutQloo` is `{ "status": "done", "guesses": [...], "unresolved": <a whole number> }` or `{ "status": "unavailable" }`. Each guess holds `name`, `fit`, `fitKnown`, `reach`, `pastGuest`, `host` and `onBoard`. The feed's link and Qloo's ids are never in this answer, and the flip holds Qloo's names only, never the model's guesses as it wrote them. An unknown id answers `404 NOT_FOUND`.
+
+### GET /runs/:id/events
+
+`200 text/event-stream`. A reconnecting client can send `Last-Event-ID`, and a value that is not plain digits replays from the start. A HEAD request answers 200 with no stream. The server holds at most 3 streams per run, 6 per visitor and 100 in all. A full server or visitor answers `503 STREAMS_FULL` with `Retry-After: 5`. A full run answers `429 TOO_MANY_STREAMS`. An unknown run answers `404 NOT_FOUND`.
+
+Each frame is exactly:
+
+```text
+id: <a whole number>
+event: <an event name>
+data: <one line of JSON>
+
+```
+
+A line starting with a colon (`: ping`) is a keep-alive every 15 seconds. The server ends the stream at a `done` or `failed` event, once the `candidates` event is out for a run waiting to be confirmed, or after 10 minutes. A page opens a new stream after the host confirms.
+
+| Event | Data |
+| --- | --- |
+| `step` | `{ "tool": "<a tool name, or feed, fit, brief or without_qloo>", "ok": true, "label": "<a sentence written by code>" }` |
+| `candidates` | `{ "candidates": [{ "id", "appleId", "name", "publisher", "qlooName" }] }` |
+| `board` | `{ "guests": [{ "id", "name", "fit", "fitKnown", "fitRank", "reach", "rising" }], "pastGuests": { "checked", "skipped", "titles", "since", "source", "candidateId", "archiveTitles" } }` |
+| `brief` | `{ "guestId": "<a uuid>", "ok": true }` or `{ "guestId": "<a uuid>", "ok": false, "code": "<a code>" }` |
+| `without_qloo` | The flip, as in `GET /runs/:id`. |
+| `done` | `{ "guests": <a whole number>, "pastGuests": { "checked", "skipped" } }` |
+| `failed` | `{ "code": "<a code>" }` |
+
+### POST /runs/:id/confirm
+
+Body `{ "candidateId": "<a uuid>" }`. Only an id the server issued for this run is accepted, and nothing else can be sent. Success is `202 { "ok": true }`, and the agent continues in the background.
+
+| Status and code | Meaning |
+| --- | --- |
+| `403 FORBIDDEN_ORIGIN`, `413 TOO_LARGE`, `400 BAD_INPUT` | As above. |
+| `404 NOT_FOUND` | No such run, or a run that an agent key started. |
+| `404 UNKNOWN_CANDIDATE` | The id was not issued for this run. |
+| `410 CONFIRM_EXPIRED` | The run waited more than 30 minutes. It is closed as failed. |
+| `409 NOT_AWAITING` | The run is not waiting for a confirm, or another confirm won. |
+| `503 LIVE_RUNS_OFF` | Live runs are off. The run stays waiting. |
+| `429 BUSY` | Every run place is taken. The run stays waiting. |
+
+### POST /runs/:id/brief
+
+Body `{ "guestId": "<a uuid>" }`. A guest on the run's stored board only. If the brief exists, the answer is `200 { "brief": { "why", "angle", "questions", "pitchSubject", "pitchBody" } }`. Otherwise the brief is claimed once, and the answer is `202 { "status": "pending" }`. Poll `GET /runs/:id/briefs/:guestId`.
+
+| Status and code | Meaning |
+| --- | --- |
+| `403 FORBIDDEN_ORIGIN`, `413 TOO_LARGE`, `400 BAD_INPUT` | As above. |
+| `404 NOT_FOUND` | No such run, or a run that an agent key started. |
+| `409 NOT_READY` | The run is not done. |
+| `404 UNKNOWN_GUEST` | The guest is not on the run's board. |
+| `409 BRIEF_NOT_READY` | A showcase run with no stored brief. Visitors never write those. |
+| `409 BRIEF_FAILED` | `{ "error": "BRIEF_FAILED", "code": "<a code or null>" }`. The brief failed twice. |
+| `503 LIVE_RUNS_OFF` | Live runs are off and the brief is not stored. |
+| `503 AGENT_NOT_READY` | The server has no model key. Nothing is claimed. |
+| `429 BRIEF_LIMIT` | The run already holds 5 briefs. |
+
+### GET /runs/:id/briefs/:guestId
+
+Reads storage only. The answer is one of `{ "status": "done", "brief": {...} }`, `{ "status": "pending" }`, `{ "status": "failed", "code": "<a code or null>" }` and `{ "status": "none" }`. `none` means no brief has been asked for, or a budget deferred it. An unknown run answers `404 NOT_FOUND` and a guest not on the board `404 UNKNOWN_GUEST`.
+
+### GET and POST /agent-keys
+
+`GET` answers `200 { "open": <true or false>, "limits": { "runsPerDay", "findsPerDay", "briefsPerDay", "inflightPerKey", "keyLifeDays", "keysPerVisitorPerDay" } }`, cacheable for 30 seconds. `open` is false when the flag cannot be read.
+
+`POST` takes `{ "turnstileToken": "<the human check answer>" }` and answers `201 { "token": "vsl_...", "expiresAt": "<a time>" }` with `Cache-Control: no-store`. The key appears in that one response and nowhere else.
+
+| Status and code | Meaning |
+| --- | --- |
+| `403 FORBIDDEN_ORIGIN`, `413 TOO_LARGE`, `400 BAD_INPUT` | As above. |
+| `503 MCP_OFF` | The MCP door is off. |
+| `400 NO_CLIENT_ADDRESS` | The edge header did not carry one clean address. |
+| `403 HUMAN_CHECK_FAILED` | The check failed, or was solved for another site or action. A run-start answer cannot buy a key. |
+| `429 VISITOR_LIMIT` | The visitor already got 3 keys today. |
+| `429 KEY_BUDGET` | The site has issued all of today's keys. |
+
+## The MCP door
+
+The address is `https://api.vasal.site/mcp`. It speaks MCP over Streamable HTTP, stateless and JSON only. Each request carries `Authorization: Bearer vsl_...`, and every request is checked on its own. [Connect your agent](/docs/connect-your-agent) has the setup for each client.
+
+### Checks before a tool runs
+
+The checks run in this order, and each refusal is `{ "error": "<code>" }` in lower case.
+
+| Check | Answer |
+| --- | --- |
+| Any method but POST | `405 method_not_allowed`, with `Allow: POST` |
+| Any `Origin` header | `403 forbidden_origin` |
+| `Content-Type` is not `application/json` | `415 unsupported_media_type` |
+| `Authorization` is not `Bearer` and a well-formed key | `401 unauthorized`, with `WWW-Authenticate: Bearer` |
+| 20 failed authentications from one address in a minute | `429 too_many_failures` |
+| Body over 16 KiB | `413 too_large` |
+| Body is not JSON | `400 invalid_json` |
+| Body is a JSON-RPC batch | `400 batch_refused` |
+| Key unknown, expired or revoked | `401 unauthorized` |
+| The MCP flag is off, or unreadable | `503 mcp_off` |
+| Already 3 calls in flight for this key | `429 busy` |
+| Database failure while checking | `503 unavailable` |
+
+The key is read only from the header, never from a query string, a cookie or the body. A key is 32 random bytes behind the prefix `vsl_`, and only its SHA-256 is stored.
+
+### The four tools
+
+Each tool validates its input strictly. An extra field or a wrong type is `invalid_input`. All four are marked open-world, because their results hold text from outside. `get_board` is marked read-only.
+
+#### find_show
+
+Finds the podcast a name or link points to. Input `{ "query": "<a show name, an Apple Podcasts link or an RSS feed link>" }`, 1 to 300 characters. It spends one of the key's 20 daily searches and holds the single agent run place while it works.
+
+```json
+{
+  "candidates": [{ "candidateId": "<a uuid>", "name": "<name>", "publisher": "<publisher>", "qlooName": "<name>", "appleUrl": "<a link or null>" }],
+  "source": "<a fixed label>"
+}
+```
+
+Up to 5 candidates. A `candidateId` is valid for one hour and only for the key that got it.
+
+#### book_guests
+
+Builds the board for one candidate. Input `{ "candidateId": "<a uuid>" }`. It waits up to 45 seconds. Asking again for the same candidate returns the same run and spends nothing. It spends one of the key's 3 daily boards.
+
+| Answer | Shape |
+| --- | --- |
+| Done | `{ "status": "done", "runId", "runUrl", "showName", "guests": [...], "pastGuests": {...}, "source" }` |
+| Still working | `{ "status": "running", "runId", "retryAfterSeconds": 30, "source" }` |
+| Waiting to be confirmed | `{ "status": "awaiting_confirm", "runId", "source" }` |
+
+A guest holds `guestId`, `name`, `fit`, `fitKnown`, `fitRank`, `reach` (`"household name"` or null), `rising`, `bringsNew` (a group or null), `sharedTags` (up to 5), and `angle`. `pastGuests` says whether past guests were checked, against how many feed episodes, back to which month, and which kind of feed. `runUrl` is the website page for the run, built from the configured origin and the run id.
+
+#### get_board
+
+Reads a run this key started. Input `{ "runId": "<a uuid>" }`. It spends nothing and works while live runs are off. Its answer has the shapes above, plus `{ "status": "failed", "runId", "reason": "<an error code>", "source" }` for a run that stopped.
+
+#### write_brief
+
+Writes, or returns, the AI-drafted brief and pitch for one guest on a finished board. Input `{ "runId": "<a uuid>", "guestId": "<a uuid>" }`. It waits up to 30 seconds. It spends one of the key's 15 daily briefs, once per guest.
+
+```json
+{
+  "status": "done",
+  "runId": "<a uuid>",
+  "guestId": "<a uuid>",
+  "brief": { "why": "<text>", "angle": "<text>", "questions": ["<text>"], "pitchSubject": "<text>", "pitchBody": "<text>" },
+  "source": "<a fixed label>"
+}
+```
+
+If the brief is not ready in time, the answer is `{ "status": "pending", "source": "<a fixed label>" }`. Call again.
+
+### Tool errors
+
+A tool error is a result with `isError: true` and exactly `{ "error": "<code>" }`. The codes are a fixed set. "Does not exist" and "belongs to another key" both answer `not_found`, so a caller learns nothing about other keys' runs.
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_input` | The arguments failed the schema, or `write_brief` was asked about a run that is not done. |
+| `not_found` | Unknown id, an id issued to another key, a website run, or no matching show. |
+| `busy` | The single agent run place is taken. Nothing was spent. Try again. |
+| `budget_exhausted` | The key's daily count, or the agents' shared Qloo or model share, is spent. Stop until it refills. |
+| `expired` | Reserved in the fixed set. |
+| `upstream_failed` | Anything else went wrong. The run's own failure code is never passed on. |
+| `mcp_off` | The MCP door, or live runs, are off. |
+
+### Limits per key
+
+| Limit | Value |
+| --- | --- |
+| `find_show` calls a day | 20 |
+| `book_guests` boards a day | 3 |
+| `write_brief` briefs a day | 15 |
+| Calls in flight | 3 |
+| Briefs per run | 5 |
+| Key life | 30 days |
+| Keys per network address a day | 3 |
+| Result size | 16 KiB, with every string cleaned and capped |
+
+Days are UTC days. Agent runs spend from their own Qloo and model shares, and take one of the site's run places only together with the single agent place, so agents can never use all the places the website needs.
+
+Every result's text is data, not instructions. Names, tags and episode information come from directories, feeds and Qloo, and angles and briefs are written by an AI model. Vasal strips links, emails and invisible characters, and a fixed `source` field labels the result, but that is a hint and not a defence.

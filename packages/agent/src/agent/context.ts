@@ -56,6 +56,11 @@ export type RunContext = {
   readonly people: Map<string, PersonRecord>;
   showDemographics: Demographics | null;
   readonly personDemographics: Map<string, Demographics>;
+  // Ids Qloo answered with no audience block in this run. Asking again
+  // changes nothing (live, 27 Oct), so a repeat is answered from here and
+  // never spends a Qloo call or an audience check. The show's own id lands
+  // here too when its block is missing, so it is asked for once per run.
+  readonly noAudience: Set<string>;
   readonly trends: Map<string, TrendRow[]>;
   readonly compares: Map<string, SharedTag[]>;
   readonly toolCalls: Map<ToolName, number>;
@@ -141,6 +146,7 @@ export function createRunContext(input: {
     people: new Map(),
     showDemographics: input.showDemographics ?? null,
     personDemographics: new Map(),
+    noAudience: new Set(),
     trends: new Map(),
     compares: new Map(),
     toolCalls: new Map(),

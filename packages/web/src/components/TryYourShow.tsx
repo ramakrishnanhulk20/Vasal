@@ -8,12 +8,7 @@ import { startRun } from "@/lib/api";
 import type { Failure } from "@/lib/api";
 import { PRIMARY_BUTTON } from "@/lib/buttonStyle";
 import { KICKER, SECTION_TITLE_PHONE, SOFT_100 } from "@/lib/textStyles";
-import { loadTurnstile } from "@/lib/turnstile";
-
-// Cloudflare's public always-pass key. The server refuses it in production.
-const TEST_SITE_KEY = "1x00000000000000000000AA";
-const SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || TEST_SITE_KEY;
-const USING_TEST_KEY = !process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
+import { SITE_KEY, USING_TEST_KEY, loadTurnstile } from "@/lib/turnstile";
 
 const EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
 const NUMBER_WORDS = [

@@ -1,0 +1,80 @@
+---
+title: Book guests for your show
+description: A walk through the site, from opening a showcase board to starting your own run, reading the board and copying a pitch.
+---
+
+This guide follows the site from the front door to a pitch you can copy. You need a browser and nothing else. There are no accounts.
+
+## 1. Try a showcase board
+
+The home page lists showcase boards for well-known shows. They are saved runs that the operator checked and promoted by hand, so they open at once and do not use any of the day's budget. Open one to see what a finished board looks like before you try your own show. The same page layout is used for your own runs.
+
+## 2. Start your own run
+
+Scroll to "Try your show". Type one of these in the box:
+
+- the show's name, as it appears in your podcast app
+- an Apple Podcasts link to the show
+- the link to the show's RSS feed
+
+Press "Find my guests". The page runs a short human check from Cloudflare first, then starts the run. If live runs are closed, the page says so and keeps the saved boards open. At the time of writing, 27 Oct 2026, the page says live runs open on 30 October, when judging starts.
+
+## 3. Confirm the show
+
+Vasal looks the show up in Apple's podcast directory and in Qloo. It then asks "Which show did you mean?" and lists the matches. With one match, it asks "Is this your show?". Pick yours. This step is there so the run spends its Qloo calls on the right show, and the pick must come within 30 minutes.
+
+If the list is empty, the run fails with a reason. A name Qloo does not know yet cannot be used, because there is no taste data to work from. Try the exact name from your podcast app, or paste the Apple Podcasts link.
+
+## 4. Watch the steps
+
+"The agent is working" shows each step as it happens: the feed it read, the people it found, whose audience it checked, and which past guests it left out. Each line is written by code in plain words. A run stops by itself after 120 seconds of work from your confirm, and the page tells you if it does.
+
+## 5. Read the board
+
+When the board is ready, each row is one guest, in order of fit.
+
+- The number on the right is the fit: how strongly that person's audience matches your show's audience. "Not scored" means Qloo gave no score for that person, and they rank last.
+- Household name marks a guest at the very top of Qloo's popularity scale. A missing label does not mean a guest is easy to book. It means Qloo's scale cannot tell.
+- Leans toward names an audience group, such as women or listeners 25 to 29, that the guest's fans lean toward more than your listeners do. It is a lean, not proof that your show has none of those listeners.
+- The tags are tastes that your audience and the guest's audience share.
+
+The page also says how far the past-guest check reached, for example how many episode titles it read and the month of the oldest one. A guest the check found in your episode titles or descriptions, or among the people who make the show, is already left out.
+
+## 6. Open a brief
+
+Choose a guest to see their panel: the name, the fit, the group they lean toward, and the brief. A brief holds four parts.
+
+- Why them: two or three sentences on why this guest suits your listeners.
+- The angle: one sentence for the episode's theme.
+- Questions: five interview questions.
+- The pitch: a subject line and a short email to the guest's team.
+
+On a showcase board the briefs are already written. On your own run, press "Write this guest's brief". The panel shows "Writing the brief..." while it works, and you get one brief per guest per run.
+
+## 7. Copy the pitch
+
+"Copy pitch" copies the subject line and the email together. Read it before you send it. The page labels it an AI draft, and Vasal never sends anything for you. The numbers and names in it are filled in by code from Qloo's data, but the sentences around them are written by a model and can still be wrong.
+
+## 8. Flip to Without Qloo
+
+The "Without Qloo" tab shows what the same AI model suggests with no Qloo data, with each guess scored by Qloo and checked against your episode history. [Without Qloo](/docs/without-qloo) explains how it is made.
+
+## Your daily limits
+
+Limits stop one visitor, or one bad day, from using up the budget for everyone. They are set on the server, not in the page.
+
+| Limit | Value | Where it comes from |
+| --- | --- | --- |
+| Runs you can start a day | 5 by default | `RUNS_PER_VISITOR_PER_DAY` in the agent server's settings. The threat model records 15 for the judging days, 30 Oct to 6 Nov 2026, and 5 after. |
+| Who counts as you | Your network address, as a keyed hash | Each IPv4 address is one visitor and each IPv6 block of 64 bits is one, so people on one office or venue network share the count. The day is a UTC day. |
+| Runs in progress across the whole site | 3 by default | `MAX_INFLIGHT_RUNS`. A full site answers "Vasal is building as many boards as it can right now". |
+| Briefs per run | 5 | A fixed cap in the code. One brief per guest, and a failed brief may be asked for once more. |
+| Time a run may work | 120 seconds from your confirm | A fixed cap in the code. |
+| Time to confirm a show | 30 minutes | A fixed cap in the code. |
+| Live streams | 3 per run, 6 per visitor | A fixed cap in the code. The page falls back to polling when a stream is refused. |
+
+Starting a run uses one of your daily runs, even if the run later fails. Confirming a show and writing briefs do not. Reading a saved board, including your own, spends nothing. The site-wide Qloo and model budgets are in [Security and limits](/docs/security-and-limits).
+
+## If something goes wrong
+
+The [FAQ](/docs/faq) explains the common messages, including why a guest is missing and what to do when a run fails.

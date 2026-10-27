@@ -184,7 +184,7 @@ export function WithoutQloo({ proof }: { proof: Proof }) {
   };
 
   return (
-    <section className="relative z-20 min-h-screen px-[6vw] py-[18vh]">
+    <section id="without-qloo" className="relative z-20 min-h-screen px-[6vw] py-[18vh]">
       <div className="grid grid-cols-12">
         <p className={`col-span-12 ${KICKER}`}>WITHOUT QLOO</p>
         <h2 className={`col-span-12 mt-5 md:col-span-8 ${SECTION_TITLE}`} style={SOFT_100}>

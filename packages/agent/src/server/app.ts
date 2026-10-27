@@ -207,7 +207,7 @@ function publicCandidates(items: Array<{ id: string; data: unknown }>): Array<Re
 /**
  * Builds the public agent server. Routes: GET /health, GET /showcase, POST
  * /runs, GET /runs/:id, GET /runs/:id/events, POST /runs/:id/confirm, POST
- * /runs/:id/brief, GET /runs/:id/briefs/:guestId, POST /agent-keys
+ * /runs/:id/brief, GET /runs/:id/briefs/:guestId, GET and POST /agent-keys
  * (keys-route.ts) and POST /mcp (mcp/server.ts); every other path and
  * method gives 404 NOT_FOUND, and there is no way to list visitor runs
  * (C6.1). GET /health answers 200 { ok: true, liveRuns } only when the

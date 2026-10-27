@@ -1,0 +1,136 @@
+---
+title: Getting started
+description: Install Vasal on a clean machine, run the tests, start both servers locally and check the live API with one command.
+---
+
+This page takes you from an empty folder to a running copy of Vasal. You need Git, Node and a terminal. You do not need any key to run the tests or to start the servers in development.
+
+## Install
+
+The repo needs Node 22.19 or newer, set in `engines` in the root `package.json`. The agent server's Docker image pins Node 26.7.0, and the test run quoted below used 26.7.0.
+
+```bash
+git clone https://github.com/ramakrishnanhulk20/Vasal.git
+cd Vasal
+npm ci
+```
+
+`npm ci` installs exactly what `package-lock.json` lists for both workspaces: `packages/agent` (the server) and `packages/web` (the site).
+
+## Set up your keys
+
+Copy the example file to `.env` in the repo root. The agent server reads that file on start. `.env` is ignored by git, so your keys stay on your machine.
+
+```bash
+cp .env.example .env
+```
+
+In development you only need two keys, and only to run a real agent. Without them the server still starts, and every run ends with an honest "agent not ready" failure instead of made-up results.
+
+| Variable | What it is for | Where the value comes from |
+| --- | --- | --- |
+| `QLOO_API_KEY` | Every Qloo call. | The Qloo hackathon key form, linked in `.env.example`. |
+| `QLOO_BASE_URL` | Qloo's host. Hackathon keys only work on the default, `https://hackathon.api.qloo.com`. | Leave as it is. |
+| `ANTHROPIC_API_KEY` | The research model and the brief writer. | An API key from console.anthropic.com. |
+| `VASAL_MODEL`, `VASAL_EFFORT` | The model and its effort level. Defaults: `claude-haiku-5-5` and `medium`. | Leave as they are. |
+| `ANTHROPIC_TOKENS_PER_DAY` | A daily ceiling on model tokens for the whole site. Default 2,000,000. | Your choice. |
+| `VASAL_TRENDS` | Whether the agent asks Qloo for trend data. Default `off`. | Leave off unless a probe shows Qloo returns trend rows. |
+| `YOUTUBE_API_KEY` | The backtest only. | A Google Cloud key restricted to the YouTube Data API. |
+| `RUNS_PER_VISITOR_PER_DAY`, `MAX_INFLIGHT_RUNS` | A visitor's daily runs (default 5) and the runs in progress across the site (default 3). | Your choice. |
+| `PORT` | The agent server's port. Default 8787. | Your choice. |
+
+The remaining variables matter only in production, where the server refuses to start without them:
+
+| Variable | What it is for |
+| --- | --- |
+| `DATABASE_URL` | The Postgres connection string for the limited `vasal_app` role. Unset in development means an in-memory database. |
+| `OWNER_DATABASE_URL`, `BOOTSTRAP_DATABASE_URL`, `VASAL_OWNER_PASSWORD`, `VASAL_APP_PASSWORD`, `DATABASE_NETWORK` | The operator scripts that migrate the database, set budgets and prune. Never give these to a server. |
+| `TURNSTILE_SECRET_KEY` | The human check on run start and key issue. Cloudflare's test secrets are refused in production. |
+| `APP_ORIGIN` | The site's public origin, used for CORS and the Origin check on every POST. Must be `https` in production. |
+| `VISITOR_HASH_SECRET` | At least 32 characters. Visitor addresses are stored only as a keyed hash made with it. |
+| `CLIENT_IP_HEADER` | The header the host's edge sets to the real client address. |
+
+## Run the tests
+
+```bash
+npm test
+```
+
+The root script runs the test script of each workspace that has one. Only `packages/agent` has tests, and they use an in-memory Postgres, so no keys and no network are needed. On 27 Oct 2026 the suite ended with these lines:
+
+```text
+ Test Files  70 passed | 2 skipped (72)
+      Tests  1142 passed | 13 skipped (1155)
+```
+
+The 13 skipped tests are the races that need a real Postgres. They run only when `HOSTED_TEST_DATABASE_URL` points at a throwaway database and `HOSTED_TEST_THROWAWAY=yes` is set. Your count moves as tests are added, but it should show 0 failed. `npm run typecheck` checks the types in both workspaces.
+
+## Start the agent server
+
+```bash
+npm run server:dev -w packages/agent
+```
+
+In development the server needs nothing else. It uses an in-memory database, so everything in it is lost when the server stops. It also uses Cloudflare's published Turnstile test secret, which accepts any token, and it switches live runs and the MCP door on. It listens on `http://localhost:8787`.
+
+If `QLOO_API_KEY` or `ANTHROPIC_API_KEY` is missing, the server prints which one and runs fail with `AGENT_NOT_READY`. With both set, it runs the real agent. Because the in-memory database cannot see the hosted server's counters, a development server holds itself to 2 Qloo calls a second, and its own caps are 500 calls a day and 2,000 a month.
+
+## Start the web app
+
+The site reads the agent server through two variables, one for the server side and one for the browser. Set both to your local server, then start the dev server.
+
+```bash
+VASAL_API_URL=http://localhost:8787 NEXT_PUBLIC_VASAL_API_URL=http://localhost:8787 npm run dev -w packages/web
+```
+
+On Windows PowerShell, set the two variables first with `$env:VASAL_API_URL = "http://localhost:8787"` and `$env:NEXT_PUBLIC_VASAL_API_URL = "http://localhost:8787"`, then run `npm run dev -w packages/web`. The site opens at `http://localhost:3000`, which is also the agent server's default `APP_ORIGIN`, so its Origin check accepts the site.
+
+Without those variables the site reads `https://api.vasal.site`.
+
+### The human check locally
+
+Cloudflare publishes test keys for Turnstile at developers.cloudflare.com/turnstile/troubleshooting/testing. The web app falls back to the site key that always passes, `1x00000000000000000000AA`, when `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is not set. The agent server falls back to the secret that always passes, `1x0000000000000000000000000000000AA`. Together they let you start runs on your machine with no Cloudflare account. The secret that always fails, `2x0000000000000000000000000000000AA`, is there for testing the refusal path. The agent server refuses both test secrets when `NODE_ENV` is `production`.
+
+## Try the pieces on their own
+
+These need no key.
+
+```bash
+npm run feed:demo -w packages/agent -- "SmartLess"
+npm run ops -w packages/agent -- --dev selftest
+```
+
+The first reads a show from Apple's public directory and its own feed. The second tries every operator command on a throwaway database.
+
+## Check the live API
+
+`prove` checks a running server from the outside, the way a visitor, another website or an agent would reach it. It holds no secret and makes no Qloo or model call. The requests that could start a run or issue a key carry Cloudflare's dummy token, which a real Turnstile secret refuses before anything is spent.
+
+```bash
+npm run prove -w packages/agent -- --remote https://api.vasal.site
+```
+
+On 27 Oct 2026 it printed this:
+
+```text
+Proving https://api.vasal.site as the site https://vasal.site would reach it.
+PASS  health: 200 with ok true in 588 ms
+PASS  showcase: 7 promoted; the first has 3 guests, 9 shared tags and a kolam with 3 rings
+PASS  run: done, with 8 guests on the board and a kolam
+PASS  events: first frame in 314 ms, 39 frames parsed, ending with done
+PASS  runs from a foreign site: 403 FORBIDDEN_ORIGIN
+PASS  agent keys from a foreign site: 403 FORBIDDEN_ORIGIN
+PASS  mcp without a key: 401 with WWW-Authenticate: Bearer
+PASS  mcp by GET: 405
+PASS  mcp preflight: 405 with no Access-Control-Allow-Origin
+PASS  unknown path: 404
+SKIP  X-Real-IP comma probe: 503 LIVE_RUNS_OFF, so the header was not tested
+PASS  X-Real-IP agent-key probe: 403 HUMAN_CHECK_FAILED: the edge replaced a client-written X-Real-IP, and the dummy token was refused before any key was issued
+11 passed, 0 failed, 1 skipped, 0 warned.
+```
+
+The showcase count and the timings change over time. The probe skips the comma check while live runs are off. The command exits non-zero if any check fails. You can aim it at your own server with `--remote http://localhost:8787 --origin http://localhost:3000`, and add `--allow-empty-showcase` for a database that has no promoted runs.
+
+## Next
+
+[How it works](/docs/how-it-works) follows one run through the code. [Architecture](/docs/architecture) shows the parts and how they connect.

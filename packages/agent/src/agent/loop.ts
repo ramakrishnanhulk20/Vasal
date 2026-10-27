@@ -37,6 +37,19 @@ const FAILED_LABELS: Record<ToolName | "unknown", string> = {
   finish_board: "Sent some picks back to be fixed",
 };
 
+// Singular and plural, so a tool added later fails to compile until its
+// limit can be named.
+const LIMIT_NOUNS: Record<ToolName, readonly [string, string]> = {
+  people_for_show: ["people list", "people lists"],
+  audience_of: ["audience check", "audience checks"],
+  trend_of: ["trend check", "trend checks"],
+  shared_taste: ["taste comparison", "taste comparisons"],
+  upcoming_releases: ["release list", "release lists"],
+  find_person: ["name lookup", "name lookups"],
+  recent_episode_titles: ["episode title list", "episode title lists"],
+  finish_board: ["board submission", "board submissions"],
+};
+
 const limitHit = (): AgentError => new AgentError("AGENT_LIMIT");
 const isToolName = (name: string): name is ToolName => Object.hasOwn(TOOL_LIMITS, name);
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
@@ -111,15 +124,43 @@ function okLabel(tool: ToolName, ctx: RunContext, input: unknown, outcome: ToolO
   }
 }
 
+// The code runTool itself wrote. It only chooses between fixed labels and is
+// never printed, and anything that does not read as a code gives null.
+function errorCodeIn(content: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  const code = field(parsed, "error");
+  return typeof code === "string" ? code : null;
+}
+
+function failedLabel(tool: ToolName, ctx: RunContext, input: unknown, outcome: ToolOutcome): string {
+  const code = errorCodeIn(outcome.content);
+  if (code === "LIMIT_REACHED") {
+    const [one, many] = LIMIT_NOUNS[tool];
+    return `Reached this run's limit of ${plural(TOOL_LIMITS[tool], one, many)}`;
+  }
+  if (tool === "audience_of" && code === "NO_DATA") return `Qloo has no audience data for ${personName(ctx, input)}`;
+  return FAILED_LABELS[tool];
+}
+
 /**
  * The step event for one finished tool call. Every label is fixed words,
- * counts read from runTool's own output, and at most a Qloo entity name
- * (direction controls stripped, at most 100 characters), so no model text,
- * tool input or tool name the model made up is ever streamed (C3.1, C3.3).
+ * counts read from runTool's own output or TOOL_LIMITS, and at most a Qloo
+ * entity name (direction controls stripped, at most 100 characters), so no
+ * model text, tool input or tool name the model made up is ever streamed
+ * (C3.1, C3.3). A failed call's label is chosen by the code runTool wrote:
+ * LIMIT_REACHED names the tool's per-run limit and its size, audience_of's
+ * NO_DATA says Qloo has no audience data for the person, and every other
+ * failure, or content that holds no readable code, keeps its tool's label.
  */
 export function stepFor(ctx: RunContext, name: string, input: unknown, outcome: ToolOutcome): StepEvent {
   const tool = isToolName(name) ? name : "unknown";
-  if (tool === "unknown" || outcome.isError) return { tool, ok: false, label: FAILED_LABELS[tool] };
+  if (tool === "unknown") return { tool, ok: false, label: FAILED_LABELS.unknown };
+  if (outcome.isError) return { tool, ok: false, label: failedLabel(tool, ctx, input, outcome) };
   return { tool, ok: true, label: okLabel(tool, ctx, input, outcome) };
 }
 

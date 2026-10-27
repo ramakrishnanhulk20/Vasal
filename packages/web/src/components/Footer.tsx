@@ -6,8 +6,9 @@ const LINK =
 const LINKS = [
   { label: "Showcase", href: "#showcase" },
   { label: "How it works", href: "#story" },
+  { label: "Proof", href: "/proof" },
   { label: "Docs", href: "/docs" },
-  { label: "For agents", href: "#agents" },
+  { label: "For agents", href: "/agents" },
 ];
 
 const SOURCE = "https://github.com/ramakrishnanhulk20/Vasal";

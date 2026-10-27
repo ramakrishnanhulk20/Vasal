@@ -1,0 +1,49 @@
+---
+title: Overview
+description: Vasal suggests podcast guests whose fans already match your show's listeners on Qloo's taste graph, with a booking brief and a pitch draft for each.
+---
+
+In a Tamil home, the vasal is the doorway, where a kolam is drawn each morning to welcome guests. Vasal does the same job for a podcast. You type the name of your show. Vasal suggests guests whose fans already match your listeners, ranked by how strong the match is, and writes a booking brief and a pitch email draft for each one.
+
+## What it does
+
+Vasal asks [Qloo](https://www.qloo.com/) which people your listeners already love. Qloo's taste graph links people, shows, films, books and music through the audiences they share, so it can answer a question a podcast directory cannot: not "who is famous", but "whose fans look like yours".
+
+For each suggested guest, Vasal shows:
+
+- Fit: how strongly that person's audience matches your show's audience, as a percentage.
+- Household name: a label for the very top of Qloo's popularity scale. A brief calls such a guest a long shot to book.
+- Leans toward: an audience group that the guest's fans lean toward more than your listeners do. This is the new audience a guest could bring.
+- Shared tastes: a few tags that both audiences carry.
+- A brief and a pitch, written on request: why the guest suits your listeners, an angle, five interview questions, and a short email to the guest's team.
+
+Vasal leaves out anyone who has already been on your show, and anyone who hosts it. It checks the show's own feed to find out.
+
+## Who it is for
+
+Vasal is built for the hosts and producers of mid-size shows. It does not need an account. It never sends an email for you: the pitch is a draft on the screen.
+
+## What is live
+
+- The site: [vasal.site](https://vasal.site) has showcase boards for well-known shows. They are saved runs that the operator checked by hand, so they open instantly and cost nothing to read.
+- Live runs: type your own show and watch the agent work, step by step. Live runs are open when the operator's switch is on and the day's budget has room. The site tells you when they are closed, and the saved boards still work.
+- The MCP door: an AI agent with a free key from [the agents page](/agents) can find a show, build a board and ask for briefs, with the same checks as the site. See [Connect your agent](/docs/connect-your-agent).
+- The proof: a backtest on 755 real episodes checked whether Qloo's fit score tracks audience size, and the [home page](/#without-qloo) shows what the same AI model suggests without Qloo's data. See [The backtest](/docs/the-backtest) and [Without Qloo](/docs/without-qloo).
+
+## What Vasal does not do
+
+Vasal does not claim that a guest has something coming out, because Qloo lists release titles without their casts. It does not write about a guest's family, health, religion, politics or identity. Every number on the screen is computed by code from Qloo's answers, and the AI model never writes one. [How it works](/docs/how-it-works) explains how that is enforced.
+
+## Where to go next
+
+- [Getting started](/docs/getting-started) runs the tests and both servers on your own machine.
+- [How it works](/docs/how-it-works) follows one run from the show name to the board.
+- [Why Qloo](/docs/why-qloo) says what only Qloo's data gives this product.
+- [Without Qloo](/docs/without-qloo) explains the flip on every board.
+- [Book guests for your show](/docs/book-guests) walks through the site.
+- [Connect your agent](/docs/connect-your-agent) gets you a key and the setup for your client.
+- [Architecture](/docs/architecture), [Every Qloo call](/docs/qloo-calls) and [API and MCP](/docs/api-and-mcp) are the developer reference.
+- [The backtest](/docs/the-backtest) and [Security and limits](/docs/security-and-limits) cover the proof and the safety rules.
+- [FAQ](/docs/faq) answers the questions hosts and judges ask most.
+
+Vasal was built for the [Qloo Agentic Hackathon](https://qloo.devpost.com/). The source is on [GitHub](https://github.com/ramakrishnanhulk20/Vasal) under the MIT licence.

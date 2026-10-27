@@ -1,0 +1,40 @@
+---
+title: Without Qloo
+description: How the Without Qloo tab on every board works, so you can see what the same AI model suggests with no Qloo data and how Qloo scores it.
+---
+
+Every board has two tabs, "With Qloo" and "Without Qloo". The first is the board Vasal built from Qloo's data. The second shows what the same AI model suggests when it has no Qloo data and no tools, and it exists so you can compare the two on equal terms.
+
+## How the flip is made
+
+After the board is stored, the run asks the same model for guests a second time.
+
+- The same model, a different job: it is the run's own model with a fixed system prompt that says to suggest guests "from your own knowledge only". It has no tools and makes one call.
+- What it is shown: the show's name as Qloo has it, the newest episode titles (up to 40), and the publisher. A show that came from a pasted feed link or a linked Apple page shows the model no episode titles and no publisher, because nobody vouched for that text.
+- What it returns: between 1 and 8 names, with no reasons. A reply outside that shape fails the flip.
+- Your exclusions apply: a name you excluded is dropped in code before anything is searched.
+
+## How each guess is scored
+
+The model's names are only a list of strings. Qloo does the rest, so the guesses are judged by the same standard as the board.
+
+1. Each distinct name gets one Qloo person search. The first result whose name matches the guess counts as that person. A name with no match is counted as unresolved, and the run keeps only the number of them.
+2. A person Qloo marks with a death date is dropped.
+3. Every person found is scored in a single Qloo call. It is the same call that scores the board's guests, with the show as the signal, so the fits on both tabs share one scale.
+4. Each guess is checked against the show's history with the same index the board uses: the episode titles and descriptions in the feed and the names of the people who make the show. A guess is flagged "already on the show" if it matches a past guest, or "hosts the show" if it matches a host. The API also marks a guess that landed on the board.
+
+A flip makes at most one model call, 8 searches and 1 scoring call. The model's own strings are never stored, streamed or shown. The run keeps Qloo's name for each person and a count of the guesses Qloo could not match, so an unmatched guess is never shown by name.
+
+If anything fails, including running past the run's 120 seconds, the flip is stored as unavailable and the "Without Qloo" tab is disabled. It never fails the run.
+
+## What the boards show
+
+On a board page, the "Without Qloo, the same model" column lists each guess with Qloo's fit for it as a percentage, or "not scored". A guess that has been on the show or hosts it is flagged. Under the column the page says each guess "was scored by Qloo and checked against the show's episode history, the same way as the board."
+
+The [home page](/#without-qloo) adds up the flagged guesses across the showcase boards. Read the totals with their limits in mind:
+
+- The check reaches only as far back as the feed does. It shows the month it reached, and a guess that is not flagged may still have been on the show before that.
+- A guess Qloo could not match is not scored and cannot be flagged.
+- The model is small and cheap on purpose. A larger model might guess differently.
+
+See [Why Qloo](/docs/why-qloo) for what the comparison is meant to show, and [How it works](/docs/how-it-works) for the board it is compared with.

@@ -182,6 +182,8 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 ### C3 What leaves the server (A5, A11, G4, G5)
 - C3.1 No attacker-influenced string is ever treated as HTML or script in the browser. This covers model prose, feed fields, Qloo and YouTube text, tool inputs in step events, and anything read back from the database. All of it renders as React text, with no `dangerouslySetInnerHTML`. If prose is rendered as markdown, raw HTML and images are off.
   - Show it: a feed title and a stub model reply containing `<img src=x onerror=alert(1)>` and `<script>` show as literal text, in both the live and the saved view.
+  - One exception, by design: the docs' diagram renderer (packages/web/src/components/docs/Mermaid.tsx) inserts the SVG that Mermaid draws with `dangerouslySetInnerHTML`. Its only input is diagram text from MDX files in this repository, read at build time; no request, database row or upstream text reaches it, and Mermaid runs at `securityLevel: "strict"`. It is the only use in the web app.
+  - Show it: a grep of packages/web/src for `dangerouslySetInnerHTML` finds that one file and no other.
 - C3.2 Every link or image address built from upstream or model data comes out of the WHATWG URL parser with protocol `https:` or `http:`. Anything else shows as plain text. Feed-supplied image URLs never go to the Next.js image optimizer, whose list of remote hosts holds exact names with no wildcards.
   - Show it: a feed link of `javascript:alert(1)` or ` JaVaScRiPt:alert(1)` shows as text.
 - C3.3 Every stream frame is one `event:` line, with a name from a fixed set, and one `data:` line holding `JSON.stringify` output (which escapes CR and LF). No upstream string is ever written into the stream outside a JSON string.
@@ -198,6 +200,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C3.10 Nothing Vasal writes about a real person claims their sexuality, gender identity, health, religion, ethnicity, politics or family life. Both prompts forbid them (SENSITIVE_TRAITS_RULE, FAMILY_RULE). checkProse refuses, on every angle and brief, the words that almost always make such a claim: sexuality and gender identity terms, named diagnoses and pregnancy, accusations, and marriage, spouse and children words (family_claim; "partner" and "family" pass, because business partners and family comedy are common angles). Religion, ethnicity and politics words are also everyday topics in prose, so there they stay prompt rules. A refused angle goes back to the model with that rule as its hint.
   - Taste chips sit next to a real person's name and read as a fact about them, so they pass two gates: Qloo's tag family must be on an allowlist (genre, subgenre, style, content, emotional tone, aesthetic, host, audience), and the name must clear a broad topic word net (crime, sex, politics, religion and faith, health and mind, addiction, race and origin, gender, environment and activism) and the identity words. The name check runs again on every public read, so a run stored before today's rules never shows a chip they refuse. A dropped chip costs nothing.
   - Labels code writes claim only what their number measures: "household name" only at Qloo popularity 0.97 or above and no other reach label, and "brings" as an audience group the guest's fans lean toward more than the show's listeners do, never one the show lacks.
+  - The same holds for every label that code or the docs put beside a number or a limit: the label names what its counter counts. The per-key in-flight cap is "calls in flight at once", because it counts any MCP request, never "boards".
 
 ### C4 Secrets (A6, A12, G3)
 - C4.1 No secret value appears in any byte sent to a browser, stored in the database, written to logs, sent to the model, or committed to git.
@@ -221,6 +224,8 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
   - One IPv4 address is one visitor, so judges behind one venue or office network share these caps. For the judging days (30 Oct to 6 Nov) RUNS_PER_VISITOR_PER_DAY is 15; it goes back to 5 after.
 - C5.4 No GET, HEAD, link prefetch or crawler visit starts a run or spends a metered call. Showing a saved run, a showcase run or the backtest page makes zero upstream calls.
   - Show it: crawl every page with GET requests only while counting upstream calls. The count is zero.
+  - GET /agent-keys answers only the mcp_enabled flag and fixed constants, with no per-visitor or global count. The web app's only route handler, /api/search, reads the docs index built at build time and calls no upstream.
+  - Show it: a crawl of every GET route, including /agent-keys and /api/search, moves no meter bucket and no counter.
 - C5.5 Starting a run, confirming a show and requesting a brief all require a POST with Content-Type `application/json` and an Origin header that, once parsed by the URL parser, equals the app's configured origin parsed the same way. A missing Origin is refused.
   - Show it: POSTs with Origin `https://evil.example`, with no Origin, and with `text/plain` are all refused.
 - C5.6 Every check that protects spending runs in the process that spends. If the agent server is deployed separately, it enforces C5.1 to C5.5 itself. It accepts relayed requests only with the web app's secret, and takes the visitor identity from a field the web app sets after its own C5.3 check. As built there is no relay: the agent server takes the visitor address only from the edge header (C5.3), and the public /mcp route follows D2.7.
@@ -246,6 +251,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C7.2 Only a 200 response that parsed and passed its schema is cached. Errors, 429s and schema failures are never cached, and entries expire after a set time.
 - C7.3 Qloo response data lives only in the private database. No file in the git tree contains any: test fixtures are synthetic, the seed script writes only to the database, and dumps go to git-ignored folders.
   - Show it: a sweep of the tracked files for Qloo response shapes and entity IDs finds nothing.
+  - The one Qloo-derived file in git is packages/web/src/published/backtest.json. It holds aggregates only (the pre-registered results, the five fit fifths' sizes and ratios, each show's correlations, the drop counts, the post-hoc checks) and is written only by `npm run backtest:public`, whose strict schema and leak check refuse any per-episode list, name, title, id or raw score.
 
 ### C8 Inputs and matching (A8, A10, A11)
 - C8.1 Every request body passes a strict schema before any work starts. Body size is capped, the show text is capped in characters after NFC normalisation, the exclusion list is capped in count and length, and unknown fields are rejected.
@@ -261,6 +267,7 @@ A "run" means one visitor's whole flow, including its confirm and brief steps. E
 - C9.1 Every guest name the model pulls from an episode title must appear in that title under the C8.3 normaliser. Names that do not are dropped and counted, and the count is published with the backtest.
 - C9.2 The offline scripts use the same metered Qloo client as the server (C5.1) and the same feed fetcher (C1). A script on a throwaway meter (backtest --dev-db) takes at most 2 Qloo calls a second, and at most one throwaway-meter process uses the production key at a time (C5.1), so with the server's 8 the total stays within Qloo's 10. The key-day probe (scripts/probe.ts) is unmetered and paced at 2 a second, and it is run only while live runs are off.
 - C9.3 Committed scripts recompute every scripted number on the backtest page from the stored dataset: --analyse for the pre-registered results, backtest:robustness for the post-hoc checks. A hand check is labelled as one. Every pull attempt is listed, including any that stopped, and the page states the method and the sample size.
+  - Every number on /proof is a field of backtest.json, apart from the timeline's dated facts from the git history and the precision hand check, each labelled as such.
 
 ### General standards
 
@@ -424,6 +431,9 @@ D1 Tokens and the human check (A15, A24, G8)
   - Show it: expire or revoke a token between two requests, and the second is refused.
 - D1.4 Outside the caller, the token appears in exactly one place: the one response that shows it, sent with `Cache-Control: no-store` and never in a URL. It never appears in a log, run row, step log, stream frame, tool result, error, run page or analytics event, and it is never sent upstream.
   - Show it: a full MCP test run finds zero `vsl_` hits in logs, rows, streams and results.
+  - In the browser, on /agents, the key lives only in component state and in the text the visitor chooses to copy. It is never put in a URL, localStorage, sessionStorage, a cookie, the console or the server-rendered page. The page asks before leaving while an issued key has not been copied, and only a copy that contains the key counts.
+  - The production site sends a content security policy whose script-src and connect-src allow only this site, the agent API and Cloudflare's challenge host, so an injected script could neither load from nor send to anywhere else.
+  - Show it: a browser run that issues a key finds no `vsl_` in storage, cookies, the address bar or the console, and the policy header is present on /agents.
 - D1.5 A token is issued only after a fresh human check solved on this site for key issue: `success` true, `hostname` equal to the app origin's hostname, and `action` equal to the key-issue action (C5.9's rule with its own action). A failure, timeout or unparseable answer issues nothing. The endpoint keeps C5.5. Per-visitor issue caps use C5.3's normaliser and an atomic reservation, and a global cap bounds tokens issued per day.
   - Show it: a replay, the run-start action, another hostname and a timeout each issue nothing. 50 parallel requests against a cap of 3 issue exactly 3 tokens.
 - D1.6 A leaked token can be made useless at once. The operator can revoke one token, revoke all of them, or switch MCP off, through database flags only, with no web endpoint. The main kill switch stops MCP too. All of these fail closed.

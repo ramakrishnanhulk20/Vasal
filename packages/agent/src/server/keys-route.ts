@@ -31,7 +31,8 @@ class IssueRefused extends Error {
 }
 
 /**
- * Builds POST /agent-keys, which app.ts mounts. A website visitor who passes
+ * Builds GET and POST /agent-keys, which app.ts mounts. GET states whether
+ * keys are open and the limits each key carries. A website visitor who passes
  * the human check gets one agent key (F9). The checks run in this order, and
  * each refusal answers { error: CODE }, changes nothing, and writes one warn
  * line holding only the route and the code:
@@ -92,6 +93,14 @@ export function createAgentKeysRoute(deps: AppDeps): Hono {
     await next();
   };
   const smallBody = bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => refuse(c, 413, "TOO_LARGE") });
+
+  // Read by the agent-key page before any human check, so it touches no count,
+  // meter or key, and an unreadable flag reads as closed (C5.4, C5.7).
+  route.get(ROUTE, async (c) => {
+    const { runsPerDay, findsPerDay, briefsPerDay, inflightPerToken, tokenLifeDays, keysPerVisitorPerDay } = MCP_LIMITS;
+    const limits = { runsPerDay, findsPerDay, briefsPerDay, inflightPerKey: inflightPerToken, keyLifeDays: tokenLifeDays, keysPerVisitorPerDay };
+    return c.json({ open: await mcpEnabled(db), limits }, 200, { "Cache-Control": "public, max-age=30" });
+  });
 
   route.post(ROUTE, sameSiteJson, smallBody, async (c) => {
     let value: unknown;

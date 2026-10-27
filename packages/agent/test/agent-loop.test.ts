@@ -14,11 +14,11 @@ import Anthropic, { APIUserAbortError } from "@anthropic-ai/sdk";
 import { describe, expect, it, vi } from "vitest";
 import { createRunContext, type RunContext } from "../src/agent/context.js";
 import { AgentError } from "../src/agent/errors.js";
-import { DEFAULT_LIMITS, runResearch, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
+import { DEFAULT_LIMITS, runResearch, stepFor, type LoopLimits, type StepEvent } from "../src/agent/loop.js";
 import { createAnthropicModel, estimateInputTokens, type ModelCallOptions, type ModelClient } from "../src/agent/model.js";
 import { RESEARCH_NUDGE, researchSystem } from "../src/agent/prompts.js";
 import { ACCUSATIONS_RULE, SENSITIVE_TRAITS_RULE, TREND_CLAIM_WORDS } from "../src/agent/prose.js";
-import { attachHarness, TOOL_LIMITS } from "../src/agent/tools.js";
+import { attachHarness, runTool, TOOL_LIMITS, type ToolName } from "../src/agent/tools.js";
 import { QlooError } from "../src/qloo/errors.js";
 import type { MeteredQloo } from "../src/qloo/metered.js";
 import type { QlooOperation } from "../src/qloo/request.js";
@@ -47,12 +47,12 @@ function synthResponse(op: QlooOperation): unknown {
   }
 }
 
-function fakeQloo() {
+function fakeQloo(respond: (op: QlooOperation) => unknown = synthResponse) {
   const ops: QlooOperation[] = [];
   const qloo: MeteredQloo = {
     async call<T>(op: QlooOperation): Promise<{ data: T; fromCache: boolean }> {
       ops.push(op);
-      return { data: synthResponse(op) as T, fromCache: false };
+      return { data: respond(op) as T, fromCache: false };
     },
     stats: () => ({ calls: ops.length, cacheHits: 0 }),
   };
@@ -439,6 +439,94 @@ describe("runResearch step labels (C3.1)", () => {
       "Could not check a trend",
       "Picked 3 guests for the board",
     ]);
+  });
+
+  it("says Qloo has no audience data for a person by Qloo's name, or for this person when the name is not known", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo((op) => (op.op === "demographics" && op.signalEntities[0] === personId(1) ? [] : synthResponse(op)));
+    const { model } = fakeModel((turn) => {
+      if (turn === 1) return reply([toolUse("p", "people_for_show", { reach: "any" })]);
+      if (turn === 2) return reply([toolUse("a", "audience_of", { personId: personId(1) }), toolUse("b", "audience_of", { personId: personId(1) })]);
+      return reply([finish()]);
+    });
+    const steps: StepEvent[] = [];
+
+    await runResearch(ctx, { model, qloo, today: TODAY, trends: true, onStep: async (step) => void steps.push(step) });
+
+    const noData = { tool: "audience_of", ok: false, label: "Qloo has no audience data for Synthetic Person 1" };
+    expect(steps).toEqual([
+      { tool: "people_for_show", ok: true, label: "Found 4 people this show's listeners love" },
+      noData,
+      noData,
+      { tool: "finish_board", ok: true, label: "Picked 3 guests for the board" },
+    ]);
+    const outcome = { content: JSON.stringify({ error: "NO_DATA" }), isError: true };
+    expect(stepFor(ctx, "audience_of", { personId: NEVER_RETURNED }, outcome)).toEqual({
+      tool: "audience_of",
+      ok: false,
+      label: "Qloo has no audience data for this person",
+    });
+  });
+
+  it("says which run limit a tool reached, with that tool's real cap", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo();
+    attachHarness(ctx, { qloo: harnessFrom(qloo).harness });
+    const inputs: Record<ToolName, unknown> = {
+      people_for_show: { reach: "any" },
+      audience_of: { personId: personId(1) },
+      trend_of: { personId: personId(1) },
+      shared_taste: { personId: personId(2) },
+      upcoming_releases: { kind: "movie" },
+      find_person: { name: "Synthetic Person 1" },
+      recent_episode_titles: {},
+      finish_board: { picks: [1, 2, 3].map((n) => ({ personId: personId(n), angle: "Their fans already love this kind of talk." })) },
+    };
+    const labels: Record<string, StepEvent> = {};
+
+    for (const [name, input] of Object.entries(inputs) as Array<[ToolName, unknown]>) {
+      for (let call = 0; call < TOOL_LIMITS[name]; call += 1) await runTool(ctx, qloo, name, input, TODAY, { trends: true });
+      const refused = await runTool(ctx, qloo, name, input, TODAY, { trends: true });
+      expect(JSON.parse(refused.content), name).toEqual({ error: "LIMIT_REACHED" });
+      labels[name] = stepFor(ctx, name, input, refused);
+    }
+
+    const limit = (tool: ToolName, label: string) => ({ tool, ok: false, label });
+    expect(labels).toEqual({
+      people_for_show: limit("people_for_show", "Reached this run's limit of 3 people lists"),
+      audience_of: limit("audience_of", "Reached this run's limit of 10 audience checks"),
+      trend_of: limit("trend_of", "Reached this run's limit of 10 trend checks"),
+      shared_taste: limit("shared_taste", "Reached this run's limit of 10 taste comparisons"),
+      upcoming_releases: limit("upcoming_releases", "Reached this run's limit of 3 release lists"),
+      find_person: limit("find_person", "Reached this run's limit of 6 name lookups"),
+      recent_episode_titles: limit("recent_episode_titles", "Reached this run's limit of 1 episode title list"),
+      finish_board: limit("finish_board", "Reached this run's limit of 2 board submissions"),
+    });
+  });
+
+  it("keeps each tool's own label for every other failure, and for an error it cannot read", async () => {
+    const ctx = newContext();
+    const { qloo } = fakeQloo((op) => {
+      if (op.op === "insights") return synthResponse(op);
+      throw new QlooError("QLOO_UPSTREAM");
+    });
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, { trends: true });
+    const cases: Array<[ToolName, unknown, boolean, string, string]> = [
+      ["audience_of", { personId: personId(1) }, true, "QLOO_UPSTREAM", "Could not check an audience"],
+      ["audience_of", { personId: NEVER_RETURNED }, true, "UNKNOWN_PERSON", "Could not check an audience"],
+      ["audience_of", { personId: 5 }, true, "BAD_INPUT", "Could not check an audience"],
+      ["shared_taste", { personId: personId(1) }, true, "QLOO_UPSTREAM", "Could not compare tastes"],
+      ["trend_of", { personId: personId(1) }, false, "NO_TREND_DATA", "Could not check a trend"],
+    ];
+
+    for (const [name, input, trends, code, label] of cases) {
+      const outcome = await runTool(ctx, qloo, name, input, TODAY, { trends });
+      expect(JSON.parse(outcome.content), code).toEqual({ error: code });
+      expect(stepFor(ctx, name, input, outcome), code).toEqual({ tool: name, ok: false, label });
+    }
+    for (const content of ["not json", JSON.stringify({ error: 7 }), JSON.stringify(["NO_DATA"])]) {
+      expect(stepFor(ctx, "audience_of", { personId: personId(1) }, { content, isError: true }).label, content).toBe("Could not check an audience");
+    }
   });
 });
 

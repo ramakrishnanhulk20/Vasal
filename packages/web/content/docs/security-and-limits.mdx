@@ -1,0 +1,85 @@
+---
+title: Security and limits
+description: A plain summary of Vasal's threat model, what it stores and for how long, how it treats untrusted text, and the spending limits and switches that protect the budget.
+---
+
+Vasal is a public door on two paid services, Qloo and Anthropic, and it reads text that strangers wrote. The [threat model](https://github.com/ramakrishnanhulk20/Vasal/blob/main/docs/security/threat-model.md) was written before the code, and its section C is the list the build was held to. This page summarises it in plain words. The model does not guard anything: every limit below is enforced by code that never asks the model for permission.
+
+## Who can start work
+
+- A human check: a run starts, and an agent key is issued, only after a Cloudflare Turnstile check solved on this site. The server asks Cloudflare to verify the answer and accepts it only if it succeeded, was solved on this site's hostname, and was solved for that action. A run-start answer cannot buy a key and the reverse. A failure, a timeout or an answer that does not parse is a refusal.
+- A same-site request: every website route that can spend needs a POST with `Content-Type: application/json` and an `Origin` header equal to the site's origin. A missing or foreign origin is refused. This stops other websites from starting runs through their visitors' browsers. The MCP door is the exception: it refuses any browser origin and needs a bearer key instead.
+- No GET spends: opening a page, a saved run or a showcase board, or a crawler visiting one, makes no Qloo call and no model call.
+- Ids you cannot guess: run ids and guest ids are random UUIDs. The confirm and brief routes accept only an id the server issued for that run, and never a link, a name or entity data from the browser.
+
+## Keys
+
+- An agent key is `vsl_` followed by 32 random bytes. Only its SHA-256 is stored, so a copy of the database holds nothing that works as a key.
+- A key is read only from the `Authorization` header, never from a query string, a cookie or the body. It is checked on every request against the database clock for revocation and expiry.
+- It appears in exactly one response, with `Cache-Control: no-store`. It is never logged, stored with a visitor's address, put in a step, or sent upstream.
+- The Qloo key rides in an `X-Api-Key` header, and the clients that send it refuse redirects so a redirect cannot carry it elsewhere. Secrets stay on the server. No secret has a `NEXT_PUBLIC_` name.
+
+## What is stored, and for how long
+
+| What | How it is kept | For how long |
+| --- | --- | --- |
+| Runs, their events, candidates, boards and briefs | Postgres | Kept. Runs are not deleted. Anyone with a run's link can read it, so do not type anything private. |
+| Visitor addresses | Only as a keyed hash (HMAC-SHA256 with a server secret), counted per day. An IPv6 address counts as its 64-bit block. | The counter row is deleted once its day started more than 2 days ago. |
+| Qloo answers | A shared cache keyed by the exact request | 7 days. Only successful answers that passed their schema are kept. |
+| Apple directory answers | The same cache | 1 hour |
+| Agent keys | SHA-256 of the key, its dates and a revoked flag, with no visitor link | Deleted 7 days after expiry, unless a run still points to the key |
+| Per-key daily counts | Counters in Postgres | Deleted once their day started more than 2 days ago |
+
+Run pages are marked `noindex`, and no page links to a visitor's run. Only runs the operator promotes appear on the home page. Once a run is promoted, a database trigger stops the web role from changing any of its rows. Qloo's response data lives only in the private database. It is not in the repository.
+
+## Untrusted text
+
+Show names, episode titles, publisher names and Qloo names are written by strangers, and the model reads some of them. They are treated as data at every step.
+
+- Fetching feeds: a feed is fetched only through a handle the server issued for this run. The fetcher dials only public internet addresses, checked on the address the socket actually uses and again on every redirect. It follows at most 3 redirects, speaks only `http` and `https` on their default ports, and caps the time and the decoded size. It sends no key or cookie. The model has no tool that fetches anything, and links inside a feed are never followed.
+- Parsing feeds: a document with a DOCTYPE is rejected before parsing. Nesting and element counts are capped. If the bytes do not parse as a feed, nothing from them is kept, streamed or logged.
+- Cleaning: every third-party string is normalised and stripped of control, invisible and direction-changing characters before anyone reads it. That includes the invisible tag characters a model can read and a person cannot see.
+- Rendering: everything shows as plain text. Nothing from a feed, Qloo or the model is treated as HTML or script, and a link built from outside data must parse as `http` or `https`. A feed title that contains the text of a stream event arrives as one value inside one event.
+- The model: tool results reach the model only as tool results, capped in size, and never in the system prompt. The visitor's own words never reach a prompt. Only a feed found by a directory search has its titles shown to a model.
+- What it may write: code removes links, emails and phone numbers from the model's prose, refuses any number it did not compute, and refuses release, family, sensitive-trait and accusation claims. [How it works](/docs/how-it-works) lists the rules.
+
+The threat model states what these checks do not cover. They cannot stop a model from being swayed by text it reads, which is why code, not the model, decides which tools run, which ids are real and what a number is. They also do not catch a nickname, a misspelling or a spelled-out link.
+
+## Spend guards
+
+Every call to Qloo or the model reserves from a counter in Postgres first, in one statement that adds only if the total stays under the cap. If any counter is full, missing, expired or unreadable, the call is not made.
+
+- Buckets: Qloo has a monthly bucket, a day share for the website, a day share for agents, a share for the operator's offline work, and a per-second bucket of 8 calls against Qloo's own 10 a second. Model tokens have a day bucket for the website and one for agents. A call takes from the month, its day share and the current second together or not at all.
+- The offline share: the operator's scripts, such as seeding showcase boards and the backtest, draw on their own day and month shares, so they cannot use what live visitors need.
+- Qloo's own count: the code records Qloo's remaining monthly calls from every reply. With fewer than 1,500 left, no call goes out.
+- Settle to usage: model tokens are reserved before a call, as the output allowance plus an estimate of the input. They are then settled to the tokens the reply reports. Unused tokens go back, and an overrun is charged, so the meter never undercounts.
+- Per visitor: 5 runs a day by default, set by `RUNS_PER_VISITOR_PER_DAY`. The threat model records 15 a day for the judging days, 30 Oct to 6 Nov 2026, and 5 after.
+- Runs in progress: at most 3 across the site by default, set by `MAX_INFLIGHT_RUNS`. A run's work is capped at 12 model turns, 25 tool calls, 250,000 tokens and 120 seconds.
+- Briefs and streams: one brief per guest per run and 5 per run, claimed before any model call. 3 open streams per run, 6 per visitor and 100 per server.
+- Per agent key: 3 boards, 20 show searches and 15 briefs a day, 3 calls in flight, and 30 days of life. One agent run place across all keys. 3 keys per network address a day. 20 failed authentications from one address a minute is the most before refusals.
+
+The daily caps come from `packages/agent/scripts/budget-policy.json`, which the hourly job applies. They follow the date, in UTC, like this.
+
+| Dates | Qloo calls a month | Website Qloo calls a day | Agent Qloo calls a day | Website model tokens a day | Agent keys issued a day |
+| --- | --- | --- | --- | --- | --- |
+| 1 to 29 Oct 2026 | 12,000 | 1,000 | 300 | 2,000,000 | 50 |
+| 30 and 31 Oct 2026 | 12,000 | 3,000 | 600 | 20,000,000 | 100 |
+| 1 to 6 Nov 2026 | 32,000 | 3,000 | 600 | 20,000,000 | 100 |
+| 7 to 30 Nov 2026 | 32,000 | 1,400 | 300 | 3,000,000 | 100 |
+| Dec 2026 and Jan 2027 | 20,000 | 1,400 | 300 | 1,000,000 | 100 |
+
+These sit inside Qloo's own quota for the key, which was 50,000 calls a month at 10 a second when it was read on 21 Oct 2026. Past 31 Jan 2027 no profile covers the date, and the health check warns 14 days before that. A day bucket whose window has ended refuses every call until the job rolls it, and every window stays open until 02:00 UTC so a late job does not refuse visitors at midnight.
+
+## Switches
+
+The operator has two switches and a key list, all set by scripts that connect with the owner role. The web role can only read them, and there is no web page or route that changes any of them.
+
+- Live runs off: stops new runs, confirms, any brief that would call the model, and the MCP tools that start work. Saved runs, showcase boards and stored briefs keep working, and the site says live runs are closed. A run already under way finishes within its own caps.
+- MCP off: stops key issue and every MCP request.
+- Revoke one key, or every key: the next request with a revoked key is refused.
+
+Every switch fails closed. If a flag, a counter or the database cannot be read, no run starts and no metered call goes out.
+
+## Read the code
+
+The code and the threat model are public on [GitHub](https://github.com/ramakrishnanhulk20/Vasal), so every claim on this page can be checked against the source.

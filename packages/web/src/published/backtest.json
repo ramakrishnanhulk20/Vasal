@@ -1,0 +1,202 @@
+{
+  "dataset": "20261021T105230Z",
+  "datasetBuiltAt": "2026-10-21T10:52:30.524Z",
+  "window": {
+    "from": "2024-10-01",
+    "to": "2026-07-31"
+  },
+  "minimumMinutes": 20,
+  "sample": {
+    "shows": 8,
+    "episodes": 755
+  },
+  "h1": {
+    "rho": 0.13953803452641075,
+    "low": 0.0688152971337607,
+    "high": 0.2113562700552157,
+    "supported": true
+  },
+  "h2": {
+    "rho": 0.09585284104171286,
+    "low": 0.02086946404687238,
+    "high": 0.17253123377822097,
+    "supported": true
+  },
+  "bootstrap": {
+    "iterations": 10000,
+    "seed": 20261019
+  },
+  "fifths": [
+    {
+      "fifth": 1,
+      "medianRatio": 1,
+      "episodes": 147
+    },
+    {
+      "fifth": 2,
+      "medianRatio": 1.1844911108818637,
+      "episodes": 156
+    },
+    {
+      "fifth": 3,
+      "medianRatio": 1.3480630790994046,
+      "episodes": 154
+    },
+    {
+      "fifth": 4,
+      "medianRatio": 1.211331696316911,
+      "episodes": 151
+    },
+    {
+      "fifth": 5,
+      "medianRatio": 1.5486908066605516,
+      "episodes": 147
+    }
+  ],
+  "shows": [
+    {
+      "name": "Armchair Expert with Dax Shepard",
+      "episodes": 196,
+      "cutShort": false,
+      "rho": 0.15736023833597484,
+      "rhoGivenFame": 0.13996467141429383
+    },
+    {
+      "name": "Call Her Daddy",
+      "episodes": 127,
+      "cutShort": false,
+      "rho": 0.025617853126836766,
+      "rhoGivenFame": 0.032962973295585576
+    },
+    {
+      "name": "The Diary Of A CEO",
+      "episodes": 43,
+      "cutShort": false,
+      "rho": 0.10413834886939229,
+      "rhoGivenFame": 0.10182889177512801
+    },
+    {
+      "name": "Club Shay Shay",
+      "episodes": 53,
+      "cutShort": true,
+      "rho": 0.12633574191216812,
+      "rhoGivenFame": 0.11916893052494852
+    },
+    {
+      "name": "Conan O'Brien Needs A Friend",
+      "episodes": 62,
+      "cutShort": false,
+      "rho": 0.22186685514337215,
+      "rhoGivenFame": 0.05588851373972431
+    },
+    {
+      "name": "This Past Weekend w/ Theo Von",
+      "episodes": 73,
+      "cutShort": false,
+      "rho": 0.1253403472543398,
+      "rhoGivenFame": 0.10546573254339804
+    },
+    {
+      "name": "Impaulsive",
+      "episodes": 37,
+      "cutShort": false,
+      "rho": 0.41033849721160237,
+      "rhoGivenFame": 0.2956635480104328
+    },
+    {
+      "name": "The Joe Rogan Experience",
+      "episodes": 164,
+      "cutShort": false,
+      "rho": 0.1320328389225055,
+      "rhoGivenFame": 0.0487595916852061
+    }
+  ],
+  "excluded": [
+    {
+      "name": "Hot Ones",
+      "reason": "no_podcast_match"
+    },
+    {
+      "name": "Good Hang with Amy Poehler",
+      "reason": "no_podcast_match"
+    },
+    {
+      "name": "Flagrant",
+      "reason": "ambiguous_podcast"
+    },
+    {
+      "name": "SmartLess",
+      "reason": "no_channel"
+    }
+  ],
+  "uploadsRead": 11927,
+  "drops": [
+    {
+      "rule": "otherShow",
+      "count": 922
+    },
+    {
+      "rule": "outsideWindow",
+      "count": 5181
+    },
+    {
+      "rule": "tooShort",
+      "count": 4215
+    },
+    {
+      "rule": "notOneGuest",
+      "count": 403
+    },
+    {
+      "rule": "guestNotFound",
+      "count": 257
+    },
+    {
+      "rule": "noFitScore",
+      "count": 194
+    },
+    {
+      "rule": "other",
+      "count": 0
+    }
+  ],
+  "precision": {
+    "checked": 50,
+    "correct": 44
+  },
+  "sensitivity": {
+    "episodes": 683,
+    "h1": {
+      "rho": 0.14925887274475405,
+      "low": 0.07047412132394489,
+      "high": 0.2258147866198465,
+      "supported": true
+    },
+    "h2": {
+      "rho": 0.10000153657270144,
+      "low": 0.017430197357255452,
+      "high": 0.18370566166265204,
+      "supported": true
+    }
+  },
+  "guestLevel": {
+    "guests": 603,
+    "h1": {
+      "low": 0.06512361654303077,
+      "high": 0.21091585234778423
+    },
+    "h2": {
+      "low": 0.020404633425607704,
+      "high": 0.1673276735050528
+    },
+    "oneRowPerGuest": {
+      "h1": 0.1531288919097119,
+      "h2": 0.11053447188151233
+    },
+    "resamples": {
+      "h1": 2000,
+      "h2": 2000
+    },
+    "seed": 20261024
+  }
+}

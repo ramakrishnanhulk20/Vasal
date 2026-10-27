@@ -263,7 +263,8 @@ export function runContextFor(
  * board is comparable (dropping any pick that answer says has died), fills
  * missing audience, trend and shared-taste data only for the picks that
  * survive exclusions and the find_person fit floor through runTool (so the
- * per-tool caps hold), builds the board in code, and stores it with a
+ * per-tool caps hold), with no audience check for a pick Qloo already said
+ * has no audience data for, builds the board in code, and stores it with a
  * "board" event and a done event. Between the two it adds the "Without Qloo"
  * flip (guessWithoutQloo) with the run's own model and Qloo client and the
  * run's deadline signal, given the publisher only for a directory show
@@ -460,8 +461,14 @@ export function createAgentRunner(deps: {
     for (const personId of personIds) {
       if (ctx.dropped.has(personId)) continue;
       for (const tool of fillTools) {
+        // A person Qloo already said has no audience data counts as checked,
+        // so the fill does not log a second refusal for them.
         const present =
-          tool === "audience_of" ? ctx.personDemographics.has(personId) : tool === "trend_of" ? ctx.trends.has(personId) : ctx.compares.has(personId);
+          tool === "audience_of"
+            ? ctx.personDemographics.has(personId) || ctx.noAudience.has(personId)
+            : tool === "trend_of"
+              ? ctx.trends.has(personId)
+              : ctx.compares.has(personId);
         if (present) continue;
         if (deadline.overTime()) throw new AgentError("AGENT_LIMIT");
         const input = { personId };

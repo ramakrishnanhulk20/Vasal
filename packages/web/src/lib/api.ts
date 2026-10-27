@@ -35,7 +35,11 @@ export type RunSnapshot = z.infer<typeof snapshotSchema>;
 export type LiveStep = z.infer<typeof stepSchema>;
 export type BriefAnswer = { kind: "done"; brief: BriefContent } | { kind: "pending" };
 
-async function call<T>(path: string, init: RequestInit, schema: z.ZodType<T>): Promise<Result<T>> {
+export async function call<T>(
+  path: string,
+  init: RequestInit,
+  schema: z.ZodType<T>,
+): Promise<Result<T>> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE}${path}`, init);

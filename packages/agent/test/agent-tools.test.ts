@@ -282,6 +282,32 @@ describe("runTool refusals (C2.1, C2.2)", () => {
     expect(ops).toHaveLength(before);
   });
 
+  it("answers a repeat audience_of for a person Qloo has no audience data for as NO_DATA, with no Qloo call and no audience check spent", async () => {
+    const { qloo, ops } = fakeQloo((op) => (op.op === "demographics" && op.signalEntities[0] === personId(1) ? [] : synthResponse(op)));
+    const ctx = newContext();
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+    const noData = { content: JSON.stringify({ error: "NO_DATA" }), isError: true };
+
+    expect(await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON)).toEqual(noData);
+    const asked = ops.length;
+    expect(await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON)).toEqual(noData);
+
+    expect(ops).toHaveLength(asked);
+    expect(ctx.toolCalls.get("audience_of")).toBe(1);
+    const refused = { tool: "audience_of", ok: false, summary: "no audience data for this person" };
+    expect(ctx.steps.slice(-2)).toEqual([refused, refused]);
+    // The repeat left all nine other checks, and once they are spent a
+    // repeat still gets the same answer rather than the limit.
+    for (let call = 1; call < TOOL_LIMITS.audience_of; call += 1) {
+      expect((await runTool(ctx, qloo, "audience_of", { personId: personId(2) }, TODAY, ON)).isError).toBe(false);
+    }
+    const spent = ops.length;
+    expect(errorOf((await runTool(ctx, qloo, "audience_of", { personId: personId(3) }, TODAY, ON)).content)).toEqual({ error: "LIMIT_REACHED" });
+    expect(await runTool(ctx, qloo, "audience_of", { personId: personId(1) }, TODAY, ON)).toEqual(noData);
+    expect(ops).toHaveLength(spent);
+    expect([...ctx.noAudience]).toEqual([personId(1)]);
+  });
+
   it("surfaces a QlooError as its code only, with no message, URL or key", async () => {
     const ctx = newContext();
     const { qloo } = fakeQloo(() => {
@@ -381,6 +407,22 @@ describe("tool requests and results", () => {
     ]);
     expect(ctx.showDemographics).not.toBeNull();
     expect(ctx.personDemographics.size).toBe(2);
+  });
+
+  it("asks once for a show Qloo has no audience block for, and still checks each person as before", async () => {
+    const { qloo, ops } = fakeQloo((op) => (op.op === "demographics" && op.signalEntities[0] === SHOW.qlooId ? [] : synthResponse(op)));
+    const ctx = newContext();
+    await runTool(ctx, qloo, "people_for_show", { reach: "any" }, TODAY, ON);
+
+    const outcomes = [];
+    for (const n of [1, 2, 3]) outcomes.push(await runTool(ctx, qloo, "audience_of", { personId: personId(n) }, TODAY, ON));
+
+    expect(ops.flatMap((op) => (op.op === "demographics" ? [op.signalEntities[0]] : []))).toEqual([SHOW.qlooId, personId(1), personId(2), personId(3)]);
+    expect(outcomes.every((outcome) => !outcome.isError)).toBe(true);
+    expect(ctx.showDemographics).toBeNull();
+    expect(ctx.personDemographics.size).toBe(3);
+    expect(ctx.steps.slice(-3).map((entry) => entry.summary)).toEqual(Array(3).fill("read one audience, 3 strong segments"));
+    expect(stepFor(ctx, "audience_of", { personId: personId(2) }, outcomes[1]!).label).toBe(`Checked who Synthetic Person 2 ${MARKER}'s fans are`);
   });
 
   it("asks for the 12 full Monday to Sunday weeks before today and returns the trend state", async () => {

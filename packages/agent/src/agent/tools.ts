@@ -291,6 +291,10 @@ function refusal(ctx: RunContext, tool: StepSummary["tool"], code: string, summa
   return { content: JSON.stringify({ error: code }), isError: true };
 }
 
+// One answer for both the first ask and every repeat, so a repeat reads
+// exactly as the ask that spent the Qloo call did.
+const noAudienceRefusal = (ctx: RunContext): ToolOutcome => refusal(ctx, "audience_of", "NO_DATA", "no audience data for this person");
+
 // Drops whole items from the end until the JSON fits (C2.8). Text is never cut
 // here; every string was already capped when it came in. Extra fields are
 // counts only, written next to the list and inside the same cap.
@@ -539,9 +543,17 @@ const audienceOf: Handler<"audience_of"> = async (ctx, qloo, input) => {
   if (!ctx.people.has(input.personId)) return refusal(ctx, "audience_of", "UNKNOWN_PERSON", "refused: person not found in this run");
   // The show's own audience is fetched once per run, so the board can tell
   // which audience group a guest's fans lean toward more than the show's do.
-  if (ctx.showDemographics === null) ctx.showDemographics = await demographicsOf(qloo, ctx.show.qlooId);
+  // An answer with no block is recorded too, so it is never asked again; the
+  // person is still checked, and the board then shows no lean.
+  if (ctx.showDemographics === null && !ctx.noAudience.has(ctx.show.qlooId)) {
+    ctx.showDemographics = await demographicsOf(qloo, ctx.show.qlooId);
+    if (ctx.showDemographics === null) ctx.noAudience.add(ctx.show.qlooId);
+  }
   const audience = await demographicsOf(qloo, input.personId);
-  if (audience === null) return refusal(ctx, "audience_of", "NO_DATA", "no audience data for this person");
+  if (audience === null) {
+    ctx.noAudience.add(input.personId);
+    return noAudienceRefusal(ctx);
+  }
   ctx.personDemographics.set(input.personId, audience);
   const segments = strongestSegments(audience, SEGMENTS_SHOWN);
   step(ctx, "audience_of", true, `read one audience, ${segments.length} strong segments`);
@@ -783,19 +795,32 @@ async function dispatch<K extends ToolName>(
   return HANDLERS[name](ctx, qloo, parsed.data as Inputs[K], today, opts);
 }
 
+// Read through the same schema dispatch uses, so the id looked up here is the
+// id audienceOf stored. A person dropped since is left to the usual path,
+// which refuses them as unknown.
+function knownNoAudience(ctx: RunContext, input: unknown): boolean {
+  const parsed = INPUTS.audience_of.safeParse(input);
+  return parsed.success && ctx.noAudience.has(parsed.data.personId) && ctx.people.has(parsed.data.personId);
+}
+
 /**
  * Runs one tool call the model asked for. Every check here is code, never a
  * question to the model (C2.1). In order: an unknown tool name, a tool past
  * its TOOL_LIMITS count for this run, input that fails the tool's strict
  * schema, and a personId no tool returned in this run are each refused with
- * no Qloo call (C2.2). With opts.trends false, trend_of is refused as
- * NO_TREND_DATA with no Qloo call, and finish_board refuses an angle that
- * calls someone rising (reason "trend_claim"). finish_board always refuses,
+ * no Qloo call (C2.2). Before the count is checked, an audience_of whose
+ * input passes its schema and names a person still in this run whom an
+ * earlier audience_of found no audience data for (ctx.noAudience) gets the
+ * same NO_DATA refusal again, with no Qloo call and without counting toward
+ * the limit, even once the limit is reached. With opts.trends false,
+ * trend_of is refused as NO_TREND_DATA with no Qloo call, and finish_board
+ * refuses an angle that calls someone rising (reason "trend_claim").
+ * finish_board always refuses,
  * with reason "release_claim", an angle whose words hold, in a row, the words
  * of any title upcoming_releases returned in this run, both taken under
  * matchKey with "the", "a" and "an" dropped (C8.3), for every title left with
  * at least two words; its hint names that title, cut to 120 characters. Every
- * attempt at a known tool counts toward its limit.
+ * other attempt at a known tool counts toward its limit.
  * Qloo requests are built from checked fields only (C2.3). Content is JSON of
  * at most 4,000 characters, and every Qloo name, tag and title and every
  * episode title in it has been through cleanText (C2.8). Angles are cleaned
@@ -823,6 +848,8 @@ export async function runTool(
 ): Promise<ToolOutcome> {
   if (!Number.isFinite(today.getTime())) throw new RangeError("today must be a valid date.");
   if (!isToolName(name)) return refusal(ctx, "unknown", "UNKNOWN_TOOL", "refused: unknown tool");
+  // Before the count, so a model or fill step asking twice spends nothing.
+  if (name === "audience_of" && knownNoAudience(ctx, input)) return noAudienceRefusal(ctx);
 
   const used = ctx.toolCalls.get(name) ?? 0;
   if (used >= TOOL_LIMITS[name]) return refusal(ctx, name, "LIMIT_REACHED", "refused: call limit reached");

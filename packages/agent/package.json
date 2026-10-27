@@ -19,7 +19,8 @@
     "ops": "tsx scripts/ops.ts",
     "prove": "tsx scripts/prove.ts",
     "backtest": "tsx scripts/backtest.ts",
-    "backtest:robustness": "tsx scripts/backtest-robustness.ts"
+    "backtest:robustness": "tsx scripts/backtest-robustness.ts",
+    "backtest:public": "tsx scripts/backtest-public.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.135.0",

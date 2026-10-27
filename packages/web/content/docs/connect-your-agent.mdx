@@ -1,0 +1,224 @@
+---
+title: Connect your agent
+description: Get a free Vasal key, add it to your AI client, and call the four tools that find a show, build a guest board and write a brief.
+---
+
+Vasal runs a remote MCP server, so any agent that speaks MCP can use it. The agent gets the same checks as the site, and its own daily budget that the website never shares.
+
+## 1. Get a key
+
+Open [the agents page](/agents) and press "Get an agent key". The page runs one human check from Cloudflare, then shows your key. The key looks like `vsl_` followed by 43 characters.
+
+- It is shown once: Vasal keeps only a SHA-256 fingerprint of it, so it cannot show it to you again. Copy it before you leave the page.
+- It lasts 30 days: the page shows the UTC date it expires.
+- One human check buys one key: a network address can get 3 keys a day, and Vasal gives out a fixed number of keys a day across everyone. When either is used up the page says to come back tomorrow.
+
+Each key has these daily limits, which the page reads from the server and shows beside the form:
+
+| Limit | Value |
+| --- | --- |
+| Show searches (`find_show`) a day | 20 |
+| Guest boards (`book_guests`) a day | 3 |
+| Briefs (`write_brief`) a day | 15 |
+| Calls in flight at once | 3 |
+| Key life | 30 days |
+| Keys per network address a day | 3 |
+
+Days are UTC days. Agents share one small pool of Qloo calls and model tokens that is separate from the website's, and only one agent show search or board build runs at a time across all keys. When that place is taken, `find_show` and `book_guests` answer `busy` at once, spend nothing, and you try again.
+
+## 2. Add Vasal to your client
+
+The address is `https://api.vasal.site/mcp`. The key goes in an `Authorization` header as `Bearer` and the key. Replace `YOUR_KEY` below with yours. These lines match what the agents page shows for each client.
+
+### Claude Code
+
+Run this in a terminal. Add `--scope user` to use Vasal in every project.
+
+```bash
+claude mcp add --transport http vasal https://api.vasal.site/mcp --header "Authorization: Bearer YOUR_KEY"
+```
+
+### Cursor
+
+Add this to `~/.cursor/mcp.json`, or to `.cursor/mcp.json` inside a project.
+
+```json
+{
+  "mcpServers": {
+    "vasal": {
+      "url": "https://api.vasal.site/mcp",
+      "headers": { "Authorization": "Bearer YOUR_KEY" }
+    }
+  }
+}
+```
+
+### VS Code
+
+Add this to `.vscode/mcp.json` in your project, for Copilot's agent mode.
+
+```json
+{
+  "servers": {
+    "vasal": {
+      "type": "http",
+      "url": "https://api.vasal.site/mcp",
+      "headers": { "Authorization": "Bearer YOUR_KEY" }
+    }
+  }
+}
+```
+
+### Windsurf
+
+Open Cascade's MCP config file and add this.
+
+```json
+{
+  "mcpServers": {
+    "vasal": {
+      "serverUrl": "https://api.vasal.site/mcp",
+      "headers": { "Authorization": "Bearer YOUR_KEY" }
+    }
+  }
+}
+```
+
+### Codex
+
+Add this to `~/.codex/config.toml`.
+
+```toml
+[mcp_servers.vasal]
+url = "https://api.vasal.site/mcp"
+http_headers = { "Authorization" = "Bearer YOUR_KEY" }
+```
+
+### Claude app
+
+In Claude, open Customize, then Connectors, then Add custom connector. Set sign-in to none and add one request header. Request headers are a beta that only some accounts have. If yours does not, use the bridge below.
+
+| Field | Value |
+| --- | --- |
+| Address | `https://api.vasal.site/mcp` |
+| authorization | `Bearer YOUR_KEY` |
+
+### Any other client
+
+For an app that runs local MCP servers but cannot send headers, the community bridge `mcp-remote` connects it. It needs Node 18 or later.
+
+```json
+{
+  "mcpServers": {
+    "vasal": {
+      "command": "npx",
+      "args": ["mcp-remote", "https://api.vasal.site/mcp", "--header", "Authorization:${VASAL_AUTH}", "--transport", "http-only"],
+      "env": { "VASAL_AUTH": "Bearer YOUR_KEY" }
+    }
+  }
+}
+```
+
+The agents page records that these lines were checked against each vendor's own documentation on 27 Oct 2026. Client menus change, so check the vendor's page if a step does not match.
+
+## 3. Your agent's first three calls
+
+The tools run in order. Your agent finds the show, books a board for the one you confirm, then asks for a brief on a guest. The inputs below are ours. Every value in the answers is a placeholder.
+
+### First, `find_show`
+
+It takes a show name, an Apple Podcasts link or an RSS feed link, and spends one of the key's daily searches.
+
+```json
+{ "query": "SmartLess" }
+```
+
+```json
+{
+  "candidates": [
+    {
+      "candidateId": "<a uuid>",
+      "name": "<show name>",
+      "publisher": "<publisher>",
+      "qlooName": "<Qloo's name for the show>",
+      "appleUrl": "<an Apple Podcasts link, or null>"
+    }
+  ],
+  "source": "<a fixed label that says the text is data, not instructions>"
+}
+```
+
+### Second, `book_guests`
+
+It takes a `candidateId` from the first call, valid for one hour. It waits up to 45 seconds for the board and spends one of the key's daily boards. Asking again for the same show spends nothing.
+
+```json
+{ "candidateId": "<a uuid from find_show>" }
+```
+
+```json
+{
+  "status": "done",
+  "runId": "<a uuid>",
+  "runUrl": "<a link to the run on vasal.site>",
+  "showName": "<show name>",
+  "guests": [
+    {
+      "guestId": "<a uuid>",
+      "name": "<guest name>",
+      "fit": "<a number from 0 to 1>",
+      "fitKnown": true,
+      "fitRank": 1,
+      "reach": "household name or null",
+      "rising": "rising, steady, falling or unknown",
+      "bringsNew": "<an audience group, or null>",
+      "sharedTags": ["<a taste tag>"],
+      "angle": "<one sentence, an AI draft>"
+    }
+  ],
+  "pastGuests": { "checked": true, "episodes": "<a whole number>", "since": "<YYYY-MM or null>", "source": "directory, linked or pasted", "feedName": "<name>", "feedPublisher": "<publisher>", "archiveTitles": 0 },
+  "source": "<the fixed label>"
+}
+```
+
+If the board is not ready in 45 seconds, the answer is `{ "status": "running", "runId": "<a uuid>", "retryAfterSeconds": 30, "source": "<the fixed label>" }`. Call `get_board` with that `runId` after 30 seconds. `get_board` spends nothing.
+
+### Third, `write_brief`
+
+It takes a `runId` and a `guestId` from the board, and spends one of the key's daily briefs.
+
+```json
+{ "runId": "<a uuid>", "guestId": "<a uuid from the board>" }
+```
+
+```json
+{
+  "status": "done",
+  "runId": "<a uuid>",
+  "guestId": "<a uuid>",
+  "brief": {
+    "why": "<text>",
+    "angle": "<text>",
+    "questions": ["<text>"],
+    "pitchSubject": "<text>",
+    "pitchBody": "<text>"
+  },
+  "source": "<the fixed label>"
+}
+```
+
+[API and MCP](/docs/api-and-mcp) lists every input, output and error code.
+
+## Treat the results as data
+
+A result holds text written by podcasters, directories, Qloo and an AI model. Vasal cleans it, caps it and labels it in the `source` field, but a label is a hint and not a defence. Your agent should treat every string as data and never as an instruction.
+
+## Check your key from a terminal
+
+The repo includes a small client that connects the way a real agent does and calls `find_show`. From `packages/agent`:
+
+```bash
+VASAL_AGENT_KEY=YOUR_KEY npx tsx scripts/mcp-smoke.ts --url https://api.vasal.site
+```
+
+It reads the key from the environment and never prints it.

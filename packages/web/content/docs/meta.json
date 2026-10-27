@@ -1,0 +1,23 @@
+{
+  "title": "Docs",
+  "pages": [
+    "index",
+    "getting-started",
+    "---Concepts---",
+    "how-it-works",
+    "why-qloo",
+    "without-qloo",
+    "---Guides---",
+    "book-guests",
+    "connect-your-agent",
+    "---Developers---",
+    "architecture",
+    "qloo-calls",
+    "api-and-mcp",
+    "---Proof and safety---",
+    "the-backtest",
+    "security-and-limits",
+    "---Help---",
+    "faq"
+  ]
+}

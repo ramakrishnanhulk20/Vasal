@@ -1,0 +1,88 @@
+---
+title: The backtest
+description: A pre-registered test of whether Qloo's guest fit score predicts how many views a podcast episode gets, with the result, the intervals and the limits.
+---
+
+Vasal ranks guests by Qloo's fit. The backtest tests whether that ranking means anything, by checking whether past guests with a higher fit to a show drew bigger audiences for their episodes. They did, by a small margin and consistently.
+
+## The question, fixed before the data
+
+The method was written down and committed on 19 Oct 2026, before our Qloo key existed and before any data was pulled. The commit is [52e208f](https://github.com/ramakrishnanhulk20/Vasal/commit/52e208f), so its git timestamp shows the method came first. Anything changed after that went into a change log in [the pre-registration](https://github.com/ramakrishnanhulk20/Vasal/blob/main/docs/backtest-preregistration.md), with the reason. That includes three fixes to the title reader made before the pull, and an entry about the two pull attempts, the first of which failed and wrote no data, that was added on 24 Oct, after the result was known.
+
+Two hypotheses were stated up front:
+
+- H1: within a show, episodes whose guest has a higher Qloo fit get more YouTube views, after adjusting for how long each episode has been online.
+- H2: H1 still holds after controlling for the guest's general fame, measured as Qloo's popularity percentile. This separates "a good fit for this audience" from "simply famous".
+
+## The result
+
+Across 755 episodes from 8 large podcasts, guests with a higher Qloo fit to the show drew more views. The link held when fame was controlled for, and it was positive in all 8 shows. Episodes whose guest sat in the top fifth by fit had 1.55 times the median adjusted views of episodes in the bottom fifth.
+
+| Test | Pooled Spearman correlation | 95% interval | Decision |
+| --- | --- | --- | --- |
+| H1: fit and age-adjusted views | 0.140 | 0.069 to 0.211 | Supported |
+| H2: the same, controlling for fame | 0.096 | 0.021 to 0.173 | Supported |
+
+"Supported" means the pooled correlation is above 0 and the lower end of its interval is above 0. That rule was written before the pull. Each show's correlation is pooled across shows with the Fisher z transform, weighted by the number of episodes minus 3. The intervals come from 10,000 bootstrap resamples of episodes within each show, with seed 20261019.
+
+The effect is small. A correlation of 0.14 means fit tilts the odds. It does not decide how big an episode's audience will be.
+
+### By show
+
+| Show | Episodes | Fit and views | Controlling for fame |
+| --- | --- | --- | --- |
+| Armchair Expert with Dax Shepard | 196 | 0.157 | 0.140 |
+| Call Her Daddy | 127 | 0.026 | 0.033 |
+| The Diary Of A CEO | 43 | 0.104 | 0.102 |
+| Club Shay Shay | 53 | 0.126 | 0.119 |
+| Conan O'Brien Needs A Friend | 62 | 0.222 | 0.056 |
+| This Past Weekend w/ Theo Von | 73 | 0.125 | 0.105 |
+| Impaulsive | 37 | 0.410 | 0.296 |
+| The Joe Rogan Experience | 164 | 0.132 | 0.049 |
+
+## How it was measured
+
+- Window: episodes published from 1 Oct 2024 to 31 Jul 2026, so every episode had been online at least 80 days when the data was pulled on 21 Oct 2026.
+- Eligible episodes: a full episode at least 20 minutes long with exactly one guest named in the title. Compilations, trailers, live Q&As and episodes with two or more guests are excluded and counted.
+- Guests: a language model reads each title and returns the guest's name. A name is kept only if it appears in that title. Each name is searched in Qloo as a person, and the top result is kept only if its name equals the extracted name.
+- Fit: Qloo's affinity for the guest's person entity, given the show's podcast entity as the signal. This is the same call the live product uses for its boards.
+- Views: YouTube view counts at the pull, adjusted within each show for the episode's age.
+- Shows: 12 shows were chosen by name before any data, and their YouTube channels were pinned by hand. A show stayed only if it matched one Qloo podcast and had at least 30 eligible episodes and 30 with a guest found in Qloo.
+
+## The sample
+
+Of the 12 pre-registered shows, 8 passed. Hot Ones and Good Hang with Amy Poehler matched no Qloo podcast by name. Flagrant matched two, and the rule excludes the show rather than picking one. SmartLess has no official full-episode YouTube channel. Club Shay Shay was cut short, because its 2,000 most recent uploads only reach back to February 2025.
+
+A hand check of 50 kept guests, drawn with seed 20261019, found 44 right, which is 88%. Five errors were Armchair Expert "Fact Check" episodes whose titles name an earlier guest, and one was a travel special where the reader named the co-host. We checked each against its title and the show's format. We did not watch the episodes.
+
+## Checks added after the fact
+
+These are labelled post-hoc and are not part of the pre-registered result.
+
+- Without the misread episodes: dropping all 70 Fact Check episodes and the 2 travel specials leaves 683 episodes. H1 is 0.149 (0.070 to 0.226) and H2 is 0.100 (0.017 to 0.184). Both are still supported.
+- Repeat guests: the 755 episodes have 603 distinct guests, counting each show's guests separately. Resampling guests instead of episodes gives intervals of 0.065 to 0.211 for H1 and 0.020 to 0.167 for H2. With one row per guest, H1 is 0.153 and H2 is 0.111. Both verdicts stand. H2's lower end, 0.020, is close to 0.
+
+## What this does not show
+
+- Causation: Qloo learns from what audiences consume together, so a hit episode may itself strengthen the link between a guest and a show. Controlling for fame does not remove that.
+- Audio downloads: YouTube views are not podcast downloads, and many listeners never use YouTube.
+- Smaller shows: these 8 are among the largest podcasts. Mid-size shows, which are the hosts Vasal is built for, may behave differently.
+- Every guest: episodes whose guest is not named in the title, or is not in Qloo, are missing. The drop counts in the results file show how many.
+
+## Reproduce it
+
+The dataset holds Qloo responses, and Qloo's terms keep those out of public repositories, so it is not published. The code is in `packages/agent/src/backtest`.
+
+- `npm run backtest -w packages/agent -- --dry-run` prints the plan and every rule, with no keys.
+- With `QLOO_API_KEY`, `ANTHROPIC_API_KEY` and `YOUTUBE_API_KEY` set, `npm run backtest -w packages/agent -- --dev-db` pulls and analyses. It costs about 900 Qloo calls.
+- `npm run backtest -w packages/agent -- --analyse <dataset.json>` recomputes the pre-registered results from a stored dataset.
+- `npm run backtest:robustness -w packages/agent -- <dataset.json>` recomputes the two post-hoc checks.
+- The 44 of 50 precision figure is a hand check, so no script recomputes it.
+
+A fresh pull will come out slightly different, because view counts keep moving.
+
+## Read more
+
+- [The proof page](/proof) shows these numbers, and the [home page](/#without-qloo) shows the Without Qloo comparison.
+- [The pre-registration](https://github.com/ramakrishnanhulk20/Vasal/blob/main/docs/backtest-preregistration.md) on GitHub.
+- [The full results](https://github.com/ramakrishnanhulk20/Vasal/blob/main/docs/backtest-results.md) on GitHub, with the timeline and the drop counts.

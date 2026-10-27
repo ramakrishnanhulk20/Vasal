@@ -316,7 +316,6 @@ describe("POST /agent-keys", () => {
     for (const path of ["/agent-keys/", "/AGENT-KEYS", "/agent-keysx", "/agent-keys/x"]) {
       expect((await ask(app, { turnstileToken: "tok" }, {}, path)).status, path).toBe(404);
     }
-    expect((await app.request("/agent-keys")).status).toBe(404);
     expect(verify).not.toHaveBeenCalled();
 
     const preflight = await app.request("/agent-keys", {
@@ -325,5 +324,34 @@ describe("POST /agent-keys", () => {
     });
     expect(preflight.headers.get("access-control-allow-origin")).toBe(APP_ORIGIN);
     expect(preflight.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+});
+
+describe("GET /agent-keys", () => {
+  it("states whether keys are open and each key's limits, changing nothing, with an unreadable flag read as closed", async () => {
+    const { app, verify } = build();
+    const before = await snapshot();
+    const open = await app.request("/agent-keys");
+    expect(open.status).toBe(200);
+    expect(open.headers.get("cache-control")).toBe("public, max-age=30");
+    expect(await open.json()).toEqual({
+      open: true,
+      limits: { runsPerDay: 3, findsPerDay: 20, briefsPerDay: 15, inflightPerKey: 3, keyLifeDays: 30, keysPerVisitorPerDay: 3 },
+    });
+
+    await setFlag(db, MCP_ENABLED_FLAG, false);
+    expect(((await (await app.request("/agent-keys")).json()) as { open: boolean }).open).toBe(false);
+
+    const flagFails: Db = {
+      query: () => Promise.reject(new StoreError("STORE_UNAVAILABLE")),
+      transaction: (fn) => db.transaction(fn),
+      close: async () => {},
+    };
+    const unreadable = await build({ db: flagFails }).app.request("/agent-keys");
+    expect(unreadable.status).toBe(200);
+    expect(((await unreadable.json()) as { open: boolean }).open).toBe(false);
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(await snapshot()).toBe(before);
   });
 });

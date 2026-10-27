@@ -8,7 +8,8 @@
 // functions main.ts wires in, that a run with trends off spends no trend
 // call, and that a past guest the feed names, a host any of the show's names
 // holds, a person the fit answer says has died, and a find_person pick under
-// the fit floor never reach the board, and that the run's time cap counts from
+// the fit floor never reach the board, that the fill never asks again about a
+// pick Qloo said has no audience data for, and that the run's time cap counts from
 // confirm with every Qloo call after it carrying the deadline's signal. It also
 // covers the "Without Qloo" flip the runner adds after the board: its stored and
 // streamed event, its best-effort failure and the publisher rule for its prompt.
@@ -606,6 +607,42 @@ describe("continueRun (C1.5, C6.4)", () => {
     const fitCall = ops.findIndex((op) => op.op === "insights" && op.resultEntities !== undefined);
     expect(ops.slice(fitCall + 1).some((op) => JSON.stringify(op).includes(personId(2)))).toBe(false);
     expect(labelsIn(await listEventsAfter(db, runId, 0))).toContain("Scored 2 guests against this show's listeners");
+  });
+
+  it("never sends a pick Qloo said has no audience data for back for another audience check, so the checks left reach the other picks", async () => {
+    const { qloo, ops } = editedQloo((op, data) => (op.op === "demographics" && op.signalEntities[0] === personId(1) ? [] : data));
+    const { model: scripted } = fakeModel(BRIEF);
+    // Research checks person 1 once and person 2 seven times, leaving 2 of
+    // the 10 audience checks for the fill.
+    const asks = [1, 2, 2, 2, 2, 2, 2, 2];
+    const model: ModelClient = {
+      ...scripted,
+      async turn(params, options) {
+        const reply = await scripted.turn(params, options);
+        const content = reply.content.flatMap((block): typeof reply.content =>
+          block.type === "tool_use" && block.name === "recent_episode_titles"
+            ? asks.map((n, index) => ({ ...block, id: `a${index}`, name: "audience_of", input: { personId: personId(n) } }))
+            : [block],
+        );
+        return { ...reply, content };
+      },
+    };
+    const input: RunInput = { show: "Synthetic Show", exclude: [] };
+    const runId = await createRun(db, input, NOW);
+    const agent = createAgentRunner({ db, ...sameForBoth(model, qloo), feeds: fakeFeeds().feeds, trends: true, now: () => NOW });
+    await agent.startRun(runId, input);
+
+    await agent.continueRun(runId, await confirmFirst(runId));
+
+    expect((await getRun(db, runId))?.status).toBe("done");
+    const asked = (n: number) => ops.filter((op) => op.op === "demographics" && op.signalEntities[0] === personId(n)).length;
+    expect(PICKS.map(asked)).toEqual([1, 7, 1, 1]);
+    const board = (await listBoard(db, runId)).map((item) => item.data as { personId: string; bringsNew: unknown });
+    expect(board.find((entry) => entry.personId === personId(1))?.bringsNew).toBeNull();
+    expect(board.find((entry) => entry.personId === personId(4))?.bringsNew).toMatchObject({ label: "listeners 25 to 29" });
+    const labels = labelsIn(await listEventsAfter(db, runId, 0));
+    expect(labels.filter((label) => label === "Qloo has no audience data for Synthetic Person 1")).toHaveLength(1);
+    expect(labels.some((label) => label.startsWith("Reached this run's limit"))).toBe(false);
   });
 
   it("keeps a pick only find_person returned when its fit reaches the floor, and fills it, and drops one below with no fill (G18)", async () => {
