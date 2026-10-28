@@ -2,7 +2,7 @@
 
 Written at the architecture gate, before any code. Section C is the acceptance criteria. Each invariant states an outcome and how to show it holds, and the build is not done until each one can be pointed to in the code.
 
-Note on sources: the reviewed design looked a show up through the Podcast Index API. The build uses Apple's iTunes Search API instead (DECISIONS.md, 16 Oct 2026). It has the same property: podcasters register their own feed URLs. So every rule below that names Podcast Index applies to the iTunes lookup unchanged.
+Note on sources: the reviewed design looked a show up through the Podcast Index API. The build uses Apple's iTunes Search API instead (decided on 16 Oct 2026). It has the same property: podcasters register their own feed URLs. So every rule below that names Podcast Index applies to the iTunes lookup unchanged.
 
 ## Data flows referred to below
 
@@ -523,7 +523,7 @@ D6 New tables
    - knowing who a token belongs to
    - compromise of the caller's agent, client or model provider, or of the MCP SDK (pinned in the lockfile)
 
-### Facts to verify for section D
+### Open questions for section D
 - How SDK 1.32.1 handles each of these:
   - a thrown tool error
   - batch arrays
@@ -535,9 +535,9 @@ D6 New tables
 - Whether Qloo's terms allow returning Qloo-derived board data to third parties through an API (A13, A23).
 - Settled on 19 Oct: the agent loop does not call YouTube; only the offline backtest does.
 
-## Facts to verify before a work order cites them
+## Open questions
 
-These come from the reviewer's own knowledge, not from a document read in this project:
+These were noted before the build from general knowledge, not from a document. The build has since settled two: the client-address header (Railway's edge sets X-Real-IP and replaces one a client writes; `npm run prove` shows it on the agent-key route) and Qloo data in the repository (only aggregates are published; see C7.3). The rest stay open:
 - YouTube's default daily quota and the unit cost of each call
 - which client-IP header Vercel and Fly or Railway set, and whether a client can spoof it
 - whether Fly and Railway private networks use IPv6 unique-local addresses

@@ -3,8 +3,8 @@
 // matter, the real verifier on a fake siteverify. It does not cover the real
 // Turnstile call or a real socket (the live dev smoke does), Cloudflare
 // refusing a replayed answer (siteverify's own job), races between separate
-// database connections (PGlite has one), or the MCP route that will accept
-// these keys (the next work order).
+// database connections (PGlite has one), or the MCP route that accepts
+// these keys (mcp-server.test.ts).
 import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

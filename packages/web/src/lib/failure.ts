@@ -11,6 +11,8 @@ const REASONS: Record<string, string> = {
   QLOO_BUDGET: BUDGET,
   CONFIRM_EXPIRED: "This run waited too long to be confirmed. Start again from the home page.",
   SERVER_RESTART: "The server restarted during this run. Start it again.",
+  AGENT_NOT_READY:
+    "The agent isn't switched on for this server. Running it yourself? Add the Qloo and Anthropic keys to .env and restart the agent server.",
 };
 
 const DEFAULT_REASON = "This run stopped before it finished.";

@@ -1,11 +1,11 @@
 "use client";
 
 import { Fragment, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent } from "react";
+import type { KeyboardEvent, RefObject } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { CopyButton } from "@/components/agents/CopyButton";
 import { PLACEHOLDER_KEY, snippetsFor } from "@/components/agents/snippets";
-import type { Block } from "@/components/agents/snippets";
+import type { Block, Snippet } from "@/components/agents/snippets";
 import { API_BASE } from "@/lib/api";
 import { KICKER } from "@/lib/textStyles";
 
@@ -37,30 +37,23 @@ function WithKey({ text, apiKey }: { text: string; apiKey: string | null }) {
 function CodeBlock({
   block,
   apiKey,
-  onCopied,
+  preRef,
 }: {
   block: Block;
   apiKey: string | null;
-  onCopied: (copiedText: string) => void;
+  preRef: RefObject<HTMLPreElement | null>;
 }) {
   return (
-    <div className="relative">
-      <div className={`${BOX} overflow-x-auto py-[18px] pl-5 pr-[80px]`}>
-        <pre className="m-0 w-max font-mono text-[13px] leading-[1.7] text-rice">
-          <WithKey text={block.text} apiKey={apiKey} />
-        </pre>
-      </div>
-      <CopyButton
-        text={block.text}
-        label="Copy"
-        accessibleName={block.accessibleName}
-        onCopied={onCopied}
-        className="absolute right-3 top-3"
-      />
+    <div className={`${BOX} overflow-x-auto px-5 py-[18px]`}>
+      <pre ref={preRef} className="m-0 w-max font-mono text-[13px] leading-[1.7] text-rice">
+        <WithKey text={block.text} apiKey={apiKey} />
+      </pre>
     </div>
   );
 }
 
+// The button shares the row with the label, so it never sits over the value.
+// On a phone the value drops to a line of its own and scrolls sideways there.
 function ValueRow({
   block,
   apiKey,
@@ -70,24 +63,68 @@ function ValueRow({
   apiKey: string | null;
   onCopied: (copiedText: string) => void;
 }) {
+  const value = useRef<HTMLSpanElement>(null);
   return (
-    <div className="relative">
-      <div className={`${BOX} flex items-baseline py-[18px] pl-5 pr-[80px]`}>
-        <span className="min-w-[112px] shrink-0 pr-3 font-mono text-[12px] text-rice-dim">
-          {block.label}
-        </span>
-        <span className="min-w-0 flex-1 overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.7] text-rice">
-          <WithKey text={block.text} apiKey={apiKey} />
-        </span>
-      </div>
+    <div
+      className={`${BOX} grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2 py-[14px] pl-5 pr-3 md:grid-cols-[112px_minmax(0,1fr)_auto]`}
+    >
+      <span className="col-start-1 row-start-1 font-mono text-[12px] text-rice-dim">
+        {block.label}
+      </span>
+      <span
+        ref={value}
+        className="col-span-2 row-start-2 min-w-0 overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.7] text-rice md:col-span-1 md:col-start-2 md:row-start-1"
+      >
+        <WithKey text={block.text} apiKey={apiKey} />
+      </span>
       <CopyButton
         text={block.text}
+        shown={value}
         label="Copy"
         accessibleName={block.accessibleName}
         onCopied={onCopied}
-        className="absolute right-3 top-3"
+        className="col-start-2 row-start-1 md:col-start-3"
       />
     </div>
+  );
+}
+
+// A snippet's one code block has its Copy button in the instruction line's
+// row. The Claude app tab has no code block, only labelled rows.
+function SnippetPanel({
+  snippet,
+  apiKey,
+  onCopied,
+}: {
+  snippet: Snippet;
+  apiKey: string | null;
+  onCopied: (copiedText: string) => void;
+}) {
+  const codeRef = useRef<HTMLPreElement>(null);
+  const code = snippet.blocks.find((block) => block.label === undefined);
+  const rows = snippet.blocks.filter((block) => block.label !== undefined);
+  return (
+    <>
+      <div className="flex items-start gap-4">
+        <p className="min-w-0 flex-1 font-body text-[14px] text-rice-dim">{snippet.line}</p>
+        {code && (
+          <CopyButton
+            text={code.text}
+            shown={codeRef}
+            label="Copy"
+            accessibleName={code.accessibleName}
+            onCopied={onCopied}
+            className="shrink-0"
+          />
+        )}
+      </div>
+      <div className="mt-3 flex flex-col gap-[10px]">
+        {code && <CodeBlock block={code} apiKey={apiKey} preRef={codeRef} />}
+        {rows.map((row) => (
+          <ValueRow key={row.label} block={row} apiKey={apiKey} onCopied={onCopied} />
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -167,16 +204,7 @@ export function SetupTabs({
             exit={{ opacity: 0 }}
             transition={{ duration: reduce ? 0 : 0.2 }}
           >
-            <p className="font-body text-[14px] text-rice-dim">{snippet.line}</p>
-            <div className="mt-3 flex flex-col gap-[10px]">
-              {snippet.blocks.map((block) =>
-                block.label === undefined ? (
-                  <CodeBlock key={block.accessibleName} block={block} apiKey={apiKey} onCopied={onCopied} />
-                ) : (
-                  <ValueRow key={block.label} block={block} apiKey={apiKey} onCopied={onCopied} />
-                ),
-              )}
-            </div>
+            <SnippetPanel snippet={snippet} apiKey={apiKey} onCopied={onCopied} />
           </motion.div>
         </AnimatePresence>
       </div>

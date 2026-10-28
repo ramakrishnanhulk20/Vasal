@@ -1,6 +1,15 @@
 "use client";
 
-import { Component, Suspense, use, useId, useSyncExternalStore, type ReactNode } from "react";
+import {
+  Component,
+  Suspense,
+  use,
+  useCallback,
+  useId,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 
 // Mapped to the site's night palette. Dark only: the docs have no light theme.
 const THEME_VARIABLES = {
@@ -99,9 +108,10 @@ Object.assign(DiagramBoundary, { getDerivedStateFromError: () => ({ failed: true
 
 // Shrinks a wide diagram to the box, but never below the scale at which its
 // labels stay readable; past that it scrolls sideways inside the box.
+// `onOverflow` is told whether the diagram still runs wider than the box.
 const MIN_SCALE = 0.72;
 
-function fitToBox(box: HTMLDivElement): () => void {
+function fitToBox(box: HTMLDivElement, onOverflow: (wider: boolean) => void): () => void {
   const svg = box.querySelector("svg");
   if (!svg) return () => {};
   const natural = svg.viewBox.baseVal?.width || svg.getBoundingClientRect().width;
@@ -110,6 +120,8 @@ function fitToBox(box: HTMLDivElement): () => void {
     const scale = Math.min(1, Math.max(MIN_SCALE, room / natural));
     svg.style.width = `${Math.round(natural * scale)}px`;
     svg.style.height = "auto";
+    // One pixel of slack, because the width is rounded.
+    onOverflow(box.scrollWidth > box.clientWidth + 1);
   };
   fit();
   const observer = new ResizeObserver(fit);
@@ -121,17 +133,21 @@ function Drawing({ chart }: { chart: string }) {
   const id = useId();
   const mermaid = use(loadMermaid());
   const { svg, bindFunctions } = use(cached(charts, chart, () => mermaid.render(id, chart)));
+  const [wider, setWider] = useState(false);
+  const attach = useCallback(
+    (box: HTMLDivElement | null) => {
+      if (!box) return;
+      bindFunctions?.(box);
+      return fitToBox(box, setWider);
+    },
+    [bindFunctions],
+  );
 
   return (
-    <div
-      className="docs-diagram"
-      ref={(box) => {
-        if (!box) return;
-        bindFunctions?.(box);
-        return fitToBox(box);
-      }}
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <>
+      <div className="docs-diagram" ref={attach} dangerouslySetInnerHTML={{ __html: svg }} />
+      {wider && <p className="docs-diagram-hint">Scroll sideways for the rest of the diagram.</p>}
+    </>
   );
 }
 

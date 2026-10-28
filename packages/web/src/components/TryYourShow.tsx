@@ -95,10 +95,13 @@ export function TryYourShow({
   const widgetRef = useRef<HTMLDivElement>(null);
   const widgetId = useRef<string | null>(null);
   const noticeRef = useRef<HTMLDivElement>(null);
+  const closed = !liveRuns || refusal === CLOSED;
 
+  // No check is loaded while runs are closed, so nobody solves one for a run
+  // that cannot start.
   useEffect(() => {
     const container = widgetRef.current;
-    if (!container) return;
+    if (closed || !container) return;
     let cancelled = false;
 
     loadTurnstile()
@@ -121,9 +124,7 @@ export function TryYourShow({
       if (widgetId.current !== null) window.turnstile?.remove(widgetId.current);
       widgetId.current = null;
     };
-  }, []);
-
-  const closed = !liveRuns || refusal === CLOSED;
+  }, [closed]);
 
   useEffect(() => {
     if (refusal === CLOSED) noticeRef.current?.focus();
@@ -175,23 +176,25 @@ export function TryYourShow({
               placeholder="Show name, Apple Podcasts link or RSS feed"
               className="w-full border-0 border-b border-rule bg-transparent py-[18px] font-display text-[length:clamp(1.5rem,2.6vw,2.25rem)] font-[350] text-rice outline-none transition-[border-color] duration-200 placeholder:text-rice-dim focus:border-rice"
             />
-            <div className="mt-7 flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
-              <div className="md:min-w-[300px] md:flex-1">
-                <div ref={widgetRef} data-action="run_start" />
-                {USING_TEST_KEY && (
-                  <p className="mt-2 font-mono text-[11px] text-rice-dim">
-                    Test human check: local only.
-                  </p>
-                )}
+            {!closed && (
+              <div className="mt-7 flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
+                <div className="md:min-w-[300px] md:flex-1">
+                  <div ref={widgetRef} data-action="run_start" />
+                  {USING_TEST_KEY && (
+                    <p className="mt-2 font-mono text-[11px] text-rice-dim">
+                      Test human check: local only.
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={!ready || starting}
+                  className={`${PRIMARY_BUTTON} shrink-0 disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0 disabled:hover:brightness-100`}
+                >
+                  {starting ? "Starting..." : "Find my guests"}
+                </button>
               </div>
-              <button
-                type="submit"
-                disabled={!ready || starting}
-                className={`${PRIMARY_BUTTON} shrink-0 disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0 disabled:hover:brightness-100`}
-              >
-                {starting ? "Starting..." : "Find my guests"}
-              </button>
-            </div>
+            )}
             {refusal !== null && refusal !== CLOSED && (
               <p aria-live="polite" className="mt-4 max-w-[52ch] font-body text-[15px] text-rice">
                 {refusal}
@@ -206,7 +209,7 @@ export function TryYourShow({
                 ref={noticeRef}
                 tabIndex={-1}
                 aria-live="polite"
-                className="mt-[18px] max-w-[52ch] rounded-lg border border-rule bg-night-2 px-[18px] py-4 font-body text-[15px] text-rice outline-none"
+                className="mt-7 max-w-[52ch] rounded-lg border border-rule bg-night-2 px-[18px] py-4 font-body text-[17px] text-rice outline-none"
               >
                 {boardCount === null ? (
                   "Live runs open on 30 October, when judging starts."

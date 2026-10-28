@@ -7,16 +7,22 @@ import type { Step } from "@/lib/runPage";
 const EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
 // Rows that enter together cascade; rows far down the list start a new cascade.
 const BATCH = 12;
+// Saved boards still carry this older label for two different causes.
+const OLD_AUDIENCE_LABEL = "Could not check an audience";
 
 export function StepsList({ steps }: { steps: Step[] }) {
   const reduce = useReducedMotion() ?? false;
+  const hasOldLabel = steps.some((step) => step.label === OLD_AUDIENCE_LABEL);
   return (
     <section className="mt-[18vh] grid grid-cols-12">
       <div className="col-span-12 md:col-span-8">
         <p className={KICKER}>HOW THIS BOARD WAS MADE</p>
         <h2 className={`mt-5 ${SECTION_TITLE}`} style={SOFT_100}>
-          {`${steps.length} steps, each a real call.`}
+          {`${steps.length} steps, in the order they ran.`}
         </h2>
+        <p className="mt-5 max-w-[60ch] font-body text-[16px] leading-[1.6] text-rice-dim">
+          {`The agent looks into more people than it picks, so some names here are not on the board.`}
+        </p>
         <ol className="mt-10 divide-y divide-rule">
           {steps.map((step, index) => (
             <motion.li
@@ -46,6 +52,11 @@ export function StepsList({ steps }: { steps: Step[] }) {
             </motion.li>
           ))}
         </ol>
+        {hasOldLabel && (
+          <p className="mt-6 max-w-[60ch] font-body text-[14px] leading-[1.6] text-rice-dim">
+            {`"${OLD_AUDIENCE_LABEL}" means Qloo had no audience data for that person, or the run had used its 10 audience checks. Neither is an error, and newer runs name which one it was.`}
+          </p>
+        )}
       </div>
     </section>
   );

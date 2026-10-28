@@ -70,6 +70,7 @@ function KeyBlock({
 }) {
   const reduce = useReducedMotion() ?? false;
   const ref = useRef<HTMLDivElement>(null);
+  const keyText = useRef<HTMLDivElement>(null);
 
   // The button that asked for the key is gone by now, so focus lands here.
   useEffect(() => {
@@ -93,11 +94,15 @@ function KeyBlock({
         {`Shown once. Vasal keeps only a scrambled fingerprint of it, so it can't show it to you again.`}
       </p>
       <div className="relative mt-4">
-        <div className="break-all rounded-lg border border-rule bg-night py-4 pl-[18px] pr-24 font-mono text-[15px] text-rice">
+        <div
+          ref={keyText}
+          className="break-all rounded-lg border border-rule bg-night py-4 pl-[18px] pr-32 font-mono text-[15px] text-rice"
+        >
           {issued.token}
         </div>
         <CopyButton
           text={issued.token}
+          shown={keyText}
           label="Copy key"
           onCopied={onCopied}
           className="absolute right-3 top-3"

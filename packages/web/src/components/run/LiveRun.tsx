@@ -355,8 +355,7 @@ export function LiveRun({
               {clock(elapsed)}
             </p>
             <p className="mt-5 max-w-[40ch] font-body text-[17px] leading-[1.6] text-rice-dim">
-              Usually about a minute. Every step below is a real call to Qloo, the feed or the
-              model.
+              {`Usually about a minute. Every step below is the agent's own work as it happens: its calls to Qloo, the feed and the model, and any limit it reaches.`}
             </p>
           </div>
           <div className="col-span-12 md:col-span-6">

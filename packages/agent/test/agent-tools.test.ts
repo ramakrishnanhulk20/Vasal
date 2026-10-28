@@ -4,7 +4,7 @@
 // carry no ids or upstream text, the trends switch, past guests left out
 // of people lists, and shared tags dropped for their family, words or length
 // before they are stored. It does not cover
-// the model loop or the Anthropic client (next work order), the real cache
+// the model loop or the Anthropic client (agent-loop and agent-model tests), the real cache
 // and meter (see
 // qloo-metered.test.ts), or real Qloo response shapes. All data is synthetic.
 import { describe, expect, it } from "vitest";

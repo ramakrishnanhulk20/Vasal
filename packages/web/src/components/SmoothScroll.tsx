@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import { usePathname } from "next/navigation";
 import Lenis from "lenis";
 import "lenis/dist/lenis.css";
 
@@ -8,6 +9,10 @@ import "lenis/dist/lenis.css";
 const NAV_OFFSET = -72;
 
 export function SmoothScroll() {
+  const pathname = usePathname();
+  const lenisRef = useRef<Lenis | null>(null);
+  const lastPath = useRef(pathname);
+
   useEffect(() => {
     const query = window.matchMedia("(prefers-reduced-motion: reduce)");
     let lenis: Lenis | null = null;
@@ -19,6 +24,7 @@ export function SmoothScroll() {
       } else if (!lenis) {
         lenis = new Lenis({ duration: 1.1, smoothWheel: true, autoRaf: true });
       }
+      lenisRef.current = lenis;
     };
 
     // Without Lenis this does nothing, so the browser makes its normal jump.
@@ -42,8 +48,21 @@ export function SmoothScroll() {
       query.removeEventListener("change", sync);
       document.removeEventListener("click", onClick);
       lenis?.destroy();
+      lenisRef.current = null;
     };
   }, []);
+
+  // A page on a new path opens at its top. Lenis keeps its own scroll target,
+  // so a glide still running from the old page would carry on and land at the
+  // bottom of the new one. A hash is left to the router, and a change that
+  // keeps the path (the board's guest in the address) never gets here.
+  useEffect(() => {
+    if (lastPath.current === pathname) return;
+    lastPath.current = pathname;
+    if (window.location.hash) return;
+    if (lenisRef.current) lenisRef.current.scrollTo(0, { immediate: true, force: true });
+    else window.scrollTo(0, 0);
+  }, [pathname]);
 
   return null;
 }

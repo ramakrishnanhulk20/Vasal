@@ -288,10 +288,13 @@ export function RunBoard({
                       className="font-display text-[length:clamp(1.75rem,2.6vw,2.5rem)] font-[350] leading-[1.02] tracking-[-0.015em] text-rice"
                       style={SOFT_100}
                     >
-                      {`${already} of ${guesses.length} of these had already been on the show.`}
+                      {`${already} of these ${guesses.length} had already been on the show.`}
                     </h2>
                     <p className="mt-[18px] font-body text-[18px] leading-[1.6] text-rice-dim">
                       {`We asked the same model for guests with no Qloo data. Each guess was scored by Qloo and checked against the show's episode history, the same way as the board.`}
+                    </p>
+                    <p className="mt-[18px] font-body text-[18px] leading-[1.6] text-rice-dim">
+                      {`Their fit can be high. People who have been on a show are often the ones its listeners love most, which is why Vasal leaves past guests out.`}
                     </p>
                   </div>
                 )}

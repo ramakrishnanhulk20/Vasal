@@ -1,6 +1,7 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useRef } from "react";
+import type { ReactNode, RefObject } from "react";
 import type { BriefState } from "@/lib/brief";
 import { COPY_BUTTON } from "@/lib/buttonStyle";
 import type { RunGuest } from "@/lib/runPage";
@@ -9,16 +10,22 @@ import { useCopy } from "@/lib/useCopy";
 const LABEL = "font-mono text-xs uppercase tracking-[0.14em] text-rice-dim";
 const PARAGRAPH = "mt-3 font-body text-[18px] leading-[1.6] text-rice";
 
-function CopyPitchButton({ text }: { text: string }) {
-  const { copied, copy } = useCopy();
+function CopyPitchButton({
+  text,
+  shown,
+}: {
+  text: string;
+  shown: RefObject<HTMLDivElement | null>;
+}) {
+  const { copied, blocked, copy } = useCopy();
   return (
     <button
       type="button"
-      onClick={() => copy(text)}
+      onClick={() => copy(text, shown.current)}
       aria-live="polite"
       className={`absolute right-3 top-3 ${COPY_BUTTON}`}
     >
-      {copied ? "Copied" : "Copy pitch"}
+      {copied ? "Copied" : blocked ? "Copy blocked" : "Copy pitch"}
     </button>
   );
 }
@@ -38,6 +45,7 @@ export function BriefBody({
   state: BriefState;
   writer?: ReactNode;
 }) {
+  const pitch = useRef<HTMLDivElement>(null);
   const fit = guest.fitKnown ? `${Math.round(guest.fit * 100)}% fit` : "Fit not scored";
   return (
     <div>
@@ -73,12 +81,15 @@ export function BriefBody({
             <div className="relative mt-3 rounded-lg border border-rule bg-night-2 px-6 py-[22px]">
               <CopyPitchButton
                 text={`Subject: ${state.brief.pitchSubject}\n\n${state.brief.pitchBody}`}
+                shown={pitch}
               />
               <p className={LABEL}>SUBJECT</p>
-              <p className="mt-2 font-body text-[16px] text-rice">{state.brief.pitchSubject}</p>
-              <p className="mt-[18px] whitespace-pre-wrap font-body text-[16px] leading-[1.65] text-rice">
-                {state.brief.pitchBody}
-              </p>
+              <div ref={pitch}>
+                <p className="mt-2 font-body text-[16px] text-rice">{state.brief.pitchSubject}</p>
+                <p className="mt-[18px] whitespace-pre-wrap font-body text-[16px] leading-[1.65] text-rice">
+                  {state.brief.pitchBody}
+                </p>
+              </div>
             </div>
             <p className="mt-4 font-mono text-[11px] text-rice-dim">
               AI DRAFT. EVERY NUMBER AND NAME IS FILLED IN BY CODE FROM QLOO; READ IT BEFORE YOU

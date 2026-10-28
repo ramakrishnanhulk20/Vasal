@@ -204,6 +204,15 @@ body {
   color: var(--color-fd-muted-foreground);
 }
 
+/* Sits right under a diagram that is wider than its box. */
+.docs-diagram-hint {
+  margin: -16px 0 24px;
+  font-family: var(--font-docs-mono), ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-fd-muted-foreground);
+}
+
 .docs-diagram .docs-diagram-source {
   align-self: stretch;
   margin: 0;

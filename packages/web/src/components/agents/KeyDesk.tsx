@@ -55,7 +55,6 @@ export function KeyDesk({ desk }: { desk: KeyDeskState | null }) {
         <p className="mt-5 max-w-[40ch] font-body text-[18px] leading-[1.6] text-rice-dim">
           {`Vasal is a remote MCP server. With a key, any agent that speaks MCP can find a show, build a guest board from Qloo's taste data and write a brief, with the same checks the site uses.`}
         </p>
-        {desk !== null && <LimitsList limits={desk.limits} />}
         <div className="mt-9">
           {issued !== null ? (
             <p className="font-body text-[15px] text-rice-dim">
@@ -64,9 +63,10 @@ export function KeyDesk({ desk }: { desk: KeyDeskState | null }) {
           ) : paused ? (
             <PausedNotice takeFocus={pausedByServer} />
           ) : (
-            <KeyForm onIssued={keyIssued}onPaused={() => setPausedByServer(true)} />
+            <KeyForm onIssued={keyIssued} onPaused={() => setPausedByServer(true)} />
           )}
         </div>
+        {desk !== null && <LimitsList limits={desk.limits} />}
       </div>
       <div className="min-w-0 md:col-span-6 md:col-start-7">
         <DeskPanel issued={issued} onCopied={markCopied} />

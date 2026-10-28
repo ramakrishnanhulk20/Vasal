@@ -3,7 +3,7 @@
 // functions that the ops script calls, and the app role's grants on
 // mcp_tokens (roles.sql applied to PGlite). It does not cover the key-issue
 // route (server-keys.test.ts), races between separate connections (PGlite
-// has one), or the MCP route that will read the header (the next work order).
+// has one), or the MCP route that reads the header (mcp-server.test.ts).
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

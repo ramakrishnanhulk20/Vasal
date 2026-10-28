@@ -22,7 +22,7 @@ const LIMITS = [
 
 export function Limits() {
   return (
-    <section className="mt-[18vh]">
+    <section id="limits" className="mt-[18vh]">
       <Reveal>
         <p className={KICKER}>WHAT THIS DOES NOT SHOW</p>
       </Reveal>

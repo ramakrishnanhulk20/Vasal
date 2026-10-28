@@ -2,8 +2,8 @@
 // role's grants on them and on MCP's in-flight share (roles.sql applied to
 // PGlite). It does not cover races between separate connections (PGlite has
 // one, so simultaneous calls are serialised and this proves the
-// single-statement cap), the MCP tools that will spend these counts (the
-// next work order), or pruning old rows (ops-prune.test.ts).
+// single-statement cap), the MCP tools that spend these counts
+// (mcp-tools.test.ts), or pruning old rows (ops-prune.test.ts).
 import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { issueToken } from "../src/mcp/tokens.js";

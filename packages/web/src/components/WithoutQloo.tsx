@@ -18,6 +18,9 @@ function fitLabel(fit: number | null, fitKnown: boolean): string {
 }
 
 // Writes straight into the text node so the count never re-renders React.
+// The page is sent with the final value, and the number stays at it until the
+// count is about to be seen, so a reader that never scrolls still gets the real
+// figure.
 function CountUp({ value }: { value: number }) {
   const ref = useRef<HTMLSpanElement>(null);
 
@@ -28,14 +31,27 @@ function CountUp({ value }: { value: number }) {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
 
     let frame = 0;
-    text.nodeValue = "0";
-    const observer = new IntersectionObserver(
+    let counting = false;
+    // Drops the number to 0 just before it scrolls in, so the final value is
+    // never on screen for a frame ahead of the count.
+    const approach = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        observer.disconnect();
-        const start = performance.now();
+        approach.disconnect();
+        if (!counting) text.nodeValue = "0";
+      },
+      { rootMargin: "0px 0px 25% 0px" },
+    );
+    const visible = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        visible.disconnect();
+        approach.disconnect();
+        counting = true;
+        text.nodeValue = "0";
+        const begun = performance.now();
         const tick = (now: number) => {
-          const progress = Math.min(1, (now - start) / COUNT_UP_MS);
+          const progress = Math.min(1, (now - begun) / COUNT_UP_MS);
           text.nodeValue = String(Math.round(value * (1 - (1 - progress) ** 3)));
           if (progress < 1) frame = requestAnimationFrame(tick);
         };
@@ -43,10 +59,12 @@ function CountUp({ value }: { value: number }) {
       },
       { threshold: 0.4 },
     );
-    observer.observe(node);
+    approach.observe(node);
+    visible.observe(node);
 
     return () => {
-      observer.disconnect();
+      approach.disconnect();
+      visible.disconnect();
       cancelAnimationFrame(frame);
       text.nodeValue = String(value);
     };
@@ -198,7 +216,7 @@ export function WithoutQloo({ proof }: { proof: Proof }) {
           {guessesTotal}
         </p>
         <p className="col-span-12 mt-6 max-w-[30ch] font-body text-[18px] leading-[1.6] text-rice-dim md:col-span-5 md:col-start-8 md:mt-0 md:[align-self:last_baseline]">
-          {`We asked the same model for guests with no Qloo data, for the ${runs.length} shows on this page. That many of its guesses had already been on the show or host it.`}
+          {`We asked the same model for guests with no Qloo data, for the ${runs.length} shows on this page. ${alreadyOnShow} of its ${guessesTotal} guesses had already been on the show or hosted it.`}
         </p>
         <div
           role="group"

@@ -33,7 +33,7 @@ const OUTPUT_FILE = fileURLToPath(new URL("../../web/src/published/backtest.json
 const MAX_DATASET_BYTES = 256 * 1024 * 1024;
 const MAX_RESULT_BYTES = 16 * 1024 * 1024;
 
-// The head chef's hand check of the 50-row precision sample, published in
+// The hand check of the 50-row precision sample, published in
 // docs/backtest-results.md ("44 of the 50 were right"). It cannot be
 // computed from the dataset.
 const PRECISION = { checked: 50, correct: 44 };

@@ -3,7 +3,7 @@
 // shape rules (one ring per guest, one joined line, every segment once, only
 // ids and path data as text) over many seeded boards. It does not cover the
 // routes that send a kolam (server-app.test.ts), how a browser draws the
-// paths, or speed, which the work order measures outside the suite.
+// paths, or speed.
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 

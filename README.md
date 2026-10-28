@@ -8,7 +8,7 @@ We help podcast hosts book the guests their listeners already love, and the ones
 
 Vasal is the doorway of a Tamil home, where a kolam is drawn each morning to welcome guests.
 
-[Live app](https://vasal.site) | [Docs](https://vasal.site/docs) | [Proof](https://vasal.site/proof) | [MCP](https://api.vasal.site/mcp)
+[Live app](https://vasal.site) | [Docs](https://vasal.site/docs) | [Proof](https://vasal.site/proof) | [Agent keys](https://vasal.site/agents)
 
 ## Live deployments
 
@@ -31,7 +31,7 @@ The seven boards are real runs that the operator checked by hand and saved, so t
 
 Vasal is for the host and producer of a mid-size podcast. Every week they decide who to invite next, and most of the time they decide from memory, from the news and from whoever the last guest suggested. The risks are a guest whose fans are not their listeners, and a guest who has already been on the show.
 
-The money follows the guests. Podcast ads are sold by the thousand downloads, so a guest who brings listeners is worth more than a famous name who does not. We tested the idea on 755 episodes of eight large shows. Episodes whose guest fit the show best drew 1.55 times the median adjusted views of the episodes whose guest fit least. The link is small (a correlation of 0.14) and it shows association, not cause. The method was written down and committed before any data was pulled, and the full write-up is in [docs/backtest-results.md](docs/backtest-results.md).
+The money follows the guests. Podcast ads are sold by the thousand downloads, so a guest who brings listeners is worth more than a famous name who does not. We tested the idea on 755 episodes of eight large shows. Episodes in the top fifth by guest fit drew 1.55 times the median adjusted views of those in the bottom fifth. The link is small (a correlation of 0.14) and it shows association, not cause. The method was written down and committed before any data was pulled, and the full write-up is in [docs/backtest-results.md](docs/backtest-results.md).
 
 A host types the name of their show. Vasal asks [Qloo](https://www.qloo.com/), a taste graph that links people, shows, films and books through the audiences they share, which people the show's listeners already love. It scores each finalist against the show on one scale, checks every name against the show's own episode feed so past guests and hosts are left out, and returns a ranked board. Each guest has a brief with five questions and a pitch email draft, written when the host asks. A "Without Qloo" tab on every board shows what the same model suggests alone: on the seven saved boards, 41 of its 56 guesses had already been on the show or host it. There is no account and no price today.
 
@@ -272,7 +272,7 @@ cp .env.example .env
 npm test
 ```
 
-On the last run, `npm test` ended with:
+`npm ci` takes about a minute and a half, and `npm test` about three and a half minutes. On the last run, `npm test` ended with:
 
 ```text
  Test Files  70 passed | 2 skipped (72)
@@ -283,9 +283,9 @@ The tests need no keys and no network. Edit `.env` only to run the real agent:
 
 | Variable | What it is for | Where the value comes from |
 | --- | --- | --- |
-| `QLOO_API_KEY` | Every Qloo call | The hackathon key form linked in `.env.example`. A hackathon key works only on `https://hackathon.api.qloo.com`, which is the default `QLOO_BASE_URL` |
-| `ANTHROPIC_API_KEY` | The research model and the brief writer | An API key from console.anthropic.com |
-| `YOUTUBE_API_KEY` | The backtest only | A Google Cloud key restricted to the YouTube Data API v3 |
+| `QLOO_API_KEY` | Every Qloo call | Qloo's hackathon key form, https://forms.gle/zz12orkLHTAneLGz6 (also in `.env.example`). Qloo gives these keys to hackathon participants. A hackathon key works only on `https://hackathon.api.qloo.com`, which is the default `QLOO_BASE_URL` |
+| `ANTHROPIC_API_KEY` | The research model and the brief writer | An API key from https://console.anthropic.com (Settings, API keys) |
+| `YOUTUBE_API_KEY` | The backtest only | A key from https://console.cloud.google.com/apis/credentials, with the YouTube Data API v3 turned on for its project |
 | `DATABASE_URL`, `TURNSTILE_SECRET_KEY`, `APP_ORIGIN`, `VISITOR_HASH_SECRET`, `CLIENT_IP_HEADER` | Production only. The server refuses to start in production without them | Your Postgres host, your Cloudflare Turnstile widget, your site's origin, 32 or more random characters, and the header your host's edge sets to the client address |
 
 Without the first two keys the server still starts, says which one is missing, and every run ends with an honest "agent not ready" failure. In development the server uses an in-memory Postgres and Cloudflare's published Turnstile test secret.
@@ -300,7 +300,12 @@ npm run server:dev -w packages/agent
 VASAL_API_URL=http://localhost:8787 NEXT_PUBLIC_VASAL_API_URL=http://localhost:8787 npm run dev -w packages/web
 ```
 
-The site opens at http://localhost:3000. On Windows PowerShell, set the two variables with `$env:VASAL_API_URL = "http://localhost:8787"` and `$env:NEXT_PUBLIC_VASAL_API_URL = "http://localhost:8787"` first. [Getting started](https://vasal.site/docs/getting-started) in the docs goes through each step and what to expect. This repository holds no Qloo response data, because Qloo's terms keep that out of public repositories.
+The site opens at http://localhost:3000. There are two ways to run it locally:
+
+- To look around, start only the web app, with no variables: `npm run dev -w packages/web`. It reads the live API at https://api.vasal.site, so the home page, the seven saved boards, /proof and /docs work as they do on vasal.site. Starting a run from localhost is refused, because the live API takes runs only from https://vasal.site.
+- To run the agent yourself, start both, as above. The local agent server starts with an empty in-memory database, so the home page says its showcase could not be loaded (there are no saved boards locally), and in development Next.js shows a red "1 Issue" badge for that 404. Runs need the Qloo and Anthropic keys in `.env`.
+
+On Windows PowerShell, set the two variables with `$env:VASAL_API_URL = "http://localhost:8787"` and `$env:NEXT_PUBLIC_VASAL_API_URL = "http://localhost:8787"` first. [Getting started](https://vasal.site/docs/getting-started) in the docs goes through each step and what to expect. This repository holds no Qloo response data, because Qloo's terms keep that out of public repositories.
 
 ## Use it from your agent
 
@@ -405,7 +410,9 @@ At 3,000 Qloo calls a day the site can serve roughly 75 to 100 live runs a day, 
 │   │   ├── src/kolam/         the drawing geometry, from guest ids and ranks
 │   │   ├── scripts/           prove, probe, ops and backtest runners, budget-policy.json
 │   │   └── test/              the vitest suite
-│   └── web/                   the Next.js app: landing, run pages, proof, agents
+│   └── web/                   the Next.js app: landing, run pages, /proof, /agents, /docs
+│       ├── content/docs/      the docs pages, in MDX
+│       └── .env.example       the web app's three public settings
 ├── docs/                      backtest write-up, pre-registration, threat model
 ├── ARCHITECTURE.md            the three diagrams and the web app's routes
 ├── .env.example               every setting, with a safe local default
@@ -436,6 +443,12 @@ At 3,000 Qloo calls a day the site can serve roughly 75 to 100 live runs a day, 
 ## Security
 
 Vasal is a public door on two paid services, and it reads text that strangers wrote. The [threat model](docs/security/threat-model.md) was written before the code, and its section C is the list the build was held to. A run starts only after a Cloudflare Turnstile check solved on this site, and every website route that spends needs a same-site POST, while the MCP door refuses browser origins and needs a bearer key. Agent keys are stored only as SHA-256 hashes. A feed is fetched only through a handle the server issued, and only from public internet addresses. Every Qloo and model call reserves from a Postgres counter first, so a full or unreadable counter refuses the call and spends nothing. The model never decides which ids are real or what a number is: code does, and code strips links and refuses claims the model made up. What remains: one network address counts as one visitor, so judges behind a shared office network share a cap. A script that solves the human check from many addresses can still use up a day's Qloo share, and the day caps and the operator's switch then stop the spending while saved boards keep working. The checks cannot stop a model from being swayed by text it reads, which is why that text never decides what runs.
+
+`npm audit` lists 6 known issues, all in dependencies. npm has a fix for two of them, in releases under two weeks old, and Vasal takes a release only once it is two weeks old, so they stay pinned as they are for judging:
+
+- An older `undici` inside Qloo's harness package (no fix released). Loading the harness makes it Node's global HTTP client, which carries only Vasal's calls to Qloo, Anthropic and Apple. It is the same version, 8.9.0, that Node 26.7 ships. Every feed, the one place a stranger controls the server at the other end, is fetched through Vasal's own client on `undici` 8.12.2.
+- `body-parser` and `fast-uri` inside the MCP SDK. The first belongs to the SDK's Express server, which Vasal never starts: its server runs on Hono and uses the SDK's web-standard transport.
+- `brace-expansion` inside lint tools and the harness's file matching, which never sees a pattern from outside.
 
 ## Licence
 

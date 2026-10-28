@@ -4,11 +4,18 @@ import { REPO, TEXT_LINK } from "@/components/proof/links";
 import { backtest, dayMonthYear, formatCount, inWords } from "@/lib/backtest";
 import { KICKER, SOFT_100 } from "@/lib/textStyles";
 
+// A show whose correlation is under this is above zero, but only just.
+const BARELY_POSITIVE = 0.05;
+
 export function ProofHeader() {
   const { sample, shows, datasetBuiltAt } = backtest;
   const episodes = formatCount(sample.episodes);
   const everyShowPositive = shows.every((show) => show.rho > 0);
-  const lede = `Before we pulled any data, we wrote the test down and committed it in public. Then we checked ${episodes} episodes from ${inWords(sample.shows)} of the biggest podcasts on YouTube. The link is small, it is real${everyShowPositive ? ", and it was positive in every show." : "."}`;
+  const barelyPositive = shows.filter((show) => show.rho < BARELY_POSITIVE).length === 1;
+  const positive = everyShowPositive
+    ? `, and it was positive in all ${inWords(shows.length)} shows${barelyPositive ? ", though barely in one" : ""}.`
+    : ".";
+  const lede = `Before we pulled any data, we wrote the test down and committed it in public. Then we checked ${episodes} episodes from ${inWords(sample.shows)} of the biggest podcasts on YouTube. The link is small, it passed the test we set in advance${positive}`;
 
   const meta = [
     <a
@@ -52,6 +59,16 @@ export function ProofHeader() {
                 {item}
               </Fragment>
             ))}
+          </p>
+        </Rise>
+        <Rise delay={0.5}>
+          <p className="mt-5 max-w-[54ch] font-body text-[15px] leading-[1.6] text-rice-dim">
+            It does not show cause and effect, audio downloads, or how smaller shows behave. Those
+            limits are spelled out{" "}
+            <a href="#limits" className={TEXT_LINK}>
+              at the end
+            </a>
+            .
           </p>
         </Rise>
       </div>
