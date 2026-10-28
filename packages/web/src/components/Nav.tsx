@@ -15,6 +15,7 @@ export function Nav({ home = "" }: { home?: string }) {
     label,
     href: href.startsWith("#") ? `${home}${href}` : href,
   }));
+  const tryHref = `${home}#try`;
 
   return (
     <header className="relative z-30 flex h-[72px] items-center justify-between px-[6vw] md:absolute md:inset-x-0 md:top-0">
@@ -37,8 +38,14 @@ export function Nav({ home = "" }: { home?: string }) {
             {label}
           </a>
         ))}
+        <a
+          href={tryHref}
+          className="rounded-lg border border-[rgba(242,169,59,0.55)] px-[14px] py-[7px] font-body text-[15px] text-accent transition-[background-color,color] duration-150 ease-out hover:bg-accent hover:text-night focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-rice"
+        >
+          Try your show
+        </a>
       </nav>
-      <MobileMenu links={links} />
+      <MobileMenu links={[{ label: "Try your show", href: tryHref }, ...links]} />
     </header>
   );
 }

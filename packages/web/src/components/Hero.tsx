@@ -39,8 +39,8 @@ export function Hero({ children, boardHref }: { children: ReactNode; boardHref: 
             <Link href={boardHref} className={PRIMARY_BUTTON}>
               See a real board
             </Link>
-            <a href="#story" className={SECONDARY_LINK}>
-              <span className="link-draw">How it works</span>
+            <a href="#try" className={SECONDARY_LINK}>
+              <span className="link-draw">Try your show</span>
             </a>
           </Rise>
         </div>
