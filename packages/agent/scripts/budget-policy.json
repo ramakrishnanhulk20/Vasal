@@ -203,7 +203,7 @@
     {
       "from": "2026-11-07",
       "to": "2026-12-01",
-      "notes": "Judging month. The day shares add up to 2,000, so the 15 judging days fit inside the month cap.",
+      "notes": "After judging, which ended on 5 Nov. The day shares add up to 2,000, so the rest of the month fits inside the month cap.",
       "buckets": [
         {
           "key": "qloo:month",

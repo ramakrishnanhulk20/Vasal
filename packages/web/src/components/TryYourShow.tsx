@@ -213,11 +213,11 @@ export function TryYourShow({
                 className="mt-7 max-w-[52ch] rounded-lg border border-rule bg-night-2 px-[18px] py-4 font-body text-[17px] text-rice outline-none"
               >
                 {boardCount === null ? (
-                  "Live runs open on 30 October, when judging starts."
+                  "Live runs are paused right now."
                 ) : (
                   <>
                     {
-                      "Live runs open on 30 October, when judging starts. Until then, open one of the "
+                      "Live runs are paused right now. Open one of the "
                     }
                     <a href="#showcase" className="link-draw">
                       {`${countWord(boardCount)} boards above`}

@@ -25,7 +25,7 @@ Vasal is the doorway of a Tamil home, where a kolam is drawn each morning to wel
 | Saved board 6 | Saved run | [Lex Fridman Podcast](https://vasal.site/runs/a312ada8-e216-41c3-bb97-b0bf66a2a1d6) |
 | Saved board 7 | Saved run | [Armchair Expert with Dax Shepard](https://vasal.site/runs/9c2c8fbb-6772-40c1-b965-d9441576c8dd) |
 
-The seven boards are real runs that the operator checked by hand and saved, so they open at once and cost nothing to read. Live runs, where you type your own show, open on 30 October 2026, when judging starts. The operator can switch them off to protect the shared Qloo quota, and the home page says which. Saved boards always work. The list above was read from `GET /showcase` on 27 October 2026.
+The seven boards are real runs that the operator checked by hand and saved, so they open at once and cost nothing to read. Live runs, where you type your own show, are open. The operator can pause them to protect the shared Qloo quota, and the home page says so when they are paused. Saved boards always work. The list above was read from `GET /showcase` on 27 October 2026.
 
 ## Overview
 
@@ -34,6 +34,13 @@ Vasal is for the host and producer of a mid-size podcast. Every week they decide
 The money follows the guests. Podcast ads are sold by the thousand downloads, so a guest who brings listeners is worth more than a famous name who does not. We tested the idea on 755 episodes of eight large shows. Episodes in the top fifth by guest fit drew 1.55 times the median adjusted views of those in the bottom fifth. The link is small (a correlation of 0.14) and it shows association, not cause. The method was written down and committed before any data was pulled, and the full write-up is in [docs/backtest-results.md](docs/backtest-results.md).
 
 A host types the name of their show. Vasal asks [Qloo](https://www.qloo.com/), a taste graph that links people, shows, films and books through the audiences they share, which people the show's listeners already love. It scores each finalist against the show on one scale, checks every name against the show's own episode feed so past guests and hosts are left out, and returns a ranked board. Each guest has a brief with five questions and a pitch email draft, written when the host asks. A "Without Qloo" tab on every board shows what the same model suggests alone: on the seven saved boards, 41 of its 56 guesses had already been on the show or host it. There is no account and no price today.
+
+Four things a judge can check on the live site:
+
+- A real agent. Claude works through Qloo's tools on every run, and each call appears on screen as it happens.
+- The show's own history. Every name is checked against the show's episode feed, so past guests and hosts never reach the board, and the board says how far back the check reached.
+- Proof written down first. The method was committed before any data existed, tested on 755 episodes, and published on [the proof page](https://vasal.site/proof) with its limits.
+- An open door for agents. Any MCP client can run the same booker with a free key from [vasal.site/agents](https://vasal.site/agents).
 
 | | How hosts book guests today | With Vasal |
 | --- | --- | --- |
@@ -231,7 +238,7 @@ flowchart TD
 3. Under "THE PITCH", click "Copy pitch". The email draft is on your clipboard.
 4. Click the "Without Qloo" tab above the list. On the first board it reads "7 of 8 of these had already been on the show." Click "With Qloo" to go back.
 5. Open https://vasal.site/proof and read the pre-registered test of 755 episodes, with its interval and its limits.
-6. Go back to the home page, scroll to "Try your show", type a podcast, solve the human check and click "Find my guests". Pick the right show, then watch the steps arrive for about a minute as the board builds. This step needs live runs to be open (from 30 October). Before that, the page says they are closed, and steps 1 to 5 still work.
+6. Go back to the home page, scroll to "Try your show", type a podcast, solve the human check and click "Find my guests". Pick the right show, then watch the steps arrive for about a minute as the board builds. If live runs are ever paused, the page says so, and steps 1 to 5 still work.
 
 To check the live API from the outside, with no key and no Qloo or model call:
 

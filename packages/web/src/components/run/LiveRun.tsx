@@ -123,7 +123,7 @@ function confirmNote(failure: Failure): Note {
   }
   if (status === 503 && code === "LIVE_RUNS_OFF") {
     return {
-      text: "Live runs open on 30 October, when judging starts. Until then, open one of the boards on the home page.",
+      text: "Live runs are paused right now. The saved boards on the home page still work.",
       link: { href: "/#showcase", label: "Back to the home page" },
     };
   }
