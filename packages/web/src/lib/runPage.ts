@@ -206,7 +206,7 @@ export function metaItems(run: RunDetail): string[] {
     const count = (value: number) => value.toLocaleString("en-US");
     items.push(
       `Past guests checked against ${count(past.episodes)} feed episodes${back ? ` back to ${back}` : ""}${
-        past.archiveTitles > 0 ? ` and ${count(past.archiveTitles)} archived` : ""
+        past.archiveTitles > 0 ? ` and ${count(past.archiveTitles)} archived titles` : ""
       }`,
     );
   } else {

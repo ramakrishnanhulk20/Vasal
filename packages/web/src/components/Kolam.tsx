@@ -99,6 +99,12 @@ export function Kolam({ run }: { run: Run }) {
   const { kolam } = run;
   const viewBox = kolam.viewBox.join(" ");
   const show = showSuffix(run);
+  // A guest with no taste shared with the show's listeners has no loop, so the
+  // loops can be fewer than the board's guests.
+  const loops =
+    kolam.rings.length === run.board.length
+      ? `one loop for each of ${kolam.rings.length} guests`
+      : `one loop for each guest with shared tastes: ${kolam.rings.length} of the board's ${run.board.length}`;
   const active = mode === "rings" && hovered !== null ? (rings[hovered] ?? null) : null;
 
   // The label flips to the left of the pointer near the right edge so it never widens the page.
@@ -224,8 +230,8 @@ export function Kolam({ run }: { run: Run }) {
           )}
         </div>
       </div>
-      <figcaption className="pointer-events-auto mt-4 max-w-[46ch] px-[2vw] font-mono text-xs text-rice-dim md:absolute md:right-0 md:top-full md:mt-3 md:px-0 md:text-right">
-        {`Drawn from a real Vasal run${show}: one loop for each of ${kolam.rings.length} guests, one dot for each of ${kolam.dots.length} tastes their fans share with the show's listeners.`}
+      <figcaption className="pointer-events-auto mt-4 max-w-[46ch] px-[2vw] font-mono text-xs text-rice-dim md:absolute md:max-w-[60ch] md:right-0 md:top-full md:mt-3 md:px-0 md:text-right">
+        {`Drawn from a real Vasal run${show}: ${loops}, one dot for each of ${kolam.dots.length} tastes their fans share with the show's listeners.`}
       </figcaption>
     </figure>
   );

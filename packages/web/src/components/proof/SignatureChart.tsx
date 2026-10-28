@@ -45,6 +45,10 @@ const KEEP_INSIDE = "max-md:left-auto max-md:right-0 max-md:translate-x-0";
 // Turned on and off by the scroll loop through data-on. With reduced motion everything shows.
 const FADE =
   "opacity-0 transition-opacity duration-300 ease-out data-[on=true]:opacity-100 motion-reduce:opacity-100 motion-reduce:transition-none";
+// The captions share one spot, so the old one fades out in full before the new one
+// starts to fade in.
+const CAPTION_FADE =
+  "opacity-0 transition-opacity duration-200 ease-out data-[on=true]:opacity-100 data-[on=true]:delay-200 motion-reduce:opacity-100 motion-reduce:transition-none";
 
 export function SignatureChart({
   fifths,
@@ -296,7 +300,7 @@ export function SignatureChart({
                 key={caption.lead}
                 data-from={CAPTION_SPANS[index][0]}
                 data-until={CAPTION_SPANS[index][1] ?? undefined}
-                className={`${FADE} col-start-1 row-start-1 motion-reduce:row-start-auto`}
+                className={`${CAPTION_FADE} col-start-1 row-start-1 motion-reduce:row-start-auto`}
               >
                 <p
                   className="font-display text-[length:clamp(1.75rem,2.6vw,2.5rem)] font-[350] leading-[1.1] text-rice"

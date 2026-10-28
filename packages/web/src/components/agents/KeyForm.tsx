@@ -7,7 +7,7 @@ import { issueAgentKey } from "@/lib/agentKeys";
 import type { IssuedKey } from "@/lib/agentKeys";
 import type { Failure } from "@/lib/api";
 import { PRIMARY_BUTTON, SECONDARY_LINK } from "@/lib/buttonStyle";
-import { SITE_KEY, loadTurnstile } from "@/lib/turnstile";
+import { SITE_KEY, TURNSTILE_ORIGIN, loadTurnstile } from "@/lib/turnstile";
 
 const MCP_OFF = "MCP_OFF";
 
@@ -61,6 +61,7 @@ export function KeyForm({
   const [token, setToken] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const widgetRef = useRef<HTMLDivElement>(null);
   const widgetId = useRef<string | null>(null);
 
@@ -68,6 +69,25 @@ export function KeyForm({
     const container = widgetRef.current;
     if (!container) return;
     let cancelled = false;
+    const stopLoading = () => {
+      if (!cancelled) setLoading(false);
+    };
+
+    // Turnstile builds its frame inside a closed shadow root, so the page cannot
+    // look for it. The browser's list of loaded resources does report the frame's
+    // page arriving. The watch starts before the first widget is drawn, so an
+    // older widget's entry never counts.
+    const watch = new PerformanceObserver((list) => {
+      const arrived = list
+        .getEntries()
+        .some(
+          (entry) =>
+            (entry as PerformanceResourceTiming).initiatorType === "iframe" &&
+            entry.name.startsWith(TURNSTILE_ORIGIN),
+        );
+      if (arrived) stopLoading();
+    });
+    watch.observe({ type: "resource" });
 
     loadTurnstile()
       .then((turnstile) => {
@@ -77,15 +97,25 @@ export function KeyForm({
           action: "agent_key",
           theme: "dark",
           size: "normal",
-          callback: (value) => setToken(value),
+          callback: (value) => {
+            stopLoading();
+            setToken(value);
+          },
           "expired-callback": () => setToken(null),
-          "error-callback": () => setToken(null),
+          "error-callback": () => {
+            stopLoading();
+            setToken(null);
+          },
         });
       })
-      .catch((error: unknown) => console.error("Human check could not start", error));
+      .catch((error: unknown) => {
+        console.error("Human check could not start", error);
+        stopLoading();
+      });
 
     return () => {
       cancelled = true;
+      watch.disconnect();
       if (widgetId.current !== null) window.turnstile?.remove(widgetId.current);
       widgetId.current = null;
     };
@@ -114,7 +144,14 @@ export function KeyForm({
 
   return (
     <form onSubmit={submit}>
-      <div ref={widgetRef} data-action="agent_key" />
+      <div className={`relative ${loading ? "min-h-[65px]" : ""}`}>
+        {loading && (
+          <p className="absolute left-0 top-0 flex h-[65px] items-center font-mono text-[12px] text-rice-dim">
+            Loading the human check...
+          </p>
+        )}
+        <div ref={widgetRef} data-action="agent_key" className="relative" />
+      </div>
       <button
         type="submit"
         disabled={token === null || pending}

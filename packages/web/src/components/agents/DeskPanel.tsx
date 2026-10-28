@@ -139,7 +139,7 @@ export function DeskPanel({
                 Your key appears here, once.
               </p>
               <p className="mt-2 max-w-[36ch] font-body text-[15px] text-rice-dim">
-                Pass the human check on the left. The key is shown on this page and nowhere else.
+                Pass the human check <span className="md:hidden">above</span><span className="hidden md:inline">on the left</span>. The key is shown on this page and nowhere else.
               </p>
             </motion.div>
           )}

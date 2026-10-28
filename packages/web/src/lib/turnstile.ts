@@ -25,7 +25,8 @@ const TEST_SITE_KEY = "1x00000000000000000000AA";
 export const SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || TEST_SITE_KEY;
 export const USING_TEST_KEY = !process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
 
-const SCRIPT_URL = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+export const TURNSTILE_ORIGIN = "https://challenges.cloudflare.com";
+const SCRIPT_URL = `${TURNSTILE_ORIGIN}/turnstile/v0/api.js?render=explicit`;
 
 let loading: Promise<TurnstileApi> | null = null;
 

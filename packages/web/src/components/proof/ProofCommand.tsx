@@ -10,8 +10,13 @@ export function ProofCommand({ command }: { command: string }) {
 
   return (
     <div className="relative">
-      <div className="overflow-x-auto rounded-lg border border-rule bg-night-2 py-[22px] pl-6 pr-[128px] font-mono text-[14px] leading-[1.7] text-rice">
-        <pre ref={shown} className="m-0 whitespace-pre-wrap font-mono">{command}</pre>
+      <div className="overflow-hidden rounded-lg border border-rule bg-night-2 font-mono text-[14px] leading-[1.7] text-rice">
+        <pre
+          ref={shown}
+          className="m-0 mr-[128px] overflow-x-auto whitespace-pre py-[22px] pl-6 font-mono"
+        >
+          {command}
+        </pre>
       </div>
       <button
         type="button"

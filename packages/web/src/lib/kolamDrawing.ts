@@ -81,5 +81,9 @@ export function showSuffix(run: Run): string {
 
 export function kolamLabel(run: Run): string {
   const { kolam } = run;
-  return `A kolam drawn from a real Vasal run${showSuffix(run)}: ${kolam.rings.length} loops, one for each guest, and ${kolam.dots.length} dots, one for each taste a guest's fans share with the show's listeners.`;
+  const loops =
+    kolam.rings.length === run.board.length
+      ? `${kolam.rings.length} loops, one for each guest`
+      : `${kolam.rings.length} loops, one for each guest with shared tastes (the board has ${run.board.length})`;
+  return `A kolam drawn from a real Vasal run${showSuffix(run)}: ${loops}, and ${kolam.dots.length} dots, one for each taste a guest's fans share with the show's listeners.`;
 }

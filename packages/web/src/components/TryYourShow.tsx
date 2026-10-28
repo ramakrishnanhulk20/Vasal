@@ -173,8 +173,9 @@ export function TryYourShow({
               aria-label="Your show"
               maxLength={300}
               autoComplete="off"
+              disabled={closed}
               placeholder="Show name, Apple Podcasts link or RSS feed"
-              className="w-full border-0 border-b border-rule bg-transparent py-[18px] font-display text-[length:clamp(1.5rem,2.6vw,2.25rem)] font-[350] text-rice outline-none transition-[border-color] duration-200 placeholder:text-rice-dim focus:border-rice"
+              className="w-full border-0 border-b border-rule bg-transparent py-[18px] font-display text-[length:clamp(1.5rem,2.6vw,2.25rem)] font-[350] text-rice outline-none transition-[border-color] duration-200 placeholder:text-rice-dim focus:border-rice disabled:cursor-not-allowed disabled:opacity-45"
             />
             {!closed && (
               <div className="mt-7 flex flex-col gap-6 md:flex-row md:items-center md:justify-between">

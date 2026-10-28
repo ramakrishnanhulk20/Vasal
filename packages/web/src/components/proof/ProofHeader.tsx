@@ -15,7 +15,7 @@ export function ProofHeader() {
   const positive = everyShowPositive
     ? `, and it was positive in all ${inWords(shows.length)} shows${barelyPositive ? ", though barely in one" : ""}.`
     : ".";
-  const lede = `Before we pulled any data, we wrote the test down and committed it in public. Then we checked ${episodes} episodes from ${inWords(sample.shows)} of the biggest podcasts on YouTube. The link is small, it passed the test we set in advance${positive}`;
+  const lede = `Before we pulled any data, we wrote the test down and committed it in public. Then we checked ${episodes} episodes from ${inWords(sample.shows)} of the biggest podcasts on YouTube. The correlation is small, it passed the test we set in advance${positive}`;
 
   const meta = [
     <a

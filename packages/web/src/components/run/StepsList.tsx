@@ -54,7 +54,7 @@ export function StepsList({ steps }: { steps: Step[] }) {
         </ol>
         {hasOldLabel && (
           <p className="mt-6 max-w-[60ch] font-body text-[14px] leading-[1.6] text-rice-dim">
-            {`"${OLD_AUDIENCE_LABEL}" means Qloo had no audience data for that person, or the run had used its 10 audience checks. Neither is an error, and newer runs name which one it was.`}
+            {`"${OLD_AUDIENCE_LABEL}" means Qloo had no audience data for that person, or the run had used its 10 audience checks. Neither is an error.`}
           </p>
         )}
       </div>

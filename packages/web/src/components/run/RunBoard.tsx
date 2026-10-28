@@ -294,7 +294,7 @@ export function RunBoard({
                       {`We asked the same model for guests with no Qloo data. Each guess was scored by Qloo and checked against the show's episode history, the same way as the board.`}
                     </p>
                     <p className="mt-[18px] font-body text-[18px] leading-[1.6] text-rice-dim">
-                      {`Their fit can be high. People who have been on a show are often the ones its listeners love most, which is why Vasal leaves past guests out.`}
+                      {`Some of these score a higher fit than the board's guests. That is expected: people who have already been on a show are often the ones its listeners love most. But they have already been booked, so there is nothing new to pitch, which is why Vasal leaves them out.`}
                     </p>
                   </div>
                 )}
