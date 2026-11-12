@@ -18,7 +18,7 @@ const contentSecurityPolicy = [
   "img-src 'self' data: blob:",
   "font-src 'self'",
   `connect-src 'self' ${apiOrigin} ${TURNSTILE}`,
-  `frame-src ${TURNSTILE}`,
+  `frame-src ${TURNSTILE} https://www.youtube-nocookie.com`,
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",

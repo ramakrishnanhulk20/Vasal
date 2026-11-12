@@ -8,7 +8,11 @@ import { useIsMobile } from "@/lib/useIsMobile";
 const EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
 const FOCUSABLE = "a[href], button:not([disabled])";
 
-export function MobileMenu({ links }: { links: Array<{ label: string; href: string }> }) {
+export function MobileMenu({
+  links,
+}: {
+  links: Array<{ label: string; href: string; external?: boolean }>;
+}) {
   const reduce = useReducedMotion() ?? false;
   const mobile = useIsMobile();
   const [open, setOpen] = useState(false);
@@ -103,6 +107,8 @@ export function MobileMenu({ links }: { links: Array<{ label: string; href: stri
                     <a
                       ref={index === 0 ? firstLinkRef : undefined}
                       href={link.href}
+                      target={link.external ? "_blank" : undefined}
+                      rel={link.external ? "noopener noreferrer" : undefined}
                       onClick={() => close(false)}
                       className="block font-display text-[36px] font-[350] leading-[1.1] text-rice transition-colors duration-150 ease-out hover:text-accent focus-visible:text-accent focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-rice"
                     >

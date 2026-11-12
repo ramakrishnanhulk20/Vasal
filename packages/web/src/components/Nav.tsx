@@ -1,7 +1,9 @@
 import { Mark } from "@/components/Mark";
 import { MobileMenu } from "@/components/MobileMenu";
+import { ARCHIVE_LINKS, isArchive } from "@/lib/archive";
+import type { ArchiveLink } from "@/lib/archive";
 
-const LINKS = [
+const LINKS: ArchiveLink[] = [
   { label: "Showcase", href: "#showcase" },
   { label: "How it works", href: "#story" },
   { label: "Proof", href: "/proof" },
@@ -11,9 +13,10 @@ const LINKS = [
 
 // On other pages, home is "/" so the section links point back at the landing page.
 export function Nav({ home = "" }: { home?: string }) {
-  const links = LINKS.map(({ label, href }) => ({
-    label,
-    href: href.startsWith("#") ? `${home}${href}` : href,
+  const archive = isArchive();
+  const links = (archive ? ARCHIVE_LINKS : LINKS).map((link) => ({
+    ...link,
+    href: link.href.startsWith("#") ? `${home}${link.href}` : link.href,
   }));
   const tryHref = `${home}#try`;
 
@@ -29,23 +32,27 @@ export function Nav({ home = "" }: { home?: string }) {
         </span>
       </div>
       <nav aria-label="Primary" className="hidden items-center gap-8 md:flex">
-        {links.map(({ label, href }) => (
+        {links.map(({ label, href, external }) => (
           <a
             key={label}
             href={href}
+            target={external ? "_blank" : undefined}
+            rel={external ? "noopener noreferrer" : undefined}
             className="link-draw font-body text-[15px] text-rice-dim hover:text-rice focus-visible:text-rice focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-rice"
           >
             {label}
           </a>
         ))}
-        <a
-          href={tryHref}
-          className="rounded-lg border border-[rgba(242,169,59,0.55)] px-[14px] py-[7px] font-body text-[15px] text-accent transition-[background-color,color] duration-150 ease-out hover:bg-accent hover:text-night focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-rice"
-        >
-          Try your show
-        </a>
+        {!archive && (
+          <a
+            href={tryHref}
+            className="rounded-lg border border-[rgba(242,169,59,0.55)] px-[14px] py-[7px] font-body text-[15px] text-accent transition-[background-color,color] duration-150 ease-out hover:bg-accent hover:text-night focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-rice"
+          >
+            Try your show
+          </a>
+        )}
       </nav>
-      <MobileMenu links={[{ label: "Try your show", href: tryHref }, ...links]} />
+      <MobileMenu links={archive ? links : [{ label: "Try your show", href: tryHref }, ...links]} />
     </header>
   );
 }

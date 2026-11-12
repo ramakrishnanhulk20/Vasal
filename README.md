@@ -8,24 +8,20 @@ We help podcast hosts book the guests their listeners already love, and the ones
 
 Vasal is the doorway of a Tamil home, where a kolam is drawn each morning to welcome guests.
 
-[Live app](https://vasal.site) | [Docs](https://vasal.site/docs) | [Proof](https://vasal.site/proof) | [Agent keys](https://vasal.site/agents)
+[Project record](https://vasal.site) | [Proof](https://vasal.site/proof) | [Demo video](https://www.youtube.com/watch?v=rb1iZH1dGLY) | [Hackathon submission](https://devpost.com/software/vasal)
 
-## Live deployments
+Vasal ran live at vasal.site from 27 October to 12 November 2026 for the Qloo Agentic Hackathon. Qloo's hackathon API access ended with judging, so the agent server and its database are retired, and vasal.site now shows a one-page record of the project with the demo and the proof. Everything below describes the app as it was submitted. It still runs locally with your own keys (see Quick start).
 
-| Part | Where it runs | Address |
+## Where it ran
+
+| Part | Where it ran | Now |
 | --- | --- | --- |
-| Web app | Vercel | https://vasal.site |
-| Agent API | Railway | Base address `https://api.vasal.site` (the bare root answers 404 by design). Health check: https://api.vasal.site/health |
-| MCP endpoint | Railway | https://api.vasal.site/mcp (POST only, with a bearer key from https://vasal.site/agents) |
-| Saved board 1 | Saved run | [This Week in Startups](https://vasal.site/runs/915764d5-a8d9-4249-8f1b-9e779ceff2ea) |
-| Saved board 2 | Saved run | [Conan O’Brien Needs A Friend](https://vasal.site/runs/f59e082d-c815-4083-81c7-24e8df435f4b) |
-| Saved board 3 | Saved run | [New Heights with Jason & Travis Kelce](https://vasal.site/runs/cac01626-151e-435c-87f8-aa31937d89f1) |
-| Saved board 4 | Saved run | [The Diary Of A CEO with Steven Bartlett](https://vasal.site/runs/ea7d8846-ebc9-46a7-a554-3b7502856ceb) |
-| Saved board 5 | Saved run | [Las Culturistas with Matt Rogers and Bowen Yang](https://vasal.site/runs/844cb44a-f4d4-43c9-bc72-206d3d65e1a0) |
-| Saved board 6 | Saved run | [Lex Fridman Podcast](https://vasal.site/runs/a312ada8-e216-41c3-bb97-b0bf66a2a1d6) |
-| Saved board 7 | Saved run | [Armchair Expert with Dax Shepard](https://vasal.site/runs/9c2c8fbb-6772-40c1-b965-d9441576c8dd) |
+| Web app | Vercel, https://vasal.site | A one-page record of the project; /proof still works |
+| Agent API | Railway, `https://api.vasal.site` | Retired on 12 November 2026 |
+| MCP endpoint | Railway, `https://api.vasal.site/mcp` | Retired with the API |
+| Seven saved boards | Postgres on Railway | Retired with the database; the demo video shows them |
 
-The seven boards are real runs that the operator checked by hand and saved, so they open at once and cost nothing to read. Live runs, where you type your own show, are open. The operator can pause them to protect the shared Qloo quota, and the home page says so when they are paused. Saved boards always work. The list above was read from `GET /showcase` on 27 October 2026.
+The seven saved boards were This Week in Startups, Conan O'Brien Needs A Friend, New Heights, The Diary Of A CEO, Las Culturistas, the Lex Fridman Podcast and Armchair Expert. They were real runs that the operator checked by hand and saved.
 
 ## Overview
 
@@ -35,12 +31,12 @@ The money follows the guests. Podcast ads are sold by the thousand downloads, so
 
 A host types the name of their show. Vasal asks [Qloo](https://www.qloo.com/), a taste graph that links people, shows, films and books through the audiences they share, which people the show's listeners already love. It scores each finalist against the show on one scale, checks every name against the show's own episode feed so past guests and hosts are left out, and returns a ranked board. Each guest has a brief with five questions and a pitch email draft, written when the host asks. A "Without Qloo" tab on every board shows what the same model suggests alone: on the seven saved boards, 41 of its 56 guesses had already been on the show or host it. There is no account and no price today.
 
-Four things a judge can check on the live site:
+Four things a judge could check on the live site:
 
 - A real agent. Claude works through Qloo's tools on every run, and each call appears on screen as it happens.
 - The show's own history. Every name is checked against the show's episode feed, so past guests and hosts never reach the board, and the board says how far back the check reached.
 - Proof written down first. The method was committed before any data existed, tested on 755 episodes, and published on [the proof page](https://vasal.site/proof) with its limits.
-- An open door for agents. Any MCP client can run the same booker with a free key from [vasal.site/agents](https://vasal.site/agents).
+- An open door for agents. Any MCP client can run the same booker with a free key from the site's /agents page.
 
 | | How hosts book guests today | With Vasal |
 | --- | --- | --- |
@@ -86,7 +82,7 @@ The [proof page](https://vasal.site/proof) and [docs/backtest-results.md](docs/b
 
 ### The agent door (MCP)
 
-Any MCP client can call Vasal at `https://api.vasal.site/mcp` with a bearer key. A person gets a key at [/agents](https://vasal.site/agents) after one human check. Four tools cover the same flow as the site: `find_show`, `book_guests`, `get_board` and `write_brief`. Agents spend from their own daily share of the budget, so they cannot use what the website needs.
+Any MCP client can call Vasal at `https://api.vasal.site/mcp` with a bearer key. A person gets a key on the site's /agents page after one human check. Four tools cover the same flow as the site: `find_show`, `book_guests`, `get_board` and `write_brief`. Agents spend from their own daily share of the budget, so they cannot use what the website needs.
 
 ### Limits
 
@@ -231,7 +227,9 @@ flowchart TD
   hourly --> roll
 ```
 
-## The two-minute judge path
+## The two-minute judge path (as it ran)
+
+These were the steps on the live site during judging. The [demo video](https://www.youtube.com/watch?v=rb1iZH1dGLY) walks the same path.
 
 1. Open https://vasal.site and click "See a real board". It opens the first saved board, for This Week in Startups.
 2. Click any guest in the list. The brief opens beside it: why them, the angle, five questions and the pitch. On a phone it opens as a sheet.
@@ -240,7 +238,7 @@ flowchart TD
 5. Open https://vasal.site/proof and read the pre-registered test of 755 episodes, with its interval and its limits.
 6. Go back to the home page, scroll to "Try your show", type a podcast, solve the human check and click "Find my guests". Pick the right show, then watch the steps arrive for about a minute as the board builds. If live runs are ever paused, the page says so, and steps 1 to 5 still work.
 
-To check the live API from the outside, with no key and no Qloo or model call:
+During judging, this checked the live API from the outside, with no key and no Qloo or model call. The API is retired now, so the command fails; run it against your own local server instead (see Quick start).
 
 ```bash
 npm run prove -w packages/agent -- --remote https://api.vasal.site
@@ -307,16 +305,13 @@ npm run server:dev -w packages/agent
 VASAL_API_URL=http://localhost:8787 NEXT_PUBLIC_VASAL_API_URL=http://localhost:8787 npm run dev -w packages/web
 ```
 
-The site opens at http://localhost:3000. There are two ways to run it locally:
+The site opens at http://localhost:3000. The local agent server starts with an empty in-memory database, so the home page says its showcase could not be loaded (there are no saved boards locally), and in development Next.js shows a red "1 Issue" badge for that 404. /proof and /docs work without it. Runs need the Qloo and Anthropic keys in `.env`; Qloo's hackathon keys ended with judging, so a run needs a Qloo key of your own.
 
-- To look around, start only the web app, with no variables: `npm run dev -w packages/web`. It reads the live API at https://api.vasal.site, so the home page, the seven saved boards, /proof and /docs work as they do on vasal.site. Starting a run from localhost is refused, because the live API takes runs only from https://vasal.site.
-- To run the agent yourself, start both, as above. The local agent server starts with an empty in-memory database, so the home page says its showcase could not be loaded (there are no saved boards locally), and in development Next.js shows a red "1 Issue" badge for that 404. Runs need the Qloo and Anthropic keys in `.env`.
-
-On Windows PowerShell, set the two variables with `$env:VASAL_API_URL = "http://localhost:8787"` and `$env:NEXT_PUBLIC_VASAL_API_URL = "http://localhost:8787"` first. [Getting started](https://vasal.site/docs/getting-started) in the docs goes through each step and what to expect. This repository holds no Qloo response data, because Qloo's terms keep that out of public repositories.
+On Windows PowerShell, set the two variables with `$env:VASAL_API_URL = "http://localhost:8787"` and `$env:NEXT_PUBLIC_VASAL_API_URL = "http://localhost:8787"` first. [Getting started](packages/web/content/docs/getting-started.mdx) in the docs goes through each step and what to expect (the docs are also served at http://localhost:3000/docs when you run the web app). This repository holds no Qloo response data, because Qloo's terms keep that out of public repositories.
 
 ## Use it from your agent
 
-Get a key at https://vasal.site/agents. It takes one human check, the key is shown once, and it lasts 30 days. In Claude Code:
+Run the agent server and web app locally (Quick start) and get a key at http://localhost:3000/agents. It takes one human check, the key is shown once, and it lasts 30 days. In Claude Code:
 
 ```bash
 claude mcp add --transport http vasal https://api.vasal.site/mcp --header "Authorization: Bearer YOUR_KEY"
